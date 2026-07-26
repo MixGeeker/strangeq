@@ -454,11 +454,11 @@ func stageBServer(t *testing.T, dir string) (*server.Server, string) {
 	srv, err := server.NewServerBuilder().WithConfig(cfg).Build()
 	require.NoError(t, err, "server build")
 	go func() { _ = srv.Start() }()
-	for i := 0; i < 200; i++ {
+	for i := 0; i < brokerStartupPolls; i++ {
 		if srv.IsListening() {
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(brokerStartupPollInterval)
 	}
 	require.True(t, srv.IsListening(), "server listener not ready")
 	return srv, fmt.Sprintf("amqp://guest:guest@%s/", addr)

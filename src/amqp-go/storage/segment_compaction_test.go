@@ -171,13 +171,24 @@ func TestSegment_CompactionPreservesUnacked(t *testing.T) {
 		sm.Acknowledge(queueName, i)
 	}
 
-	// Batch ACK is asynchronous — wait for all 4 ACKs to be applied to the bitmap
+	// Batch ACK is asynchronous. tryCompaction() gates on the sealed segment's
+	// deletedCount (via deletionRatio = deletedCount/messageCount vs.
+	// cfg.CompactionThreshold), NOT on qs.ackBitmap — so we must wait for the
+	// segment's deletedCount to reach 4, not for the ack bitmap cardinality.
+	// Waiting on the bitmap instead races with the async batch-ack applying to
+	// the segment: under load the bitmap can reach 4 before deletedCount does,
+	// so tryCompaction() sees a deletion ratio still under threshold and skips
+	// compaction, leaving the "acked" messages readable.
 	require.Eventually(t, func() bool {
-		qs.bitmapMutex.RLock()
-		count := int(qs.ackBitmap.GetCardinality())
-		qs.bitmapMutex.RUnlock()
-		return count >= 4
-	}, 1*time.Second, 5*time.Millisecond, "batch ACKs should be applied before compaction")
+		qs.sealedMutex.RLock()
+		defer qs.sealedMutex.RUnlock()
+		for _, seg := range qs.sealedSegments {
+			if seg.deletedCount.Load() >= 4 {
+				return true
+			}
+		}
+		return false
+	}, 1*time.Second, 5*time.Millisecond, "ACKs should be applied to the sealed segment's deletedCount before compaction")
 
 	// Manually trigger compaction
 	qs.tryCompaction()

@@ -175,11 +175,11 @@ func (b *confBroker) startEmbedded() {
 	require.NoError(t, err, "build embedded server")
 	b.srv = srv
 	go func() { _ = srv.Start() }()
-	for i := 0; i < 100; i++ {
+	for i := 0; i < brokerStartupPolls; i++ {
 		if srv.IsListening() {
 			break
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(brokerStartupPollInterval)
 	}
 	require.True(t, srv.IsListening(), "embedded server did not start listening")
 	b.uri = fmt.Sprintf("amqp://guest:guest@%s/", srv.Listener.Addr().String())

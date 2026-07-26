@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"log"
 	"os"
 	"testing"
 	"time"
@@ -78,7 +79,7 @@ func TestAuthenticationPLAIN(t *testing.T) {
 	// Start server in background
 	go func() {
 		if err := srv.Start(); err != nil {
-			t.Logf("Server stopped: %v", err)
+			log.Printf("test server stopped: %v", err)
 		}
 	}()
 
@@ -158,7 +159,7 @@ func TestAuthenticationANONYMOUS(t *testing.T) {
 	// Start server in background
 	go func() {
 		if err := srv.Start(); err != nil {
-			t.Logf("Server stopped: %v", err)
+			log.Printf("test server stopped: %v", err)
 		}
 	}()
 
@@ -209,7 +210,7 @@ func TestAuthenticationDisabled(t *testing.T) {
 	// Start server in background
 	go func() {
 		if err := srv.Start(); err != nil {
-			t.Logf("Server stopped: %v", err)
+			log.Printf("test server stopped: %v", err)
 		}
 	}()
 
@@ -271,7 +272,7 @@ func TestAuthenticationWithMessaging(t *testing.T) {
 	// Start server in background
 	go func() {
 		if err := srv.Start(); err != nil {
-			t.Logf("Server stopped: %v", err)
+			log.Printf("test server stopped: %v", err)
 		}
 	}()
 

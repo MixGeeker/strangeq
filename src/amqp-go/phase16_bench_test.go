@@ -46,11 +46,11 @@ func startBenchServer(b *testing.B) (string, func()) {
 	}()
 
 	// Poll until listener is ready
-	for i := 0; i < 50; i++ {
+	for i := 0; i < brokerStartupPolls; i++ {
 		if srv.IsListening() {
 			break
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(brokerStartupPollInterval)
 	}
 	if !srv.IsListening() {
 		b.Fatal("server listener not ready")

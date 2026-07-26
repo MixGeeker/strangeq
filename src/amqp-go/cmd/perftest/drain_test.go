@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 	"testing"
 	"time"
@@ -52,14 +53,25 @@ func startEmbeddedServer(t *testing.T) (string, func()) {
 	}
 	go func() {
 		if err := srv.Start(); err != nil {
-			t.Logf("embedded server stopped: %v", err)
+			log.Printf("embedded server stopped: %v", err)
 		}
 	}()
-	for i := 0; i < 100; i++ {
+	// Listener-readiness budget, NOT a behavioural deadline: too tight and the
+	// test fails before its subject has started, then reports as covered while
+	// never having run. This was 100 x 20ms = 2s, against a measured ~4.3s
+	// instrumented broker startup (21-25s under machine load).
+	//
+	// Package main's tests share brokerStartupPolls/brokerStartupPollInterval
+	// for this; that constant lives in a _test.go file there and is not visible
+	// across the package boundary, so these values are kept deliberately
+	// IDENTICAL to it (6000 x 10ms = 60s). If you change one, change both — a
+	// second private copy of this budget is exactly how the class survived a
+	// whole loop untouched.
+	for i := 0; i < 6000; i++ {
 		if srv.IsListening() {
 			break
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 	if !srv.IsListening() {
 		srv.Stop()

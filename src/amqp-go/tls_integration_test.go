@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"log"
 	"math/big"
 	"net"
 	"os"
@@ -126,19 +127,19 @@ func startTLSTestServer(t *testing.T, port string, certFile, keyFile, caFile str
 
 	go func() {
 		if err := srv.Start(); err != nil {
-			t.Logf("Server stopped: %v", err)
+			log.Printf("test server stopped: %v", err)
 		}
 	}()
 
 	// Poll until listener is ready
-	for i := 0; i < 50; i++ {
+	for i := 0; i < brokerStartupPolls; i++ {
 		if srv.IsListening() {
 			break
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(brokerStartupPollInterval)
 	}
 	if !srv.IsListening() {
-		t.Fatal("server listener not ready after 1s")
+		t.Fatal("server listener not ready")
 	}
 
 	t.Cleanup(func() {

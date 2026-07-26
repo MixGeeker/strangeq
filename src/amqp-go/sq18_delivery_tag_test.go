@@ -64,11 +64,11 @@ func sq18Server(t *testing.T) (string, func()) {
 		t.Fatalf("Build failed: %v", err)
 	}
 	go func() { _ = srv.Start() }()
-	for i := 0; i < 100; i++ {
+	for i := 0; i < brokerStartupPolls; i++ {
 		if srv.IsListening() {
 			break
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(brokerStartupPollInterval)
 	}
 	if !srv.IsListening() {
 		t.Fatal("server listener not ready")

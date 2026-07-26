@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"testing"
@@ -125,7 +126,7 @@ func startAuthzTestServer(t *testing.T, port string) *server.Server {
 
 	go func() {
 		if err := srv.Start(); err != nil {
-			t.Logf("Server stopped: %v", err)
+			log.Printf("test server stopped: %v", err)
 		}
 	}()
 

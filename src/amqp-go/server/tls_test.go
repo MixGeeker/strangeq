@@ -9,6 +9,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"fmt"
+	"log"
 	"math/big"
 	"net"
 	"os"
@@ -539,7 +540,7 @@ func TestServerStart_WithTLS(t *testing.T) {
 
 	go func() {
 		if err := srv.Start(); err != nil {
-			t.Logf("Server stopped: %v", err)
+			log.Printf("Server stopped: %v", err)
 		}
 	}()
 	defer func() {
@@ -612,7 +613,7 @@ func TestServerStart_PlainTCPWhenTLSDisabled(t *testing.T) {
 
 	go func() {
 		if err := srv.Start(); err != nil {
-			t.Logf("Server stopped: %v", err)
+			log.Printf("Server stopped: %v", err)
 		}
 	}()
 	defer func() {

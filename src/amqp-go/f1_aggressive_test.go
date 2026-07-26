@@ -44,11 +44,11 @@ func f1AggServer(t *testing.T, fsync bool, ringSize int, walChanBuf int) (string
 		t.Fatalf("Build failed: %v", err)
 	}
 	go func() { _ = srv.Start() }()
-	for i := 0; i < 200; i++ {
+	for i := 0; i < brokerStartupPolls; i++ {
 		if srv.IsListening() {
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(brokerStartupPollInterval)
 	}
 	if !srv.IsListening() {
 		t.Fatal("server listener not ready")
@@ -249,6 +249,30 @@ func TestF1_Agg_MultiProducer(t *testing.T) {
 	const perProducer = 25000
 	body := make([]byte, 1024)
 
+	// The producers deliberately outlive the assertion below: this is a
+	// liveness test (the consumer must receive a message while 4x25K publishes
+	// are in flight), and blocking on 100K publishes would turn it into a
+	// throughput test. Because they outlive it they MUST NOT touch t — a t.*
+	// call from a goroutine after its test has returned panics the whole test
+	// binary and kills every remaining test in the package. So producer errors
+	// are collected here and reported by the test itself, in the deferred
+	// reporter below, while the test is still live.
+	//
+	// Errors seen after pubCancel are dropped: cancellation is the test's own
+	// teardown signal, and a publish that fails because we are shutting the
+	// producer down is not a finding.
+	pubCtx, pubCancel := context.WithCancel(context.Background())
+	var prodErrMu sync.Mutex
+	var prodErrs []string
+	prodErrf := func(format string, args ...interface{}) {
+		if pubCtx.Err() != nil {
+			return
+		}
+		prodErrMu.Lock()
+		prodErrs = append(prodErrs, fmt.Sprintf(format, args...))
+		prodErrMu.Unlock()
+	}
+
 	var wg sync.WaitGroup
 	for p := 0; p < producers; p++ {
 		wg.Add(1)
@@ -256,31 +280,58 @@ func TestF1_Agg_MultiProducer(t *testing.T) {
 			defer wg.Done()
 			pconn, err := amqp.Dial(uri)
 			if err != nil {
-				t.Errorf("producer %d dial: %v", pid, err)
+				prodErrf("producer %d dial: %v", pid, err)
 				return
 			}
 			defer pconn.Close()
 			pch, err := pconn.Channel()
 			if err != nil {
-				t.Errorf("producer %d channel: %v", pid, err)
+				prodErrf("producer %d channel: %v", pid, err)
 				return
 			}
 			defer pch.Close()
 			if err := pch.Confirm(false); err != nil {
-				t.Errorf("producer %d confirm: %v", pid, err)
+				prodErrf("producer %d confirm: %v", pid, err)
 				return
 			}
 			for i := 0; i < perProducer; i++ {
-				if err := pch.PublishWithContext(context.Background(), "", qName, false, false, amqp.Publishing{
+				if err := pch.PublishWithContext(pubCtx, "", qName, false, false, amqp.Publishing{
 					DeliveryMode: amqp.Persistent,
 					Body:         body,
 				}); err != nil {
-					t.Errorf("producer %d publish %d: %v", pid, i, err)
+					prodErrf("producer %d publish %d: %v", pid, i, err)
 					return
 				}
 			}
 		}(p)
 	}
+
+	// Runs before the deferred cleanup (registered earlier, so it runs later):
+	// cancel the producers, give them a bounded window to exit, then report
+	// whatever they found.
+	//
+	// What makes this safe is NOT that stragglers are guaranteed to have
+	// stopped — prodErrf tests pubCtx and only then takes the lock, so a
+	// producer can pass that test, be descheduled, and append after this
+	// reporter has already read the slice. It is safe because producers never
+	// call t.* on any path, the mutex makes the slice itself race-free, and a
+	// late append is simply dropped, which is acceptable precisely because
+	// post-cancellation errors are teardown artifacts rather than findings.
+	defer func() {
+		pubCancel()
+		producersDone := make(chan struct{})
+		go func() { wg.Wait(); close(producersDone) }()
+		select {
+		case <-producersDone:
+		case <-time.After(10 * time.Second):
+			t.Logf("warning: producers did not exit within 10s of cancellation")
+		}
+		prodErrMu.Lock()
+		defer prodErrMu.Unlock()
+		for _, e := range prodErrs {
+			t.Errorf("%s", e)
+		}
+	}()
 
 	recv := 0
 	deadline := time.After(60 * time.Second)
@@ -299,8 +350,7 @@ func TestF1_Agg_MultiProducer(t *testing.T) {
 	}
 	t.Logf("PASS (multiProducer, 4x25K): consumer received %d messages within 60s", recv)
 
-	// Let producers finish in background; don't block test exit on them.
-	go func() { wg.Wait() }()
+	// Producers are cancelled and joined by the deferred reporter above.
 	// Close the consumer connection in a background goroutine. Under heavy
 	// flood the server's UnregisterConsumer teardown can hang (a known
 	// teardown path where the poll loop's stopCh requeue is slow), which is

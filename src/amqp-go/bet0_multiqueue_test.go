@@ -58,8 +58,12 @@ import (
 
 var bet0PortCounter atomic.Int64
 
-// bet0StartupPolls bounds how long every helper here waits for an embedded
-// broker's listener, at 10ms per poll.
+// brokerStartupPolls, together with brokerStartupPollInterval, bounds how
+// long every embedded-broker helper in this package waits for the listener
+// to come up. This is a listener-readiness POLL BUDGET, not a behavioural
+// deadline: every behavioural deadline in these tests is a separate constant
+// and is unchanged by this one. Conflating the two is exactly the failure
+// mode this constant exists to prevent — see below.
 //
 // It was 400 (4.0s), and that is too tight to be a timeout — it was silently
 // acting as a threshold. Under `go test -race` broker startup exceeds 4s, so
@@ -70,9 +74,39 @@ var bet0PortCounter atomic.Int64
 //
 // This is a startup timeout, not an assertion. Raising it weakens nothing —
 // every behavioural deadline in these tests is separate and unchanged — it only
-// stops the harness from failing a test before its subject has started. 20s is
-// ~5x the observed instrumented startup; a genuine hang still fails, just later.
-const bet0StartupPolls = 2000
+// stops the harness from failing a test before its subject has started.
+// A too-tight budget does not make a test fail late — it makes the test fail
+// BEFORE its subject has started, and the test then reports as covered while
+// never having run.
+//
+// 2000 (20s) WAS ALSO OBSERVED INSUFFICIENT, so this is the same landmine going
+// off a second time, one order of magnitude further out. Under a load average
+// of ~4.8 — routine for a shared CI runner — five tests failed simultaneously
+// with "server listener not ready", taking 21.8-25.0s each; the same five on a
+// quiet machine start in 0.37-3.40s. A 10-60x swing in startup, and the harness
+// failing tests whose subject never began, reported as if multi-queue recovery
+// were broken.
+//
+// 6000 (60s) is ~18x the quiet-machine worst case. A genuine hang still fails,
+// just later — which is the correct trade for a timeout that has now twice been
+// mistaken for an assertion.
+//
+// Until this sweep, three more helpers (f1AggServer in f1_aggressive_test.go,
+// f1Server in f1_starvation_test.go, and confBroker.startEmbedded in
+// conformance_harness_test.go) each carried their OWN, independent copy of
+// this budget — hardcoded at 200 polls x 10ms, or 100 polls x 20ms — both of
+// which are the same 2s that had already been proven insufficient above. They
+// survived at 2s only because nothing tied them to this constant: someone
+// raised the copy in front of them and the other three did not move. That is
+// how four separate near-misses of the same landmine coexisted in one
+// package. All four sites now share brokerStartupPolls and
+// brokerStartupPollInterval so tightening one tightens (and can be reasoned
+// about) for all of them at once; re-tightening this constant re-arms the
+// same failure for every site that reads it.
+const (
+	brokerStartupPolls        = 6000
+	brokerStartupPollInterval = 10 * time.Millisecond
+)
 
 // bet0Server starts an embedded broker rooted at dir and returns it with its URI.
 // dir is persistent across a Stop/restart so durable recovery can be exercised.
@@ -88,11 +122,11 @@ func bet0Server(t *testing.T, dir string) (*server.Server, string) {
 	srv, err := server.NewServerBuilder().WithConfig(cfg).Build()
 	require.NoError(t, err, "server build")
 	go func() { _ = srv.Start() }()
-	for i := 0; i < bet0StartupPolls; i++ {
+	for i := 0; i < brokerStartupPolls; i++ {
 		if srv.IsListening() {
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(brokerStartupPollInterval)
 	}
 	require.True(t, srv.IsListening(), "server listener not ready")
 	// These tests drive hundreds of thousands of messages through an embedded
@@ -142,11 +176,20 @@ type bet0LoadResult struct {
 // both keep delivering.
 //
 // Shape (proven repro, dossier §6): 2 queues x 3 producers / 3 consumers each,
-// sustained concurrent publishing. Assertion is on consumption measured DURING
-// the publish window: each queue must consume at least bet0MinDeliveredFraction
-// of what it published. Healthy single-queue behaviour is ~0.97; on broken main
-// it is ~0.0006, so the threshold has three orders of magnitude of margin and is
-// not a tuning knob.
+// sustained concurrent publishing. The assertion is on consumption measured
+// DURING the publish window, and it goes through bet0CheckLiveness — see
+// bet0_liveness_predicate_test.go for the predicate and for the measurements
+// behind every threshold it applies.
+//
+// Uninstrumented, that predicate still enforces the original floor: each queue
+// must consume at least bet0MinDeliveredFraction (0.50) of what it published.
+// Healthy single-queue behaviour is ~0.97 and broken main is ~0.0006, so that
+// floor has three orders of magnitude of margin and is not a tuning knob.
+// UNDER -race THAT FLOOR IS UNDECIDABLE — the healthy and broken rate bands
+// overlap — so it is disabled there and the diagnostic becomes cross-queue
+// balance plus a liveness backstop. It is disabled, NOT lowered; lowering it is
+// the banned fix. The predicate file explains why at length. Read it before
+// changing anything here.
 //
 // The second assertion — every published message is eventually delivered, zero
 // loss, within a bounded drain — is the correctness half: the fix must restore
@@ -177,16 +220,16 @@ func TestBet0_ConcurrentMultiQueueDelivery(t *testing.T) {
 	}
 }
 
+// Load shape. The assertion thresholds live in bet0_liveness_predicate_test.go,
+// next to the measurements that justify them.
 const (
-	bet0Queues                = 2
-	bet0ProducersPerQueue     = 3
-	bet0ConsumersPerQueue     = 3
-	bet0BodySize              = 128
-	bet0PublishWindow         = 4 * time.Second
-	bet0DrainDeadline         = 25 * time.Second
-	bet0MinDeliveredFraction  = 0.5
-	bet0MinPublishedForSignal = 20000 // per queue; below this the run proves nothing
-	bet0Prefetch              = 100
+	bet0Queues            = 2
+	bet0ProducersPerQueue = 3
+	bet0ConsumersPerQueue = 3
+	bet0BodySize          = 128
+	bet0PublishWindow     = 4 * time.Second
+	bet0DrainDeadline     = 25 * time.Second
+	bet0Prefetch          = 100
 )
 
 func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
@@ -333,27 +376,29 @@ func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
 	pubCancel()
 
 	// --- LIVENESS assertion (this is the one that fails on broken main) ---
+	// The predicate itself, and the measurements behind every threshold it
+	// applies, are in bet0_liveness_predicate_test.go. Read that file before
+	// touching any number: under -race the consumed/published rate bands of a
+	// healthy and a broken tree overlap, so the diagnostic here is cross-queue
+	// BALANCE, not rate.
+	samples := make([]bet0Sample, bet0Queues)
 	for qi, res := range results {
+		samples[qi] = bet0Sample{
+			name:      queueNames[qi],
+			published: res.publishedAtWindow,
+			consumed:  res.consumedAtWindow,
+		}
 		t.Logf("queue %s: published=%d consumed-in-window=%d (%.4f)",
-			queueNames[qi], res.publishedAtWindow, res.consumedAtWindow,
-			float64(res.consumedAtWindow)/float64(max64(res.publishedAtWindow, 1)))
+			queueNames[qi], res.publishedAtWindow, res.consumedAtWindow, samples[qi].ratio())
 	}
-	for qi, res := range results {
-		require.Greaterf(t, res.publishedAtWindow, int64(bet0MinPublishedForSignal),
-			"queue %s published only %d messages in %s — load too low for this run to prove anything",
-			queueNames[qi], res.publishedAtWindow, bet0PublishWindow)
+	if notice := bet0PremiseNotice(samples, bet0Policy()); notice != "" {
+		t.Log(notice)
 	}
-	for qi, res := range results {
-		minWanted := int64(float64(res.publishedAtWindow) * bet0MinDeliveredFraction)
-		require.GreaterOrEqualf(t, res.consumedAtWindow, minWanted,
-			"MULTI-QUEUE DELIVERY STARVATION: queue %s consumed %d of %d published "+
-				"during the %s publish window (%.4f of published; need >= %.2f). "+
-				"With %d queues publishing concurrently, every queue's delivery must keep up "+
-				"just as a single queue does.",
-			queueNames[qi], res.consumedAtWindow, res.publishedAtWindow, bet0PublishWindow,
-			float64(res.consumedAtWindow)/float64(max64(res.publishedAtWindow, 1)),
-			bet0MinDeliveredFraction, bet0Queues)
+	if notice := bet0SignalNotice(samples); notice != "" {
+		t.Log(notice)
 	}
+	require.NoErrorf(t, bet0CheckLiveness(samples, bet0Policy()),
+		"shape=%s window=%s", shape, bet0PublishWindow)
 
 	// --- ZERO-LOSS assertion: drain what is left, bounded ---
 	targets := make([]int64, bet0Queues)
@@ -960,11 +1005,11 @@ func bet0ServerWithConfig(t *testing.T, dir string, tweak func(*config.AMQPConfi
 	srv, err := server.NewServerBuilder().WithConfig(cfg).Build()
 	require.NoError(t, err, "server build")
 	go func() { _ = srv.Start() }()
-	for i := 0; i < bet0StartupPolls; i++ {
+	for i := 0; i < brokerStartupPolls; i++ {
 		if srv.IsListening() {
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(brokerStartupPollInterval)
 	}
 	require.True(t, srv.IsListening(), "server listener not ready")
 	t.Cleanup(func() { _ = srv.Stop() })
@@ -2108,11 +2153,11 @@ func bet0TryServer(t *testing.T, dir string) (*server.Server, string, error) {
 		return nil, "", err
 	}
 	go func() { _ = srv.Start() }()
-	for i := 0; i < bet0StartupPolls; i++ {
+	for i := 0; i < brokerStartupPolls; i++ {
 		if srv.IsListening() {
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(brokerStartupPollInterval)
 	}
 	if !srv.IsListening() {
 		return nil, "", fmt.Errorf("server listener not ready")
@@ -2145,9 +2190,20 @@ func bet0TryServer(t *testing.T, dir string) (*server.Server, string, error) {
 // publish window — because the defect is a rate failure, invisible to any
 // after-the-fact drain.
 //
-// HONEST LIMITATION — THIS TEST DOES NOT REPRODUCE THAT BUG. It passes: 2 queues
-// at 0.997/0.998, and 4 queues at outstanding=1000 at ~0.985. Do not read its
-// green as coverage of the perftest starvation.
+// HONEST LIMITATION — THIS TEST DOES NOT REPRODUCE THE *PERFTEST* STARVATION,
+// the concurrent-declare one described above. Uninstrumented it passes at
+// 0.997/0.998 for 2 queues and ~0.985 for 4 at outstanding=1000. Do not read
+// its green as coverage of that defect.
+//
+// ⚠️ CORRECTION, measured 2026-07-26: that sentence used to read "THIS TEST DOES
+// NOT REPRODUCE THAT BUG" without qualification, and on the blanket reading it
+// is FALSE. Under -race this shape DOES reproduce the multi-queue P0 on the
+// pre-fix tree: ported to 8a65f98 it starves q2 to consumed=0, 3 runs of 3
+// (q1 ratios 0.2141 / 0.2729 / 0.3011 beside q2 at 0.0000). So this test carries
+// a real pristine-red obligation and its thresholds get the same treatment and
+// the same proof as the P0 repro's — not a weaker one. The original claim was
+// about the perftest case specifically; it read as blanket, and was believed as
+// blanket, which is why it is spelled out here.
 //
 // The reason it cannot reproduce it is itself the key diagnostic. The trigger is
 // CONCURRENT QUEUE DECLARATION, not load and not confirms alone. Two perftest
@@ -2166,15 +2222,18 @@ func bet0TryServer(t *testing.T, dir string) (*server.Server, string, error) {
 // produce a test that passes for the wrong reason.
 func TestBet0_MultiQueueWithConfirmsDelivers(t *testing.T) {
 	const (
-		queues       = 2
-		producers    = 3
-		consumers    = 3
-		outstanding  = 200 // per producer; mirrors perftest's bounded window
-		bodySize     = 1024
-		window       = 5 * time.Second
-		minFraction  = 0.5
-		minPublished = 5000 // per queue; below this the run proves nothing
+		queues      = 2
+		producers   = 3
+		consumers   = 3
+		outstanding = 200 // per producer; mirrors perftest's bounded window
+		bodySize    = 1024
+		window      = 5 * time.Second
 	)
+	// Exactly the same predicate and the same thresholds as the P0 repro — this
+	// shape reproduces the same defect on the pre-fix tree (see the correction
+	// in the header), so it gets the same gate, not a weaker one. Thresholds and
+	// the measurements behind them live in bet0_liveness_predicate_test.go.
+	policy := bet0Policy()
 	_, uri := bet0Server(t, t.TempDir())
 
 	names := make([]string, queues)
@@ -2301,25 +2360,25 @@ func TestBet0_MultiQueueWithConfirmsDelivers(t *testing.T) {
 	}
 	stopOnce.Do(func() { close(stop) })
 
+	samples := make([]bet0Sample, queues)
 	for i, n := range names {
+		// Identical consumer count and prefetch per queue — the premise the
+		// balance term rests on. See bet0_liveness_predicate_test.go.
+		samples[i] = bet0Sample{name: n, published: pubAt[i], consumed: conAt[i]}
 		t.Logf("queue %s: published=%d consumed-in-window=%d (%.4f)",
-			n, pubAt[i], conAt[i], float64(conAt[i])/float64(max64(pubAt[i], 1)))
+			n, pubAt[i], conAt[i], samples[i].ratio())
 	}
-	for i, n := range names {
-		require.Greaterf(t, pubAt[i], int64(minPublished),
-			"queue %s published only %d in %s — load too low for this run to prove anything",
-			n, pubAt[i], window)
+	if notice := bet0PremiseNotice(samples, policy); notice != "" {
+		t.Log(notice)
 	}
-	for i, n := range names {
-		want := int64(float64(pubAt[i]) * minFraction)
-		require.GreaterOrEqualf(t, conAt[i], want,
-			"MULTI-QUEUE STARVATION UNDER PUBLISHER CONFIRMS: queue %s consumed %d of %d "+
-				"published during the %s window (%.4f; need >= %.2f). With confirms disabled and "+
-				"nothing else changed, both queues run healthily — so this is specific to the "+
-				"confirm path, and it is the exact workload (durable + confirms + multiple "+
-				"queues) that multi-queue scaling exists to serve.",
-			n, conAt[i], pubAt[i], window, float64(conAt[i])/float64(max64(pubAt[i], 1)), minFraction)
+	if notice := bet0SignalNotice(samples); notice != "" {
+		t.Log(notice)
 	}
+	require.NoErrorf(t, bet0CheckLiveness(samples, policy),
+		"UNDER PUBLISHER CONFIRMS, window=%s. With confirms disabled and nothing else "+
+			"changed, both queues run healthily — so a failure here is specific to the "+
+			"confirm path, and it is the exact workload (durable + confirms + multiple "+
+			"queues) that multi-queue scaling exists to serve.", window)
 }
 
 // ----------------------------------------------------------------------------
@@ -2474,11 +2533,11 @@ func bet0PinnedServer(t *testing.T, dir string) (*server.Server, string, *c1Pinn
 	srv, err := server.NewServerBuilder().WithConfig(cfg).WithStorage(pinned).Build()
 	require.NoError(t, err, "server build")
 	go func() { _ = srv.Start() }()
-	for i := 0; i < bet0StartupPolls; i++ {
+	for i := 0; i < brokerStartupPolls; i++ {
 		if srv.IsListening() {
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(brokerStartupPollInterval)
 	}
 	require.True(t, srv.IsListening(), "server listener not ready")
 	t.Cleanup(func() { _ = srv.Stop() })
@@ -2956,11 +3015,11 @@ func bet0LogCapturingServer(t *testing.T, dir, logFile string) (*server.Server, 
 		return nil, "", err
 	}
 	go func() { _ = srv.Start() }()
-	for i := 0; i < bet0StartupPolls; i++ {
+	for i := 0; i < brokerStartupPolls; i++ {
 		if srv.IsListening() {
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(brokerStartupPollInterval)
 	}
 	if !srv.IsListening() {
 		return nil, "", fmt.Errorf("server listener not ready")
@@ -3312,11 +3371,11 @@ func bet0PinnedLoggingServer(t *testing.T, dir, logFile string) (*server.Server,
 	srv, err := server.NewServerBuilder().WithConfig(cfg).WithStorage(pinned).Build()
 	require.NoError(t, err, "server build")
 	go func() { _ = srv.Start() }()
-	for i := 0; i < bet0StartupPolls; i++ {
+	for i := 0; i < brokerStartupPolls; i++ {
 		if srv.IsListening() {
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(brokerStartupPollInterval)
 	}
 	require.True(t, srv.IsListening(), "server listener not ready")
 	t.Cleanup(func() { _ = srv.Stop() })
