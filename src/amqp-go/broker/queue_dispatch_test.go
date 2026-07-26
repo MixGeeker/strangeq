@@ -38,7 +38,7 @@ func TestDispatch_FIFOClaimOrder(t *testing.T) {
 		defer cancel()
 
 		for i := uint64(0); i < 5; i++ {
-			qs.Publish(i)
+			qs.FrontierComplete(qs.FrontierReserve(), true)
 		}
 		for want := uint64(0); want < 5; want++ {
 			tag, _, ok := qs.Claim(stop, testTimer(qs))
@@ -61,7 +61,7 @@ func TestDispatch_CompetingConsumersDistinct(t *testing.T) {
 
 		const N = 1000
 		for i := uint64(0); i < N; i++ {
-			qs.Publish(i)
+			qs.FrontierComplete(qs.FrontierReserve(), true)
 		}
 
 		const workers = 8
@@ -131,7 +131,7 @@ func TestDispatch_ParkWake(t *testing.T) {
 		case <-time.After(50 * time.Millisecond):
 		}
 
-		qs.Publish(0)
+		qs.FrontierComplete(qs.FrontierReserve(), true)
 
 		select {
 		case v := <-gotTag:
@@ -166,7 +166,7 @@ func TestDispatch_ParkWakeMultiple(t *testing.T) {
 
 		<-time.After(50 * time.Millisecond)
 		for i := uint64(0); i < consumers; i++ {
-			qs.Publish(i)
+			qs.FrontierComplete(qs.FrontierReserve(), true)
 		}
 
 		seen := make(map[uint64]bool)
@@ -240,7 +240,7 @@ func TestDispatch_RequeuePreservesTagAndFIFO(t *testing.T) {
 		defer cancel()
 
 		for i := uint64(0); i < 3; i++ {
-			qs.Publish(i)
+			qs.FrontierComplete(qs.FrontierReserve(), true)
 		}
 		t0, _, _ := qs.Claim(stop, testTimer(qs))
 		t1, _, _ := qs.Claim(stop, testTimer(qs))
@@ -265,7 +265,7 @@ func TestDispatch_RequeuePreservesTagAndFIFO(t *testing.T) {
 			t.Errorf("second requeue claim = %d (ok=%v), want 2", r2, ok)
 		}
 
-		qs.Publish(3)
+		qs.FrontierComplete(qs.FrontierReserve(), true)
 		r3, _, ok := qs.Claim(stop, testTimer(qs))
 		if !ok || r3 != 3 {
 			t.Errorf("fresh claim after requeue = %d (ok=%v), want 3", r3, ok)
@@ -281,7 +281,7 @@ func TestDispatch_RequeueWakesParked(t *testing.T) {
 		defer cancel()
 
 		for i := uint64(0); i <= 7; i++ {
-			qs.Publish(i)
+			qs.FrontierComplete(qs.FrontierReserve(), true)
 		}
 		for i := uint64(0); i < 7; i++ {
 			if _, _, ok := qs.Claim(stop, testTimer(qs)); !ok {
@@ -353,7 +353,7 @@ func TestDispatch_RecoverThenPublish(t *testing.T) {
 			got <- t2
 		}()
 		<-time.After(50 * time.Millisecond)
-		qs.Publish(11)
+		qs.FrontierComplete(qs.FrontierReserve(), true)
 		select {
 		case v := <-got:
 			if v != 11 {
@@ -372,8 +372,8 @@ func TestDispatch_BackpressureBlocksPublisher(t *testing.T) {
 		stop, cancel := makeStop()
 		defer cancel()
 
-		qs.Publish(0)
-		qs.Publish(1)
+		qs.FrontierComplete(qs.FrontierReserve(), true)
+		qs.FrontierComplete(qs.FrontierReserve(), true)
 		t0, _, _ := qs.Claim(stop, testTimer(qs))
 		t1, _, _ := qs.Claim(stop, testTimer(qs))
 		qs.ClaimInflight(t0)
@@ -404,7 +404,7 @@ func TestDispatch_BackpressureStopExits(t *testing.T) {
 		qs := NewQueueState(1)
 		stop := qs.StopCh()
 
-		qs.Publish(0)
+		qs.FrontierComplete(qs.FrontierReserve(), true)
 		t0, _, _ := qs.Claim(stop, testTimer(qs))
 		qs.ClaimInflight(t0)
 
@@ -434,7 +434,7 @@ func TestDispatch_DepthAccounting(t *testing.T) {
 		defer cancel()
 
 		for i := uint64(0); i < 5; i++ {
-			qs.Publish(i)
+			qs.FrontierComplete(qs.FrontierReserve(), true)
 		}
 		if d := qs.Depth(); d != 5 {
 			t.Fatalf("Depth after publish 5 = %d, want 5", d)
@@ -471,7 +471,7 @@ func TestDispatch_DepthWithRequeue(t *testing.T) {
 		stop, cancel := makeStop()
 		defer cancel()
 
-		qs.Publish(0)
+		qs.FrontierComplete(qs.FrontierReserve(), true)
 		tag, _, _ := qs.Claim(stop, testTimer(qs))
 		qs.ClaimInflight(tag)
 		if d := qs.Depth(); d != 1 {
@@ -545,7 +545,7 @@ func TestDispatch_DuplicateWakesCoalesce(t *testing.T) {
 		if qs.ParkedCount() != 1 {
 			t.Errorf("ParkedCount = %d, want 1", qs.ParkedCount())
 		}
-		qs.Publish(0)
+		qs.FrontierComplete(qs.FrontierReserve(), true)
 		select {
 		case v := <-got:
 			if v != 0 {
@@ -578,7 +578,7 @@ func TestDispatch_ConcurrentPublishClaimRequeue(t *testing.T) {
 				if !qs.WaitForCapacity(stop) {
 					return
 				}
-				qs.Publish(i)
+				qs.FrontierComplete(qs.FrontierReserve(), true)
 				published.Add(1)
 			}
 		}()
@@ -653,7 +653,7 @@ func TestDispatch_ConcurrentPublishClaimRequeue_Race(t *testing.T) {
 				if !qs.WaitForCapacity(stop) {
 					return
 				}
-				qs.Publish(i)
+				qs.FrontierComplete(qs.FrontierReserve(), true)
 				published.Add(1)
 			}
 		}()
@@ -713,7 +713,7 @@ func TestDispatch_RequeueUnbounded(t *testing.T) {
 
 		const N = 4096 + 1000
 		for i := uint64(0); i < N; i++ {
-			qs.Publish(i)
+			qs.FrontierComplete(qs.FrontierReserve(), true)
 		}
 		tags := make([]uint64, N)
 		for i := uint64(0); i < N; i++ {
@@ -762,7 +762,7 @@ func TestDispatch_NoAllocOnClaim(t *testing.T) {
 
 		const pre = 4000
 		for i := uint64(0); i < pre; i++ {
-			qs.Publish(i)
+			qs.FrontierComplete(qs.FrontierReserve(), true)
 		}
 		timer := time.NewTimer(qs.parkTimeout)
 		defer timer.Stop()
@@ -806,7 +806,7 @@ func TestDispatch_CloseDuringPublish(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := uint64(0); i < 100000; i++ {
-				qs.Publish(i)
+				qs.FrontierComplete(qs.FrontierReserve(), true)
 			}
 		}()
 
@@ -838,7 +838,7 @@ func TestDispatch_CloseDuringClaim(t *testing.T) {
 		}
 
 		for i := uint64(0); i < 100; i++ {
-			qs.Publish(i)
+			qs.FrontierComplete(qs.FrontierReserve(), true)
 		}
 		time.Sleep(10 * time.Millisecond)
 		qs.Close()
@@ -854,7 +854,7 @@ func TestDispatch_AckAdvanceWakesPublisher(t *testing.T) {
 		stop, cancel := makeStop()
 		defer cancel()
 
-		qs.Publish(0)
+		qs.FrontierComplete(qs.FrontierReserve(), true)
 		t0, _, _ := qs.Claim(stop, testTimer(qs))
 		qs.ClaimInflight(t0)
 

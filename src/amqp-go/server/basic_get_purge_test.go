@@ -142,6 +142,25 @@ func publishMessageToQueue(t *testing.T, srv *Server, queueName, body string) {
 	require.NoError(t, err)
 }
 
+// resolveWireTagToMsgID translates a per-channel WIRE delivery tag (the value
+// carried on the basic.get-ok / basic.deliver frame, minted by
+// channel.NextWireTag) into the broker-internal msgID (the packed
+// queueOrdinal<<44|perQueueSeq tag used to key the broker's delivery ledger).
+// SQ-18 (protocol/structures.go:355-375) keeps these as two independent tag
+// spaces; tests that probe the broker ledger directly via
+// srv.Broker.GetConsumerForDelivery must look it up by msgID, not by the wire
+// tag off the frame. Must be called before the entry is settled (ack/reject/
+// nack removes it via channel.TakeWireTag), so callers resolve it once right
+// after the delivery and hold onto the returned msgID for later assertions.
+func resolveWireTagToMsgID(t *testing.T, srv *Server, conn *protocol.Connection, channelID uint16, wireTag uint64) uint64 {
+	t.Helper()
+	channel := srv.wireChannel(conn, channelID)
+	require.NotNil(t, channel, "channel must be registered to resolve wire tag")
+	ref, ok := channel.ResolveWireTag(wireTag)
+	require.True(t, ok, "wire tag must still be tracked on the channel")
+	return ref.MsgID
+}
+
 // encodeBasicGet serializes a basic.get method and returns its payload.
 func encodeBasicGet(t *testing.T, queueName string, noAck bool) []byte {
 	t.Helper()
@@ -380,12 +399,13 @@ func TestBasicGetWithAckTrackingThenAck(t *testing.T) {
 	getOK := &protocol.BasicGetOKMethod{}
 	require.NoError(t, getOK.Deserialize(methodPayload))
 	deliveryTag := getOK.DeliveryTag
+	msgID := resolveWireTagToMsgID(t, srv, conn, 1, deliveryTag)
 
 	drainFrame(t, frameCh) // header
 	drainFrame(t, frameCh) // body
 
 	// Verify delivery is tracked with empty consumer tag
-	consumerTag, ok := srv.Broker.GetConsumerForDelivery(deliveryTag)
+	consumerTag, ok := srv.Broker.GetConsumerForDelivery(msgID)
 	assert.True(t, ok)
 	assert.Equal(t, "", consumerTag, "basic.get delivery should have empty consumer tag")
 
@@ -396,7 +416,7 @@ func TestBasicGetWithAckTrackingThenAck(t *testing.T) {
 	err = srv.handleBasicAck(conn, 1, ackPayload)
 	require.NoError(t, err)
 
-	_, ok = srv.Broker.GetConsumerForDelivery(deliveryTag)
+	_, ok = srv.Broker.GetConsumerForDelivery(msgID)
 	assert.False(t, ok, "delivery should be removed after ack")
 }
 

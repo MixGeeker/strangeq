@@ -711,6 +711,14 @@ type Queue struct {
 	Channel      *Channel      // Reference back to parent channel (runtime state, not persisted)
 	MessageCount atomic.Uint64 // In-memory message count (runtime state, not persisted)
 	OwnerConnID  string        // Connection ID that owns this queue (exclusive queues only)
+
+	// Ordinal is this queue's composite-delivery-tag ordinal (see
+	// broker/tag_packing.go and broker.QueueState.SetOrdinal). It is
+	// CBOR-marshalled with the rest of this struct so a durable queue's
+	// ordinal survives restart. Ordinals allocate from 1 — 0 unambiguously
+	// means "unassigned" (a queue declared before this field existed, or a
+	// queue whose ordinal has not been resolved yet).
+	Ordinal uint64
 }
 
 // NewQueue creates a new queue

@@ -21,6 +21,13 @@ var ErrConsumerChannelFull = errors.New("consumer channel full")
 // cannot be routed to any queue.
 var ErrNoRoute = errors.New("no route to destination queue")
 
+// ErrQueueClosed is returned when a publish is routed to a queue whose runtime
+// state was closed underneath it — a concurrent queue.delete tore the queue
+// down after routing resolved its binding. The message was neither stored nor
+// dead-lettered, so the publisher must be told (nack / basic.return), but the
+// connection is healthy and must NOT be torn down.
+var ErrQueueClosed = errors.New("queue closed during publish")
+
 // ErrExchangeTypeMismatch is returned when a re-declare of an existing
 // exchange specifies a different type. Callers should handle this as a
 // channel-level 406 PreconditionFailed per AMQP 0.9.1 spec.
@@ -161,8 +168,72 @@ type StorageBroker struct {
 	queueOwners       sync.Map
 	deliveryIndex     sync.Map
 	getDeliveryQueues sync.Map
-	globalDeliveryTag atomic.Uint64
 	metricsCollector  MetricsCollector
+
+	// queueCreateMuByName holds one *sync.Mutex per queue name (LoadOrStore,
+	// same pattern as queueConsumersMu / getQueueConsumersMutex). It backs
+	// FOUR distinct per-name critical sections. The mutex is NOT reentrant and
+	// must never be held twice by the same goroutine; within a section, call
+	// createQueueStateLocked, never getOrCreateQueueState. Each section HOLDS
+	// the mutex across its QueueState work rather than unlocking first — see
+	// getQueueCreateMutex's doc comment for why that is the load-bearing
+	// invariant and what breaks if any of them unlocks early:
+	//
+	//  1. DeclareQueue's new-queue branch: serializes the whole
+	//     check-allocate-persist sequence for a queue's metadata record, so
+	//     only ONE ordinal is ever allocated and persisted for a given name
+	//     even when several connections race to idempotently declare the
+	//     same brand-new queue (the most common AMQP client pattern). See
+	//     storage/persistent_metadata.go StoreQueue's write-once-ordinal
+	//     invariant for the second, independent layer of defense.
+	//
+	//  2. DeclareQueue's existing-queue (redeclare) branch: the lock-free
+	//     record read that selects this branch is only a pre-check, so the
+	//     record is re-read under this mutex and the mutex is then held across
+	//     the whole redeclare, including the QueueState creation inside
+	//     declareExistingQueueLocked. Without that span, a concurrent
+	//     DeleteQueue landing between validating the record and creating the
+	//     state leaves a live, publishable, record-less queue whose confirmed
+	//     durable publishes are discarded at the next restart. If the re-read
+	//     finds the record already deleted, this branch unlocks and falls
+	//     through to case 1, which persists a fresh record and ordinal band
+	//     for the new incarnation.
+	//
+	//  3. getOrCreateQueueState's COLD path — the first-ever creation of a
+	//     QueueState for a given queue name in this process. Held while the
+	//     queue's composite-tag ordinal (broker/tag_packing.go) is resolved
+	//     and SetOrdinal is called, BEFORE the new QueueState is published
+	//     via queueStates.Store: without this, a plain LoadOrStore would let
+	//     a concurrent publisher observe the QueueState (and mint a tag)
+	//     before SetOrdinal ran, minting with ordinalBase still at its zero
+	//     value — colliding with ordinal-0's tag space.
+	//
+	//  4. DeleteQueue's teardown span: held from before activeQueues.Delete
+	//     through storage.DeleteQueue (inclusive), so a concurrent
+	//     getOrCreateQueueState cold path cannot observe the metadata record
+	//     after the QueueState has been removed but before the record is
+	//     deleted — a window in which it would reuse the dying queue's
+	//     ordinal without persisting it. Blocking here instead forces that
+	//     concurrent create to wait until the record is genuinely gone and
+	//     allocate a FRESH ordinal. This is a SIBLING critical section to
+	//     getQueueConsumersMutex — DeleteQueue releases that mutex before
+	//     acquiring this one — never nested inside it.
+	//
+	// Locking per NAME rather than broker-wide means one queue's first-ever
+	// creation (StoreQueue's atomicWrite fsyncs twice, ~18ms on macOS) never
+	// blocks a different queue's concurrent first creation — only concurrent
+	// creators of the SAME name contend. The hot path (queue already known)
+	// in getOrCreateQueueState never touches this map; it is a single
+	// lock-free sync.Map Load.
+	queueCreateMuByName sync.Map
+
+	// ordinalAlloc is the broker-wide allocator for queue composite-tag
+	// ordinals (broker/tag_packing.go). Initialized at construction from the
+	// max Ordinal already persisted across all known queues (via
+	// ListQueues), so restart never reissues an ordinal a still-live durable
+	// queue already owns. allocateOrdinal() is the only writer.
+	ordinalAlloc atomic.Uint64
+
 	// logger is used only on cold paths (e.g. a dropped dead-letter). nil is
 	// treated as "no logging" so callers that never wire one pay nothing; the
 	// server builder injects its interfaces.Logger via SetLogger.
@@ -215,9 +286,144 @@ func NewStorageBroker(storage interfaces.Storage, engineConfig interfaces.Engine
 		ttlNow:       func() int64 { return time.Now().UnixMilli() },
 	}
 
+	broker.initOrdinalAllocator()
 	broker.initializeDefaultExchanges()
 
 	return broker
+}
+
+// initOrdinalAllocator seeds ordinalAlloc from the highest queue ordinal
+// already persisted (via ListQueues), so a fresh process never reissues an
+// ordinal a still-live durable queue already owns after restart. Queues
+// declared before this field existed (or never yet resolved) carry
+// Ordinal==0 and are ignored by the max. A ListQueues error is tolerated
+// (best-effort, mirrors updateDurableMetadata's "log but don't fail" style
+// elsewhere in this file): ordinalAlloc simply starts at 0, so the first
+// allocation is ordinal 1, same as a brand-new broker.
+//
+// ListQueues alone under-reports the true high-water mark: a queue's
+// ordinal is RETIRED, never reclaimed, when its metadata record is deleted
+// (queue.delete purges only the in-memory ring — the shared WAL is never
+// purged by queue name; see recovery_manager.go's discard-on-recovery
+// cases B/C). So a name that was declared, published to, and deleted still
+// has physical records sitting in the WAL tagged with its old ordinal, with
+// no metadata trace for ListQueues to see. Left unaccounted for, a fresh
+// declare of a new name (or a redeclare of the same name) after restart
+// could be handed that same retired ordinal — and the moment recovery next
+// runs, records from the dead incarnation and the new one would carry
+// identical composite tags, an unrecoverable collision in the shared WAL's
+// bare-uint64-keyed offsetIndex/ackBitmap. So every recoverable record's own
+// composite-tag ordinal is folded into the high-water mark too, not just
+// live queues' persisted Ordinal fields.
+func (b *StorageBroker) initOrdinalAllocator() {
+	var maxOrdinal uint64
+
+	if queues, err := b.storage.ListQueues(); err == nil {
+		for _, q := range queues {
+			if q.Ordinal > maxOrdinal {
+				maxOrdinal = q.Ordinal
+			}
+		}
+	}
+
+	if recoverable, err := b.storage.GetRecoverableMessages(); err == nil {
+		for _, messages := range recoverable {
+			for _, m := range messages {
+				if m.DeliveryMode != 2 {
+					continue
+				}
+				if ord := TagOrdinal(m.DeliveryTag); ord > maxOrdinal {
+					maxOrdinal = ord
+				}
+			}
+		}
+	}
+
+	b.ordinalAlloc.Store(maxOrdinal)
+}
+
+// allocateOrdinal hands out the next composite-tag queue ordinal
+// (broker/tag_packing.go), starting from 1 (0 means "unassigned"). Fails
+// loudly — never silently wraps — if the 20-bit ordinal space is exhausted;
+// see tag_packing.go for why that is unreachable in any real deployment
+// (1,048,575 queue lifetimes).
+func (b *StorageBroker) allocateOrdinal() (uint64, error) {
+	ord := b.ordinalAlloc.Add(1)
+	if ord > MaxQueueOrdinal {
+		return 0, fmt.Errorf("queue ordinal space exhausted: cannot allocate ordinal %d (max %d)", ord, MaxQueueOrdinal)
+	}
+	return ord, nil
+}
+
+// resolveQueueOrdinal returns the composite-tag ordinal for the queue whose
+// metadata record is `existing`, reusing an already-persisted one (redeclare,
+// or restart recovery) or allocating and persisting a fresh one. In the common
+// case DeclareQueue's new-queue branch has already resolved and persisted the
+// ordinal before the queue's QueueState is ever created, so this is just a
+// fast reuse; the allocate-and-persist branch below remains for legacy/edge
+// records (e.g. a pre-ordinal-field record).
+//
+// It takes the RECORD, not a queue name, and `existing` must be non-nil. That
+// is the whole point of the signature: a QueueState must never be created for
+// a name with no record (resolving an ordinal that cannot be persisted leaves
+// a live, record-less queue whose confirmed durable publishes are discarded at
+// the next restart), and passing the record makes that a precondition the
+// compiler helps enforce rather than a comment a future caller can miss. The
+// sole caller, createQueueStateLocked, reads the record to make exactly that
+// decision and hands the same pointer down, so there is no second read here.
+// That caller holds getQueueCreateMutex for the queue name, so there is no
+// concurrent-allocation race for it.
+//
+// Persistence failure is tolerated (best-effort): a freshly allocated ordinal
+// is always new and unique, so a failed write here cannot cause a collision —
+// worst case the queue re-allocates a different, still-safe ordinal on next
+// restart — but it is logged loudly rather than silently swallowed, since a
+// lost ordinal write is exactly the shape of bug this mechanism prevents.
+func (b *StorageBroker) resolveQueueOrdinal(existing *protocol.Queue) uint64 {
+	if existing.Ordinal != 0 {
+		return existing.Ordinal
+	}
+
+	ordinal, aerr := b.allocateOrdinal()
+	if aerr != nil {
+		// Unreachable in any real deployment (see tag_packing.go); a silent
+		// wrap here would be cross-queue delivery-tag collision, so fail as
+		// loudly as possible instead of returning a value the caller could
+		// mistake for a valid ordinal. NOTE: this is the only panic reachable
+		// while a per-name create mutex is held with a bare Lock/Unlock. It is
+		// safe today only because nothing in server/ or broker/ recovers from
+		// a panic, so the process dies rather than leaving that name wedged —
+		// adding per-connection panic recovery would make the wedge real.
+		panic(aerr)
+	}
+
+	// existing is storage's SHARED CACHED POINTER (see
+	// PersistentMetadataStore.GetQueue/loadQueueFromDisk) — every other
+	// concurrent GetQueue caller (DeclareQueue, DeleteQueue, BindQueue, none
+	// of which hold this lock) reads the same object, so it must never be
+	// mutated in place. Clone before setting the ordinal. Field-by-field (not
+	// `cp := *existing`): protocol.Queue embeds an atomic.Uint64
+	// (MessageCount), which must not be copied by value (go vet: "assignment
+	// copies lock value") — round-trip its value through Load/Store instead.
+	cp := protocol.Queue{
+		Name:        existing.Name,
+		Durable:     existing.Durable,
+		AutoDelete:  existing.AutoDelete,
+		Exclusive:   existing.Exclusive,
+		Arguments:   existing.Arguments,
+		Channel:     existing.Channel,
+		OwnerConnID: existing.OwnerConnID,
+		Ordinal:     ordinal,
+	}
+	cp.MessageCount.Store(existing.MessageCount.Load())
+	if serr := b.storage.StoreQueue(&cp); serr != nil && b.logger != nil {
+		b.logger.Warn("failed to persist resolved queue ordinal; queue will re-resolve on next restart",
+			interfaces.LogField{Key: "queue", Value: existing.Name},
+			interfaces.LogField{Key: "ordinal", Value: ordinal},
+			interfaces.LogField{Key: "error", Value: serr})
+	}
+
+	return ordinal
 }
 
 // ttlNowMillis returns the current wall clock in Unix milliseconds through the
@@ -464,6 +670,65 @@ func (b *StorageBroker) getQueueConsumersMutex(queueName string) *sync.Mutex {
 	return val.(*sync.Mutex)
 }
 
+// getQueueCreateMutex returns the per-queue-name mutex that serializes every
+// operation which creates, re-validates, or destroys a queue's identity for
+// one name. Same LoadOrStore-one-mutex-per-key pattern as
+// getQueueConsumersMutex above.
+//
+// FOUR acquirers, all of which HOLD IT ACROSS the QueueState work rather than
+// unlocking first — that is the invariant, and it is the opposite of what this
+// comment said before the C1 fixes:
+//   - getOrCreateQueueState — cold-path creation; defer-unlocks, so it is held
+//     across createQueueStateLocked.
+//   - DeclareQueue, existing-queue branch — re-reads the record under the lock
+//     and holds it across all of declareExistingQueueLocked. The one path that
+//     unlocks early is the deliberate fallthrough when the re-read finds the
+//     record deleted; that path then re-acquires below.
+//   - DeclareQueue, new-queue branch — holds it across the
+//     ordinal-allocate-then-persist sequence AND the activeQueues.Store plus
+//     createQueueStateLocked pair, unlocking only after the state is published.
+//   - DeleteQueue's teardown — holds it from activeQueues.Delete through
+//     storage.DeleteQueue inclusive.
+//
+// WHY they hold rather than unlock: a delete landing between "validate the
+// record" and "create the state" produced a live, publishable, record-less
+// queue whose confirmed durable publishes were discarded at the next restart.
+// Unlocking early anywhere above reopens that. See createQueueStateLocked.
+//
+// NON-REENTRANT. While holding it, call createQueueStateLocked, NEVER
+// getOrCreateQueueState — the latter takes this same mutex and self-deadlocks.
+//
+// LOCK ORDERING RULE — this mutex is a LEAF among broker locks. While it is
+// held you may descend only into the storage/metadata layer (GetQueue /
+// StoreQueue, i.e. PersistentMetadataStore.mutex). You must NEVER acquire
+// another broker-level lock beneath it — in particular getQueueConsumersMutex —
+// and nothing may acquire this one while holding that. Two per-name mutexes
+// taken in opposite orders on two queue names is a textbook deadlock, and the
+// storage layer never calls back up into the broker, so keeping this a leaf is
+// what makes the ordering trivially acyclic.
+//
+// SIBLING, NOT NESTED, with the consumers mutex: DeleteQueue takes the
+// consumers mutex to stop and unregister consumers, and RELEASES it before
+// acquiring this one for the teardown span. The two spans are strictly
+// disjoint. Preserve that if you reorder teardown.
+//
+// If you add a call under this lock, re-verify the leaf rule and the
+// sibling-not-nested property — and if you change who holds it across what,
+// UPDATE THIS COMMENT. A lock-discipline comment that no longer matches the
+// code is the same defect class as an unverified safety invariant: it is read
+// precisely by the maintainer about to add a call under the lock.
+//
+// Acquirers are named by SYMBOL, deliberately, with no line numbers: grep for
+// getQueueCreateMutex. This comment has twice shipped carrying references that
+// had drifted under edits made above them — once while it was itself being
+// fixed for being wrong. A stale line number here misdirects exactly the
+// maintainer the comment exists to warn, so keep symbol names when you extend
+// it; they are less precise but edits cannot rot them.
+func (b *StorageBroker) getQueueCreateMutex(queueName string) *sync.Mutex {
+	val, _ := b.queueCreateMuByName.LoadOrStore(queueName, &sync.Mutex{})
+	return val.(*sync.Mutex)
+}
+
 // SetQueueOwnerIfFree atomically claims ownership of a queue for a connection.
 // Returns true if the caller is now the owner (either it was unowned or already
 // owned by the same connection). Returns false if another connection already
@@ -500,11 +765,83 @@ func (b *StorageBroker) GetQueuesOwnedByConnection(connID string) []string {
 	return queues
 }
 
-// getOrCreateQueueState returns the queue state, creating it if needed (lock-free)
+// getOrCreateQueueState returns the queue state, creating it if needed. The
+// fast path (queue already known) is a single lock-free sync.Map load — this
+// is called on every publish, so it must stay cheap. Only the COLD path
+// (first-ever access to this queue name in this process) takes the per-name
+// mutex from getQueueCreateMutex: it must resolve the queue's composite-tag
+// ordinal (broker/tag_packing.go) and call SetOrdinal BEFORE the QueueState
+// is published to other goroutines. A plain LoadOrStore would publish the
+// new QueueState first, letting a concurrent publisher mint a tag with
+// ordinalBase still at its zero value — colliding with ordinal-0's tag space
+// (see queueCreateMuByName's field doc). The re-check after acquiring the
+// mutex handles two goroutines racing to create the SAME queue name; other
+// queue names creating concurrently only contend briefly on the (distinct,
+// per-name) mutex, not on each other's ordinal resolution.
 func (b *StorageBroker) getOrCreateQueueState(queueName string) *QueueState {
-	val, ok := b.queueStates.Load(queueName)
-	if ok {
+	if val, ok := b.queueStates.Load(queueName); ok {
 		return val.(*QueueState)
+	}
+
+	mu := b.getQueueCreateMutex(queueName)
+	mu.Lock()
+	defer mu.Unlock()
+
+	return b.createQueueStateLocked(queueName)
+}
+
+// createQueueStateLocked creates and publishes the QueueState for queueName.
+// The caller MUST already hold getQueueCreateMutex(queueName): the ordinal is
+// resolved and SetOrdinal is called BEFORE the state is published via
+// queueStates.Store, so a concurrent publisher can never observe it with
+// ordinalBase still at its zero value. It re-checks queueStates first, so it
+// is safe to call when another goroutine created the state while the caller
+// was waiting on the mutex.
+func (b *StorageBroker) createQueueStateLocked(queueName string) *QueueState {
+	if val, ok := b.queueStates.Load(queueName); ok {
+		return val.(*QueueState)
+	}
+
+	// A QueueState must never come into existence for a name that has no
+	// metadata record. THIS nil-check is that guard — resolveQueueOrdinal
+	// below persists unconditionally and takes the record as a non-nil
+	// precondition, so without this check we would allocate an ordinal for a
+	// name with nothing to write it to, leaving a live, publishable,
+	// record-less queue. Recovery classifies records with no metadata as a
+	// deleted queue's and discards them, so any durable publish confirmed
+	// against such a state is lost at the next restart.
+	//
+	// In production the only way to reach here without a record is that a
+	// concurrent DeleteQueue removed it (routing can resolve a binding just
+	// before the delete lands). Return a CLOSED state rather than a live one:
+	// every publish path bails on StopCh() — PublishMessage,
+	// PublishMessageAsyncConfirm, fanoutSharedAsyncConfirm, fanoutSharedSync
+	// and PublishMessageTx all check it — so the publish is REFUSED instead of
+	// being confirmed and then silently discarded. Any new publish path MUST
+	// keep that StopCh check or this guarantee is lost.
+	//
+	// It is deliberately NOT stored in queueStates and burns no ordinal, so a
+	// later legitimate declare still creates a real state for this name.
+	//
+	// A read FAILURE is deliberately treated the same as absence here, unlike
+	// DeclareQueue's re-check which fails the declare instead. The asymmetry is
+	// intentional: this function cannot report an error (it returns only a
+	// *QueueState, and giving it an error return would push a decision onto
+	// ~19 call sites that mostly cannot act on it), and refusing is the safe
+	// direction — a spurious ErrQueueClosed nack costs a publisher a retry,
+	// whereas guessing "present" on an unreadable record risks the silent
+	// data loss above. The unreadable case is logged so it cannot be mistaken
+	// for a routine delete race, since the two are indistinguishable here.
+	record, gerr := b.storage.GetQueue(queueName)
+	if gerr != nil || record == nil {
+		if gerr != nil && !errors.Is(gerr, interfaces.ErrQueueNotFound) && b.logger != nil {
+			b.logger.Warn("queue metadata unreadable; refusing to create queue state (publishes will be refused until it reads cleanly)",
+				interfaces.LogField{Key: "queue", Value: queueName},
+				interfaces.LogField{Key: "error", Value: gerr})
+		}
+		dead := NewQueueState(b.computeDepthHighWM())
+		dead.Close()
+		return dead
 	}
 
 	// Create new queue state with a backpressure high-water mark derived from
@@ -512,9 +849,14 @@ func (b *StorageBroker) getOrCreateQueueState(queueName string) *QueueState {
 	// coordinates broker-level publisher backpressure with storage-level
 	// spilling: once unacked depth reaches the spill threshold, publishers
 	// block in WaitForCapacity until consumers ack and drain.
+	//
+	// The record read above is handed straight to resolveQueueOrdinal: it is
+	// the same record that decision needs, and re-reading it there would be
+	// both redundant and a second chance to observe a different value.
 	newState := NewQueueState(b.computeDepthHighWM())
-	actual, _ := b.queueStates.LoadOrStore(queueName, newState)
-	return actual.(*QueueState)
+	newState.SetOrdinal(b.resolveQueueOrdinal(record))
+	b.queueStates.Store(queueName, newState)
+	return newState
 }
 
 // GetQueuePolicy returns the resolved x-argument policy for a queue, or nil
@@ -1051,35 +1393,37 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 	if err != nil && !errors.Is(err, interfaces.ErrQueueNotFound) {
 		return nil, fmt.Errorf("failed to check existing queue: %w", err)
 	}
-
-	// If exists, validate properties match
 	if existing != nil {
-		if existing.Durable != durable || existing.AutoDelete != autoDelete || existing.Exclusive != exclusive {
-			return nil, fmt.Errorf("queue '%s' properties mismatch", name)
+		// The read above is lock-free and therefore only a fast pre-check: a
+		// concurrent DeleteQueue may remove the record before we act on it.
+		// Re-read under the per-name create mutex and hold it across the whole
+		// redeclare, so the record cannot vanish between validating it and
+		// creating the QueueState. Acting on the stale pointer would re-install
+		// a deleted queue and then mint a QueueState whose freshly allocated
+		// ordinal is never persisted — a live, publishable, record-less queue
+		// whose confirmed durable publishes are discarded at the next restart.
+		mu := b.getQueueCreateMutex(name)
+		mu.Lock()
+		fresh, ferr := b.storage.GetQueue(name)
+		if ferr == nil && fresh != nil {
+			q, derr := b.declareExistingQueueLocked(fresh, durable, autoDelete, exclusive)
+			mu.Unlock()
+			return q, derr
 		}
-
-		// Add to active cache (lock-free)
-		b.activeQueues.Store(name, existing)
-
-		// Ensure queue state exists and carries the resolved policy. The
-		// stored (original) arguments win: redeclare arguments are not
-		// compared today (known gap — AMQP 0.9.1 says differing args should
-		// be a 406), so they must not overwrite the policy either. This
-		// branch also covers recovery when the storage backend already holds
-		// the durable queue across restarts. Resolution errors are tolerated
-		// here (nil policy) so queues persisted before validation existed
-		// remain usable.
-		qs := b.getOrCreateQueueState(name)
-		if policy, perr := ResolveQueuePolicy(existing.Arguments); perr == nil {
-			qs.SetPolicy(policy)
+		// Only a genuine "no such record" may fall through to the new-queue
+		// path. That path allocates and PERSISTS a fresh ordinal band, so
+		// treating a transient read failure as "deleted" would rewrite the
+		// ordinal of a queue that is still very much alive — re-banding its
+		// delivery tags and orphaning every record already written under the
+		// old band. Fail the declare instead; a redeclare is safe to retry.
+		if ferr != nil && !errors.Is(ferr, interfaces.ErrQueueNotFound) {
+			mu.Unlock()
+			return nil, fmt.Errorf("failed to re-check existing queue '%s': %w", name, ferr)
 		}
-		// W4 SQ-9: a (re)declare is queue "use" (resets the x-expires idle clock)
-		// and must ensure the reaper is running (e.g. on durable recovery, whose
-		// queues re-enter through this branch).
-		qs.MarkActivity(b.ttlNowMillis())
-		b.maybeStartReaper(name, qs)
-
-		return existing, nil
+		// The record was deleted out from under us. Fall through to the
+		// new-queue path, which re-acquires the mutex and persists a fresh
+		// record + ordinal (a new incarnation, with its own ordinal band).
+		mu.Unlock()
 	}
 
 	// Resolve the typed queue policy from x-arguments ONCE, at declare time
@@ -1093,21 +1437,74 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 		return nil, fmt.Errorf("queue '%s': %w", name, err)
 	}
 
-	// Create new queue
-	queue := protocol.NewQueue(name, durable, autoDelete, exclusive, arguments)
+	// New queue: serialize the whole check-allocate-persist sequence per
+	// queue NAME. Two connections idempotently declaring the SAME brand-new
+	// queue (the most common AMQP client pattern) is completely ordinary; the
+	// lock-free check above is only a fast pre-check, not a guarantee — both
+	// callers can reach here concurrently for the same name having each seen
+	// "not found". Without this lock, each would build its own queue object
+	// (Ordinal 0) and call StoreQueue independently: even with StoreQueue's
+	// write-once-ordinal invariant (storage/persistent_metadata.go) closing
+	// the specific "second write reverts Ordinal to 0" failure, the loser's
+	// StoreQueue call would still be redundant and racy against the winner's
+	// ordinal resolution below. Locking per name means only concurrent
+	// creators of the SAME name ever contend; other names' first-ever
+	// creation (StoreQueue's atomicWrite fsyncs twice, ~18ms on macOS)
+	// proceeds independently. See queueCreateMuByName's field doc.
+	mu := b.getQueueCreateMutex(name)
+	mu.Lock()
 
-	// Store queue
-	err = b.storage.StoreQueue(queue)
-	if err != nil {
-		return nil, err
+	// Re-check under the lock: another goroutine may have declared (and
+	// released the lock for) this exact queue name while this one was
+	// waiting on it. declareExistingQueueLocked requires the create mutex to
+	// stay held across the whole redeclare (see its doc comment), so unlock
+	// AFTER the call, not before — unlocking first would let a concurrent
+	// DeleteQueue land between the read above and the QueueState creation
+	// inside declareExistingQueueLocked, which is the exact race this whole
+	// change eliminates.
+	if existing, gerr := b.storage.GetQueue(name); gerr == nil && existing != nil {
+		q, derr := b.declareExistingQueueLocked(existing, durable, autoDelete, exclusive)
+		mu.Unlock()
+		return q, derr
 	}
 
-	// Add to active cache (lock-free)
-	b.activeQueues.Store(name, queue)
+	// Create new queue and resolve its composite-tag ordinal (see
+	// broker/tag_packing.go) BEFORE the first persist, so the record is
+	// written to disk exactly once, already carrying its final ordinal —
+	// never Ordinal:0 followed by a later repair write that a concurrent
+	// reader could observe mid-transition.
+	queue := protocol.NewQueue(name, durable, autoDelete, exclusive, arguments)
 
-	// Ensure queue state exists and attach the resolved policy (nil when no
-	// known x-arguments were supplied).
-	qs := b.getOrCreateQueueState(name)
+	ordinal, aerr := b.allocateOrdinal()
+	if aerr != nil {
+		mu.Unlock()
+		// Unreachable in any real deployment (see tag_packing.go); a silent
+		// wrap here would be cross-queue delivery-tag collision, so fail the
+		// declare outright instead of proceeding with an invalid ordinal.
+		return nil, fmt.Errorf("queue '%s': %w", name, aerr)
+	}
+	queue.Ordinal = ordinal
+
+	// Store queue. A failed persist here is a HARD failure (not
+	// best-effort): the ordinal was just allocated for this queue and must
+	// not be silently lost, so the declare fails rather than proceeding with
+	// an unpersisted identity.
+	if serr := b.storage.StoreQueue(queue); serr != nil {
+		mu.Unlock()
+		return nil, serr
+	}
+
+	// Publish the routing-cache entry and create the QueueState while STILL
+	// holding the per-name create mutex. Unlocking first would let a concurrent
+	// DeleteQueue's activeQueues.Delete be overwritten by the Store below,
+	// leaving a permanent phantom routing entry with no metadata record and no
+	// QueueState that the default exchange keeps resolving to.
+	// createQueueStateLocked assumes the lock is held (getOrCreateQueueState
+	// would retake it and self-deadlock — the mutex is not reentrant).
+	b.activeQueues.Store(name, queue)
+	qs := b.createQueueStateLocked(name)
+	mu.Unlock()
+
 	qs.SetPolicy(policy)
 	// W4 SQ-9: start the per-queue TTL/x-expires reaper (no-op unless the policy
 	// needs it) and seed the x-expires idle clock from declare time.
@@ -1122,6 +1519,46 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 	}
 
 	return queue, nil
+}
+
+// declareExistingQueueLocked handles the redeclare path for a queue name
+// that already has a persisted record — reached either from the lock-free
+// fast check at the top of DeclareQueue, or from the re-check inside the
+// per-name create lock after losing a race to create the same brand-new
+// queue name (see DeclareQueue's new-queue branch). The caller MUST already
+// hold getQueueCreateMutex(existing.Name) and must keep holding it for the
+// duration of this call: that is what makes "the record still exists" and
+// "the QueueState now exists" atomic against a concurrent DeleteQueue, which
+// is why this function calls createQueueStateLocked (which assumes the lock
+// is held) rather than getOrCreateQueueState (which would try to take it
+// again and self-deadlock).
+func (b *StorageBroker) declareExistingQueueLocked(existing *protocol.Queue, durable, autoDelete, exclusive bool) (*protocol.Queue, error) {
+	if existing.Durable != durable || existing.AutoDelete != autoDelete || existing.Exclusive != exclusive {
+		return nil, fmt.Errorf("queue '%s' properties mismatch", existing.Name)
+	}
+
+	// Add to active cache (lock-free)
+	b.activeQueues.Store(existing.Name, existing)
+
+	// Ensure queue state exists and carries the resolved policy. The
+	// stored (original) arguments win: redeclare arguments are not
+	// compared today (known gap — AMQP 0.9.1 says differing args should
+	// be a 406), so they must not overwrite the policy either. This
+	// branch also covers recovery when the storage backend already holds
+	// the durable queue across restarts. Resolution errors are tolerated
+	// here (nil policy) so queues persisted before validation existed
+	// remain usable.
+	qs := b.createQueueStateLocked(existing.Name)
+	if policy, perr := ResolveQueuePolicy(existing.Arguments); perr == nil {
+		qs.SetPolicy(policy)
+	}
+	// W4 SQ-9: a (re)declare is queue "use" (resets the x-expires idle clock)
+	// and must ensure the reaper is running (e.g. on durable recovery, whose
+	// queues re-enter through this branch).
+	qs.MarkActivity(b.ttlNowMillis())
+	b.maybeStartReaper(existing.Name, qs)
+
+	return existing, nil
 }
 
 // DeleteQueue removes a queue
@@ -1184,13 +1621,22 @@ func (b *StorageBroker) DeleteQueue(name string, ifUnused, ifEmpty bool) (int, e
 		}
 	}
 
+	// Hold the per-name create mutex across the teardown so a concurrent
+	// getOrCreateQueueState cold path cannot observe the metadata record
+	// AFTER the QueueState has been removed but BEFORE the record is
+	// deleted. In that window resolveQueueOrdinal would reuse the dying
+	// queue's ordinal without persisting it, leaving a live publishable
+	// queue with no metadata record — whose durable publishes are confirmed
+	// and then discarded at the next restart as a deleted queue.
+	cmu := b.getQueueCreateMutex(name)
+	cmu.Lock()
 	b.activeQueues.Delete(name)
 	b.queueOwners.Delete(name)
 	if qval, qok := b.queueStates.LoadAndDelete(name); qok {
 		qval.(*QueueState).Close()
 	}
-
 	err = b.storage.DeleteQueue(name)
+	cmu.Unlock()
 	if err != nil {
 		return purgedCount, err
 	}
@@ -1645,7 +2091,7 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 		queueState := b.getOrCreateQueueState(queueName)
 
 		if !queueState.WaitForCapacity(queueState.StopCh()) {
-			return fmt.Errorf("queue '%s' closed during backpressure wait", queueName)
+			return fmt.Errorf("queue '%s' closed during backpressure wait: %w", queueName, ErrQueueClosed)
 		}
 
 		// SQ-11 max-length: one policy load per target queue (nil => no policy
@@ -1680,7 +2126,7 @@ func (b *StorageBroker) PublishMessage(exchangeName, routingKey string, message 
 		// reset), so pure-transient queues also go through the frontier after
 		// their first publish. The lock is held for O(1) work (append + atomic
 		// store), never across I/O.
-		msgID := queueState.FrontierReserve(func() uint64 { return b.globalDeliveryTag.Add(1) })
+		msgID := queueState.FrontierReserve()
 
 		var storeMsg *protocol.Message
 		if i == 0 {
@@ -1888,7 +2334,7 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 		// was deleted out from under us.
 		select {
 		case <-queueState.StopCh():
-			return false, nil, fmt.Errorf("queue '%s' closed", queueName)
+			return false, nil, fmt.Errorf("queue '%s': %w", queueName, ErrQueueClosed)
 		default:
 		}
 		if queueState.AtHighWaterMark() {
@@ -1914,7 +2360,7 @@ func (b *StorageBroker) PublishMessageAsyncConfirm(exchangeName, routingKey stri
 		// in tag order and any concurrent transient publisher that mints a higher
 		// tag observes the queue frontier-active and routes through it (A3
 		// race-safety — see QueueState.FrontierReserve).
-		msgID := queueState.FrontierReserve(func() uint64 { return b.globalDeliveryTag.Add(1) })
+		msgID := queueState.FrontierReserve()
 
 		var storeMsg *protocol.Message
 		if i == 0 {
@@ -2034,7 +2480,7 @@ func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *p
 			for _, r := range reserved {
 				r.qs.FrontierComplete(r.tag, false)
 			}
-			return false, nil, fmt.Errorf("queue '%s' closed", queueName)
+			return false, nil, fmt.Errorf("queue '%s': %w", queueName, ErrQueueClosed)
 		default:
 		}
 		if queueState.AtHighWaterMark() {
@@ -2053,7 +2499,7 @@ func (b *StorageBroker) fanoutSharedAsyncConfirm(sdw sharedDurableWriter, agg *p
 			}
 		}
 
-		msgID := queueState.FrontierReserve(func() uint64 { return b.globalDeliveryTag.Add(1) })
+		msgID := queueState.FrontierReserve()
 
 		var storeMsg *protocol.Message
 		if i == 0 {
@@ -2173,7 +2619,7 @@ func (b *StorageBroker) fanoutSharedSync(sdw sharedDurableWriter, message *proto
 			for _, r := range reserved {
 				r.qs.FrontierComplete(r.tag, false)
 			}
-			return fmt.Errorf("queue '%s' closed during backpressure wait", queueName)
+			return fmt.Errorf("queue '%s' closed during backpressure wait: %w", queueName, ErrQueueClosed)
 		}
 
 		p := queueState.Policy()
@@ -2193,7 +2639,7 @@ func (b *StorageBroker) fanoutSharedSync(sdw sharedDurableWriter, message *proto
 		// frontier lock, so a concurrent durable publisher minting a higher tag
 		// observes the queue frontier-active and can never advance head past this
 		// still-pending lower tag before its completion below marks it done.
-		msgID := queueState.FrontierReserve(func() uint64 { return b.globalDeliveryTag.Add(1) })
+		msgID := queueState.FrontierReserve()
 
 		var storeMsg *protocol.Message
 		if i == 0 {
@@ -2358,14 +2804,14 @@ func (b *StorageBroker) PublishMessageTx(txnStore interfaces.Storage, exchangeNa
 
 		if !queueState.WaitForCapacity(queueState.StopCh()) {
 			releaseReserved()
-			return nil, fmt.Errorf("queue '%s' closed during backpressure wait", queueName)
+			return nil, fmt.Errorf("queue '%s' closed during backpressure wait: %w", queueName, ErrQueueClosed)
 		}
 
 		// Reserve the tag on the frontier at stage time, minting inside the
 		// callback so this queue's frontier tags register in tag order (same
 		// pattern as PublishMessage). The tag stays pending on the frontier
 		// until the deferred closure calls FrontierComplete after commit/abort.
-		msgID := queueState.FrontierReserve(func() uint64 { return b.globalDeliveryTag.Add(1) })
+		msgID := queueState.FrontierReserve()
 		reserved = append(reserved, reservedSlot{queueState, msgID})
 
 		var storeMsg *protocol.Message
@@ -3032,20 +3478,6 @@ func (b *StorageBroker) GetConsumerForDelivery(deliveryTag uint64) (string, bool
 // RebuildDeliveryIndex rebuilds a single delivery index entry (used during crash recovery)
 func (b *StorageBroker) RebuildDeliveryIndex(deliveryTag uint64, consumerTag string) {
 	b.deliveryIndex.Store(deliveryTag, consumerTag)
-}
-
-// AdvanceDeliveryTag advances the global delivery tag counter past the given value.
-// Called during recovery to ensure new delivery tags don't collide with recovered ones.
-func (b *StorageBroker) AdvanceDeliveryTag(tag uint64) {
-	for {
-		current := b.globalDeliveryTag.Load()
-		if tag <= current {
-			return
-		}
-		if b.globalDeliveryTag.CompareAndSwap(current, tag) {
-			return
-		}
-	}
 }
 
 // RecoverQueue initializes a queue's dispatch cursor from the recovered

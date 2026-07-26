@@ -20,8 +20,8 @@ func TestWaitForCapacity_WakesOnAckAdvance_Within1ms(t *testing.T) {
 		stop, cancel := makeStop()
 		defer cancel()
 
-		qs.Publish(0)
-		qs.Publish(1)
+		qs.FrontierComplete(qs.FrontierReserve(), true)
+		qs.FrontierComplete(qs.FrontierReserve(), true)
 		t0, _, _ := qs.Claim(stop, testTimer(qs))
 		t1, _, _ := qs.Claim(stop, testTimer(qs))
 		qs.ClaimInflight(t0)

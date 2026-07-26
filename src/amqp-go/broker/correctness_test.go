@@ -164,17 +164,38 @@ func TestQueueConsumersConcurrentUnregister(t *testing.T) {
 	}
 }
 
-// TestGlobalDeliveryTagMonotonic verifies that the global delivery tag counter
-// produces strictly increasing, globally unique IDs (C3 fix).
-func TestGlobalDeliveryTagMonotonic(t *testing.T) {
+// TestDeliveryTagsGloballyUniquePerQueueMonotonic verifies the two properties
+// the C3 fix actually protects, publishing alternately to two queues.
+//
+// This supersedes TestGlobalDeliveryTagMonotonic, which asserted that delivery
+// tags strictly increase ACROSS queues. That was never a required property — it
+// was an artifact of minting every tag from one shared counter. Tags are now
+// composed per queue, so interleaved publishes to different queues legitimately
+// produce descending values, and the old assertion is false by construction.
+//
+// The property that IS load-bearing is global UNIQUENESS, which is what that
+// test's own doc comment named as its purpose. It is load-bearing because the
+// broker has ONE shared WAL whose offsetIndex, ackBitmap and currentFileOffsets
+// are keyed by a bare uint64 with no queue discriminator, as is the broker's
+// deliveryIndex — so two queues ever minting the same tag would mean an ack on
+// one queue reclaiming another queue's message: silent, durable, cross-queue
+// data loss.
+//
+// The second property, per-queue monotonicity, is what the dispatch plane
+// depends on (Claim walks a queue's tags in ascending order) and the old test
+// never checked it at all. So this is strictly stronger coverage than what it
+// replaces, on both dimensions that matter.
+func TestDeliveryTagsGloballyUniquePerQueueMonotonic(t *testing.T) {
 	broker, cleanup := createTestBroker(t)
 	defer cleanup()
 
 	broker.DeclareQueue("queue-a", false, false, false, nil)
 	broker.DeclareQueue("queue-b", false, false, false, nil)
 
+	seen := make(map[uint64]string, 100)
+	prevPerQueue := make(map[string]uint64, 2)
+
 	// Publish to both queues alternately
-	prev := uint64(0)
 	for i := 0; i < 100; i++ {
 		qn := "queue-a"
 		if i%2 == 1 {
@@ -184,31 +205,25 @@ func TestGlobalDeliveryTagMonotonic(t *testing.T) {
 		if err := broker.PublishMessage("", qn, msg); err != nil {
 			t.Fatalf("Publish %d to %s failed: %v", i, qn, err)
 		}
-		if msg.DeliveryTag <= prev {
-			t.Errorf("delivery tag %d not increasing (prev=%d) at iteration %d", msg.DeliveryTag, prev, i)
+
+		// (1) Global uniqueness across queues.
+		if owner, dup := seen[msg.DeliveryTag]; dup {
+			t.Fatalf("delivery tag %d reused at iteration %d: already issued to %s, now to %s — "+
+				"tags key the shared WAL and the broker delivery index, so a collision is "+
+				"cross-queue data loss", msg.DeliveryTag, i, owner, qn)
 		}
-		prev = msg.DeliveryTag
-	}
-}
+		seen[msg.DeliveryTag] = qn
 
-// TestAdvanceDeliveryTag verifies that AdvanceDeliveryTag correctly moves
-// the global counter past a recovered tag, preventing collisions (C3 fix).
-func TestAdvanceDeliveryTag(t *testing.T) {
-	broker, cleanup := createTestBroker(t)
-	defer cleanup()
-
-	// Simulate recovery: advance past tag 1000
-	broker.AdvanceDeliveryTag(1000)
-
-	broker.DeclareQueue("queue-a", false, false, false, nil)
-	msg := &protocol.Message{Body: []byte("x"), Exchange: "", RoutingKey: "queue-a"}
-	if err := broker.PublishMessage("", "queue-a", msg); err != nil {
-		t.Fatalf("Publish failed: %v", err)
+		// (2) Strictly increasing WITHIN each queue (what Claim's ascending walk needs).
+		if prev, ok := prevPerQueue[qn]; ok && msg.DeliveryTag <= prev {
+			t.Errorf("delivery tag %d not increasing within %s (prev=%d) at iteration %d",
+				msg.DeliveryTag, qn, prev, i)
+		}
+		prevPerQueue[qn] = msg.DeliveryTag
 	}
 
-	// New tag must be > 1000 (not start from 1, which would collide with recovered messages)
-	if msg.DeliveryTag <= 1000 {
-		t.Errorf("new delivery tag %d should be > 1000 after AdvanceDeliveryTag(1000)", msg.DeliveryTag)
+	if len(seen) != 100 {
+		t.Errorf("expected 100 distinct delivery tags, got %d", len(seen))
 	}
 }
 

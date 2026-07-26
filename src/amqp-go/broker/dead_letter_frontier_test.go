@@ -16,7 +16,7 @@ import (
 //
 // THE BUG (pre-fix): republishToTargets (dead_letter.go) mints a delivery tag
 // lock-free, stores it SYNCHRONOUSLY, then makes it visible with a raw
-// qs.Publish(msgID) — with NO FrontierActive() awareness. Because the store
+// visibility advance that bypassed the frontier entirely. Because the store
 // precedes the publish, the transient-victim window is already closed there; but
 // the DURABLE-victim window is open on a frontier-active DLX TARGET: the raw
 // casMaxHead(msgID+1) jumps head PAST a concurrently-reserved-but-still-pending
@@ -84,7 +84,7 @@ func TestFrontierFlip_DeadLetterSibling_NoStrand(t *testing.T) {
 	gateOpen.Store(false)
 
 	// A gated async durable publish reserves L on the target's frontier and holds
-	// it pending: frontierActive flips to true and head is NOT advanced past L.
+	// it pending: L is registered but head is NOT advanced past it.
 	var confirms atomic.Int64
 	confirmCB := func(e error) {
 		if e == nil {
@@ -92,12 +92,19 @@ func TestFrontierFlip_DeadLetterSibling_NoStrand(t *testing.T) {
 		}
 	}
 	dm := &protocol.Message{RoutingKey: target, Body: []byte("d"), DeliveryMode: 2}
+	headBeforeGatedReserve := qs.Head()
 	_, _, err = b.PublishMessageAsyncConfirm("", target, dm, confirmCB)
 	require.NoError(t, err)
-	require.True(t, qs.FrontierActive(), "target must be frontier-active after the gated durable reserve")
+	// The precondition that actually matters, and the one this comment states:
+	// the gated durable tag is RESERVED but not yet visible, so head must not
+	// have moved. (This replaces an assertion that the queue is
+	// "frontier-active"; every publish now routes through the frontier
+	// unconditionally, so that could never be false and asserted nothing.)
+	require.Equal(t, headBeforeGatedReserve, qs.Head(),
+		"a gated durable reserve must leave head unadvanced — L is pending, not visible")
 
 	// Drive the dead-letter republish straight through the seam. It mints
-	// msgID > L (globalDeliveryTag is monotonic and L was minted first), stores it
+	// msgID > L (this queue's sequence is monotonic and L was minted first), stores it
 	// synchronously (ring-resident), then publishes it. Pre-fix, the raw
 	// Publish(msgID)->casMaxHead(msgID+1) jumps head PAST the gated pending L.
 	published := int64(2) // the durable L + the dead-letter republish

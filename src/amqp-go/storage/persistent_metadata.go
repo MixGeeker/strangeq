@@ -1,7 +1,6 @@
 package storage
 
 import (
-	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -23,7 +22,6 @@ const (
 	ConsumersDir        = "consumers"
 	FileExtension       = ".cbor"
 	TempFileExtension   = ".tmp"
-	DeliveryTagFile     = "delivery_tag"
 )
 
 // PersistentMetadataStore implements persistent metadata storage using CBOR binary format
@@ -362,10 +360,33 @@ func (pm *PersistentMetadataStore) ListExchanges() ([]*protocol.Exchange, error)
 	return exchanges, nil
 }
 
-// StoreQueue persists a queue to disk and updates cache
+// StoreQueue persists a queue to disk and updates cache.
+//
+// INVARIANT: a queue's composite-tag ordinal (broker/tag_packing.go) is
+// write-once per queue incarnation. It is assigned exactly once, at
+// creation (broker.DeclareQueue / broker.resolveQueueOrdinal), and the only
+// way it is ever cleared is DeleteQueue removing the record entirely — a
+// redeclare of the same name after a delete finds no existing record here
+// and correctly gets a fresh allocation. Enforced here, not just at the
+// call sites that assign it: if a record for this queue name already
+// exists and its Ordinal is non-zero, that ordinal is authoritative and the
+// incoming queue's Ordinal is forced to match it, discarding whatever the
+// caller passed — 0 (a caller that built its object before an ordinal was
+// resolved) or any other non-zero value (a caller that raced a concurrent
+// allocation and lost). This makes the entire class of "two goroutines
+// both declare/persist a brand-new queue and interleave their StoreQueue
+// calls" bugs impossible regardless of ordering, not just the specific
+// case where the loser's write reverts Ordinal to 0: silently overwriting
+// band N with a different non-zero band M would be equally catastrophic —
+// a live queue whose durable WAL records don't match its persisted
+// ordinal, which recovery refuses to boot from.
 func (pm *PersistentMetadataStore) StoreQueue(queue *protocol.Queue) error {
 	pm.mutex.Lock()
 	defer pm.mutex.Unlock()
+
+	if existingOrdinal := pm.existingOrdinalLocked(queue.Name); existingOrdinal != 0 {
+		queue.Ordinal = existingOrdinal
+	}
 
 	data, err := cbor.Marshal(queue)
 	if err != nil {
@@ -383,6 +404,33 @@ func (pm *PersistentMetadataStore) StoreQueue(queue *protocol.Queue) error {
 	}
 
 	return nil
+}
+
+// existingOrdinalLocked returns the Ordinal already persisted for name, or 0
+// if no record exists (or it has never had one assigned). Callers MUST
+// already hold pm.mutex (it reads the cache and, on a miss, the disk file
+// directly rather than through GetQueue/loadQueueFromDisk, which would
+// re-acquire pm.mutex and deadlock against StoreQueue's write lock — Go's
+// sync.RWMutex is not reentrant). Used solely to enforce StoreQueue's
+// write-once-ordinal invariant.
+func (pm *PersistentMetadataStore) existingOrdinalLocked(name string) uint64 {
+	if pm.cacheEnabled {
+		if cached, ok := pm.queueCache.Load(name); ok {
+			return cached.(*protocol.Queue).Ordinal
+		}
+	}
+
+	path := filepath.Join(pm.baseDir, QueuesDir, name+FileExtension)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+
+	var existing protocol.Queue
+	if err := cbor.Unmarshal(data, &existing); err != nil {
+		return 0
+	}
+	return existing.Ordinal
 }
 
 // GetQueue loads a queue from cache or disk
@@ -948,30 +996,6 @@ func (pm *PersistentMetadataStore) LoadAllMetadata() (
 	}
 
 	return exchanges, queues, bindings, consumers, nil
-}
-
-func (pm *PersistentMetadataStore) SaveDeliveryTagCounter(tag uint64) error {
-	data := make([]byte, 8)
-	binary.BigEndian.PutUint64(data, tag)
-	path := filepath.Join(pm.baseDir, DeliveryTagFile)
-	pm.mutex.Lock()
-	defer pm.mutex.Unlock()
-	return pm.atomicWrite(path, data)
-}
-
-func (pm *PersistentMetadataStore) LoadDeliveryTagCounter() (uint64, error) {
-	path := filepath.Join(pm.baseDir, DeliveryTagFile)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return 0, nil
-		}
-		return 0, fmt.Errorf("failed to read delivery tag counter: %w", err)
-	}
-	if len(data) < 8 {
-		return 0, nil
-	}
-	return binary.BigEndian.Uint64(data), nil
 }
 
 // Close closes the metadata store (no-op for JSON files)

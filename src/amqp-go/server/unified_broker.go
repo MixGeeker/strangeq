@@ -75,9 +75,6 @@ type UnifiedBroker interface {
 	// per-message EnqueueRecoveredMessage.
 	RecoverQueue(queueName string, minTag, maxTag, count uint64)
 
-	// Recovery support — advances global delivery tag past recovered tags
-	AdvanceDeliveryTag(tag uint64)
-
 	// Recovery support — rebuilds delivery index entry for a recovered pending ack
 	RebuildDeliveryIndex(deliveryTag uint64, consumerTag string)
 

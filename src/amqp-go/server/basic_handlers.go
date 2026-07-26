@@ -517,6 +517,24 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 			}
 			return nil
 		}
+		if errors.Is(err, broker.ErrQueueClosed) {
+			// A concurrent queue.delete tore the target queue down after routing
+			// resolved its binding. The broker neither stored nor dead-lettered
+			// the message, so it must never be confirmed — but the connection is
+			// healthy and must not be torn down. Same priority order as the
+			// max-length rejection above:
+			//   - confirm mode: settle the tag as a basic.nack the contiguous ack
+			//     watermark can never re-confirm,
+			//   - else mandatory: return the message to the publisher,
+			//   - else: silently drop.
+			if confirmTag > 0 {
+				return s.settleRejectConfirm(conn, confirmCh, confirmTag)
+			}
+			if message.Mandatory {
+				return s.sendBasicReturn(conn, channelID, 312, "NO_ROUTE", message.Exchange, message.RoutingKey, message)
+			}
+			return nil
+		}
 		s.Log.Error("Failed to route message",
 			zap.Error(err),
 			zap.String("exchange", message.Exchange),
@@ -1001,8 +1019,9 @@ func parseBasicNackArgs(payload []byte) (deliveryTag uint64, multiple, requeue b
 
 // wireChannel returns the channel for channelID, or nil when it is not
 // registered. Real connections always register a channel via channel.open
-// before any delivery; a nil result (some unit tests) selects the legacy
-// wire-tag == msgID fallback in resolveDeliveryTag.
+// before any delivery; a nil result (some unit tests) makes resolveDeliveryTag
+// report the tag as unknown, since there is no per-channel wire-tag table to
+// resolve it against.
 func (s *Server) wireChannel(conn *protocol.Connection, channelID uint16) *protocol.Channel {
 	if v, ok := conn.Channels.Load(channelID); ok {
 		return v.(*protocol.Channel)
@@ -1012,24 +1031,23 @@ func (s *Server) wireChannel(conn *protocol.Connection, channelID uint16) *proto
 
 // resolveDeliveryTag (SQ-18) translates a wire delivery tag received on
 // basic.ack/nack/reject into the broker identity behind it and removes the
-// tracking entry (the tag is about to be settled). With a channel present the
-// per-channel wire-tag table is authoritative; without one it falls back to
-// treating the wire tag as the broker msgID (legacy path). known=false means
-// the tag is unknown or already settled (duplicate/no-ack/stale) and the caller
-// must no-op, matching AMQP's tolerant handling of stale acks.
+// tracking entry (the tag is about to be settled). The per-channel wire-tag
+// table is authoritative: wire tags (channel.NextWireTag, 1-based per
+// channel) and broker-internal msgIDs (packed queueOrdinal<<44|perQueueSeq
+// tags) are two independent tag spaces, so without a channel there is no way
+// to recover the msgID behind a wire tag. known=false means the tag is
+// unknown, already settled (duplicate/no-ack/stale), or there is no channel
+// to resolve it against, and the caller must no-op, matching AMQP's tolerant
+// handling of stale acks.
 func (s *Server) resolveDeliveryTag(channel *protocol.Channel, wireTag uint64) (msgID uint64, consumerTag string, isGet, known bool) {
-	if channel != nil {
-		ref, ok := channel.TakeWireTag(wireTag)
-		if !ok {
-			return 0, "", false, false
-		}
-		return ref.MsgID, ref.ConsumerTag, ref.IsGet, true
+	if channel == nil {
+		return 0, "", false, false
 	}
-	ctag, ok := s.Broker.GetConsumerForDelivery(wireTag)
+	ref, ok := channel.TakeWireTag(wireTag)
 	if !ok {
 		return 0, "", false, false
 	}
-	return wireTag, ctag, ctag == "", true
+	return ref.MsgID, ref.ConsumerTag, ref.IsGet, true
 }
 
 // handleBasicAck handles the basic.ack method

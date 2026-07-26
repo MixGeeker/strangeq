@@ -117,10 +117,6 @@ func (a *StorageBrokerAdapter) RequeueAllGetDeliveries() {
 	a.broker.RequeueAllGetDeliveries()
 }
 
-func (a *StorageBrokerAdapter) AdvanceDeliveryTag(tag uint64) {
-	a.broker.AdvanceDeliveryTag(tag)
-}
-
 func (a *StorageBrokerAdapter) RecoverQueue(queueName string, minTag, maxTag, count uint64) {
 	a.broker.RecoverQueue(queueName, minTag, maxTag, count)
 }

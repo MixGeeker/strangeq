@@ -242,9 +242,10 @@ func TestTxAckBuffers(t *testing.T) {
 	// Publish a message and retrieve it via basic.get (no_ack=false)
 	publishMessageToQueue(t, srv, "tx-ack-buffer", "to-ack")
 	deliveryTag := getDeliveryTag(t, srv, conn, frameCh, "tx-ack-buffer")
+	msgID := resolveWireTagToMsgID(t, srv, conn, 1, deliveryTag)
 
 	// Verify delivery is tracked
-	_, ok := srv.Broker.GetConsumerForDelivery(deliveryTag)
+	_, ok := srv.Broker.GetConsumerForDelivery(msgID)
 	assert.True(t, ok)
 
 	txSelect(t, srv, conn, frameCh, 1)
@@ -253,7 +254,7 @@ func TestTxAckBuffers(t *testing.T) {
 	require.NoError(t, err)
 
 	// Delivery should still be tracked — ack was buffered, not executed
-	_, ok = srv.Broker.GetConsumerForDelivery(deliveryTag)
+	_, ok = srv.Broker.GetConsumerForDelivery(msgID)
 	assert.True(t, ok, "delivery should still be tracked after buffered ack")
 
 	// Verify operation was buffered
@@ -270,6 +271,7 @@ func TestTxAckCommitExecutes(t *testing.T) {
 
 	publishMessageToQueue(t, srv, "tx-ack-commit", "to-ack-commit")
 	deliveryTag := getDeliveryTag(t, srv, conn, frameCh, "tx-ack-commit")
+	msgID := resolveWireTagToMsgID(t, srv, conn, 1, deliveryTag)
 
 	txSelect(t, srv, conn, frameCh, 1)
 
@@ -277,13 +279,13 @@ func TestTxAckCommitExecutes(t *testing.T) {
 	require.NoError(t, err)
 
 	// Still tracked before commit
-	_, ok := srv.Broker.GetConsumerForDelivery(deliveryTag)
+	_, ok := srv.Broker.GetConsumerForDelivery(msgID)
 	assert.True(t, ok)
 
 	txCommit(t, srv, conn, frameCh, 1)
 
 	// Delivery should be removed — ack was executed
-	_, ok = srv.Broker.GetConsumerForDelivery(deliveryTag)
+	_, ok = srv.Broker.GetConsumerForDelivery(msgID)
 	assert.False(t, ok, "delivery should be removed after committed ack")
 }
 
@@ -294,6 +296,7 @@ func TestTxAckRollbackDiscards(t *testing.T) {
 
 	publishMessageToQueue(t, srv, "tx-ack-rollback", "to-ack-rollback")
 	deliveryTag := getDeliveryTag(t, srv, conn, frameCh, "tx-ack-rollback")
+	msgID := resolveWireTagToMsgID(t, srv, conn, 1, deliveryTag)
 
 	txSelect(t, srv, conn, frameCh, 1)
 
@@ -303,7 +306,7 @@ func TestTxAckRollbackDiscards(t *testing.T) {
 	txRollback(t, srv, conn, frameCh, 1)
 
 	// Delivery should still be tracked — ack was discarded
-	_, ok := srv.Broker.GetConsumerForDelivery(deliveryTag)
+	_, ok := srv.Broker.GetConsumerForDelivery(msgID)
 	assert.True(t, ok, "delivery should still be tracked after rolled-back ack")
 
 	// No pending operations
@@ -319,6 +322,7 @@ func TestTxRejectBuffers(t *testing.T) {
 
 	publishMessageToQueue(t, srv, "tx-reject-buffer", "to-reject")
 	deliveryTag := getDeliveryTag(t, srv, conn, frameCh, "tx-reject-buffer")
+	msgID := resolveWireTagToMsgID(t, srv, conn, 1, deliveryTag)
 
 	txSelect(t, srv, conn, frameCh, 1)
 
@@ -326,7 +330,7 @@ func TestTxRejectBuffers(t *testing.T) {
 	require.NoError(t, err)
 
 	// Delivery should still be tracked
-	_, ok := srv.Broker.GetConsumerForDelivery(deliveryTag)
+	_, ok := srv.Broker.GetConsumerForDelivery(msgID)
 	assert.True(t, ok, "delivery should still be tracked after buffered reject")
 
 	ops, err := srv.TransactionManager.GetPendingOperations(1)
@@ -342,6 +346,7 @@ func TestTxNackBuffers(t *testing.T) {
 
 	publishMessageToQueue(t, srv, "tx-nack-buffer", "to-nack")
 	deliveryTag := getDeliveryTag(t, srv, conn, frameCh, "tx-nack-buffer")
+	msgID := resolveWireTagToMsgID(t, srv, conn, 1, deliveryTag)
 
 	txSelect(t, srv, conn, frameCh, 1)
 
@@ -349,7 +354,7 @@ func TestTxNackBuffers(t *testing.T) {
 	require.NoError(t, err)
 
 	// Delivery should still be tracked
-	_, ok := srv.Broker.GetConsumerForDelivery(deliveryTag)
+	_, ok := srv.Broker.GetConsumerForDelivery(msgID)
 	assert.True(t, ok, "delivery should still be tracked after buffered nack")
 
 	ops, err := srv.TransactionManager.GetPendingOperations(1)
@@ -370,6 +375,7 @@ func TestTxMultipleOperationsCommit(t *testing.T) {
 	// Publish a message to consume, so we can buffer an ack
 	publishMessageToQueue(t, srv, "tx-multi", "to-consume")
 	deliveryTag := getDeliveryTag(t, srv, conn, frameCh, "tx-multi")
+	msgID := resolveWireTagToMsgID(t, srv, conn, 1, deliveryTag)
 
 	txSelect(t, srv, conn, frameCh, 1)
 
@@ -393,7 +399,7 @@ func TestTxMultipleOperationsCommit(t *testing.T) {
 	assert.Nil(t, msg)
 
 	// Delivery should still be tracked (ack was buffered)
-	_, ok := srv.Broker.GetConsumerForDelivery(deliveryTag)
+	_, ok := srv.Broker.GetConsumerForDelivery(msgID)
 	assert.True(t, ok)
 
 	txCommit(t, srv, conn, frameCh, 1)
@@ -405,7 +411,7 @@ func TestTxMultipleOperationsCommit(t *testing.T) {
 	assert.Equal(t, "published-in-tx", string(msg.Body))
 
 	// Ack should have executed — delivery removed
-	_, ok = srv.Broker.GetConsumerForDelivery(deliveryTag)
+	_, ok = srv.Broker.GetConsumerForDelivery(msgID)
 	assert.False(t, ok)
 
 	// No pending operations
@@ -494,9 +500,10 @@ func TestTxGetDeliveryAckCommitExecutes(t *testing.T) {
 
 	publishMessageToQueue(t, srv, "tx-get-ack", "get-delivery")
 	deliveryTag := getDeliveryTag(t, srv, conn, frameCh, "tx-get-ack")
+	msgID := resolveWireTagToMsgID(t, srv, conn, 1, deliveryTag)
 
 	// Verify this is a basic.get delivery (empty consumer tag)
-	consumerTag, ok := srv.Broker.GetConsumerForDelivery(deliveryTag)
+	consumerTag, ok := srv.Broker.GetConsumerForDelivery(msgID)
 	require.True(t, ok)
 	assert.Equal(t, "", consumerTag)
 
@@ -506,12 +513,12 @@ func TestTxGetDeliveryAckCommitExecutes(t *testing.T) {
 	require.NoError(t, err)
 
 	// Still tracked
-	_, ok = srv.Broker.GetConsumerForDelivery(deliveryTag)
+	_, ok = srv.Broker.GetConsumerForDelivery(msgID)
 	assert.True(t, ok)
 
 	txCommit(t, srv, conn, frameCh, 1)
 
 	// Should be removed after commit
-	_, ok = srv.Broker.GetConsumerForDelivery(deliveryTag)
+	_, ok = srv.Broker.GetConsumerForDelivery(msgID)
 	assert.False(t, ok, "basic.get delivery ack should be executed on commit")
 }

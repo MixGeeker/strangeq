@@ -44,7 +44,7 @@ func BenchmarkQueueDispatch_Claim(b *testing.B) {
 	defer cancel()
 
 	for i := uint64(0); i < uint64(b.N)+1; i++ {
-		qs.Publish(i)
+		qs.FrontierComplete(qs.FrontierReserve(), true)
 	}
 
 	b.ReportAllocs()
@@ -57,6 +57,12 @@ func BenchmarkQueueDispatch_Claim(b *testing.B) {
 	}
 }
 
+// BenchmarkQueueDispatch_Publish measures the production tag-mint +
+// visibility path directly: FrontierReserve (the queue's one tag minter)
+// followed by FrontierComplete (the visibility/ready-count step). The old
+// lock-free QueueState.Publish(tag) fast path this benchmark originally
+// measured has been removed — every production publish now goes through
+// this pair (broker/queue_dispatch.go).
 func BenchmarkQueueDispatch_Publish(b *testing.B) {
 	qs := NewQueueState(0)
 	defer qs.Close()
@@ -65,7 +71,7 @@ func BenchmarkQueueDispatch_Publish(b *testing.B) {
 	b.ResetTimer()
 
 	for i := uint64(0); i < uint64(b.N); i++ {
-		qs.Publish(i)
+		qs.FrontierComplete(qs.FrontierReserve(), true)
 	}
 }
 
@@ -79,7 +85,7 @@ func BenchmarkQueueDispatch_PublishClaimRoundtrip(b *testing.B) {
 	b.ResetTimer()
 
 	for i := uint64(0); i < uint64(b.N); i++ {
-		qs.Publish(i)
+		qs.FrontierComplete(qs.FrontierReserve(), true)
 		if _, _, ok := qs.Claim(stop, testTimer(qs)); !ok {
 			b.Fatal("claim failed")
 		}
@@ -92,15 +98,15 @@ func BenchmarkQueueDispatch_ConcurrentPublishClaim(b *testing.B) {
 	stop, cancel := makeStop()
 	defer cancel()
 
-	var tagCounter atomic.Uint64
-
 	b.ReportAllocs()
 	b.ResetTimer()
 
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			tag := tagCounter.Add(1)
-			qs.Publish(tag)
+			// FrontierReserve is this queue's ONLY tag minter and is safe to call
+			// concurrently (frontierMu-guarded) — a real concurrent producer never
+			// picks its own tag, so no caller-side counter is needed here either.
+			qs.FrontierComplete(qs.FrontierReserve(), true)
 			if _, _, ok := qs.Claim(stop, testTimer(qs)); !ok {
 				b.Fatal("claim failed")
 			}
@@ -115,7 +121,7 @@ func BenchmarkQueueDispatch_Requeue(b *testing.B) {
 	defer cancel()
 
 	for i := uint64(0); i < uint64(b.N); i++ {
-		qs.Publish(i)
+		qs.FrontierComplete(qs.FrontierReserve(), true)
 		tag, _, ok := qs.Claim(stop, testTimer(qs))
 		if !ok {
 			b.Fatal("claim failed")
@@ -138,7 +144,7 @@ func BenchmarkQueueDispatch_AckAdvance(b *testing.B) {
 	defer cancel()
 
 	for i := uint64(0); i < uint64(b.N); i++ {
-		qs.Publish(i)
+		qs.FrontierComplete(qs.FrontierReserve(), true)
 		tag, _, ok := qs.Claim(stop, testTimer(qs))
 		if !ok {
 			b.Fatal("claim failed")
@@ -353,15 +359,15 @@ func BenchmarkDeliverMessage_ManualAck(b *testing.B) {
 
 	for i := uint64(0); i < uint64(b.N); i++ {
 		b.StopTimer()
-		// QueueState's tags are its own zero-based tail-cursor sequence, not
-		// an identity the caller controls (Publish(tag) only advances the
-		// head watermark to tag+1 — Claim then hands back whatever the tail
-		// cursor is, e.g. Publish(1) on a fresh queue yields Claim()==0, not
-		// 1). Storage must be keyed by the tag Claim actually returns, or
-		// deliverMessage's GetMessage silently takes the gap-tag path and
-		// never sends to the consumer (see BenchmarkQueueDispatch_Claim for
-		// the same zero-based Publish(i) convention).
-		qs.Publish(i)
+		// QueueState's tags are minted by FrontierReserve (this queue's ONLY tag
+		// minter — a dense, zero-based, per-queue sequence), not an identity the
+		// caller controls: Claim hands back whatever the tail cursor is, which
+		// tracks FrontierReserve's mint order, not this loop's `i`. Storage must
+		// be keyed by the tag Claim actually returns, or deliverMessage's
+		// GetMessage silently takes the gap-tag path and never sends to the
+		// consumer (see BenchmarkQueueDispatch_Claim for the same zero-based
+		// FrontierReserve/FrontierComplete convention).
+		qs.FrontierComplete(qs.FrontierReserve(), true)
 		claimedTag, redelivered, ok := qs.Claim(stop, testTimer(qs))
 		if !ok {
 			b.Fatal("claim failed")

@@ -180,7 +180,6 @@ func (b *ackTestBroker) GetConsumerForDelivery(deliveryTag uint64) (string, bool
 }
 
 func (b *ackTestBroker) RecoverQueue(queueName string, minTag, maxTag, count uint64) {}
-func (b *ackTestBroker) AdvanceDeliveryTag(tag uint64)                               {}
 func (b *ackTestBroker) RebuildDeliveryIndex(deliveryTag uint64, consumerTag string) {}
 func (b *ackTestBroker) GetMessageForGet(queueName string, noAck bool) (*protocol.Message, uint64, uint32, error) {
 	return nil, 0, 0, nil
@@ -278,7 +277,8 @@ func TestA2_AckFrameRoutedToAckQueue(t *testing.T) {
 	conn := protocol.NewConnection(serverConn)
 	conn.Channels.Store(uint16(1), protocol.NewChannel(1, conn))
 
-	ackFrame := encodeAckFrame(t, 1, 42, false)
+	ackWireTag := registerAckTestDelivery(conn, 1, 42, "test-consumer")
+	ackFrame := encodeAckFrame(t, 1, ackWireTag, false)
 
 	_, err := srv.processFrame(conn, ackFrame)
 	if err != nil {
@@ -331,7 +331,8 @@ func TestA2_RejectFrameRoutedToAckQueue(t *testing.T) {
 	defer serverConn.Close()
 	conn := protocol.NewConnection(serverConn)
 
-	rejectFrame := encodeRejectFrame(t, 1, 42, true)
+	rejectWireTag := registerAckTestDelivery(conn, 1, 42, "test-consumer")
+	rejectFrame := encodeRejectFrame(t, 1, rejectWireTag, true)
 
 	_, err := srv.processFrame(conn, rejectFrame)
 	if err != nil {
@@ -382,7 +383,8 @@ func TestA2_AckProcessorProcessesAck(t *testing.T) {
 	defer serverConn.Close()
 	conn := protocol.NewConnection(serverConn)
 
-	ackFrame := encodeAckFrame(t, 1, 42, false)
+	ackWireTag := registerAckTestDelivery(conn, 1, 42, "test-consumer")
+	ackFrame := encodeAckFrame(t, 1, ackWireTag, false)
 	conn.AckQueue <- ackFrame
 
 	done := make(chan struct{})
@@ -463,7 +465,8 @@ func TestA2_AckProcessorProcessesReject(t *testing.T) {
 	defer serverConn.Close()
 	conn := protocol.NewConnection(serverConn)
 
-	rejectFrame := encodeRejectFrame(t, 1, 42, true)
+	rejectWireTag := registerAckTestDelivery(conn, 1, 42, "test-consumer")
+	rejectFrame := encodeRejectFrame(t, 1, rejectWireTag, true)
 	conn.AckQueue <- rejectFrame
 
 	done := make(chan struct{})
@@ -505,7 +508,8 @@ func TestA2_AckProcessorDrainsOnClose(t *testing.T) {
 	conn := protocol.NewConnection(serverConn)
 
 	for i := uint64(1); i <= 5; i++ {
-		conn.AckQueue <- encodeAckFrame(t, 1, i, false)
+		wireTag := registerAckTestDelivery(conn, 1, i, "test-consumer")
+		conn.AckQueue <- encodeAckFrame(t, 1, wireTag, false)
 	}
 
 	done := make(chan struct{})
@@ -621,4 +625,34 @@ func TestA2_AckConcurrentWithPublish(t *testing.T) {
 
 	close(conn.AckQueue)
 	<-ackDone
+}
+
+// registerAckTestDelivery registers a real channel on conn — as every
+// production connection has — and records wireTag -> msgID for consumerTag,
+// returning the wire tag a client would put on the ack/nack/reject frame.
+//
+// Wire delivery tags (per-channel, 1-based, minted by Channel.NextWireTag) and
+// broker-internal msgIDs are two independent tag spaces bridged only by the
+// channel's wire-tag table. These ackProcessor fixtures used to drive a
+// connection with NO channel registered, and only resolved because a legacy
+// no-channel fallback treated the wire tag AS the msgID. That fallback has been
+// removed: under packed delivery tags a wire tag can never equal an msgID, so
+// the fallback could only ever have resolved to the wrong message.
+//
+// This wires the delivery the way production does. Every asserted msgID,
+// consumer tag and flag in the callers is unchanged — only the frame's wire tag
+// differs, which is fixture plumbing, not behaviour under test. These tests are
+// about the ackProcessor goroutine draining conn.AckQueue; tag resolution is
+// incidental to that subject.
+func registerAckTestDelivery(conn *protocol.Connection, channelID uint16, msgID uint64, consumerTag string) uint64 {
+	var channel *protocol.Channel
+	if v, ok := conn.Channels.Load(channelID); ok {
+		channel = v.(*protocol.Channel)
+	} else {
+		channel = protocol.NewChannel(channelID, conn)
+		conn.Channels.Store(channelID, channel)
+	}
+	wireTag := channel.NextWireTag()
+	channel.TrackDelivery(wireTag, msgID, consumerTag, false)
+	return wireTag
 }

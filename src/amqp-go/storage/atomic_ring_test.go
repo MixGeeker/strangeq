@@ -55,7 +55,13 @@ func TestAtomicRing_StoreSpilledWhenSlotOccupied(t *testing.T) {
 	seq, spilled, err := r.Store(4, msgAt(4))
 	require.NoError(t, err)
 	require.True(t, spilled)
-	require.Equal(t, uint64(4), seq)
+	// The returned seq is the SLOT the tag addresses (tag & mask), not a
+	// monotonic store counter. Slots are now addressed arithmetically from the
+	// tag, so tag 4 in a 4-slot ring maps back onto slot 0 — which is exactly
+	// why this store spills. No production caller reads this value (every one
+	// of them discards it and reads only `spilled`), so it is asserted here
+	// purely to pin the addressing rule the spill behaviour follows from.
+	require.Equal(t, uint64(4)&r.mask, seq)
 	require.Equal(t, uint64(4), r.Count())
 
 	got, ok := r.LoadByTag(0)
@@ -138,29 +144,55 @@ func TestAtomicRing_DeleteIdempotent_Concurrent(t *testing.T) {
 	require.Equal(t, uint64(99), r.Count())
 }
 
-func TestAtomicRing_DeleteTagGuard(t *testing.T) {
-	r := NewAtomicRing(4)
-	_, _, err := r.Store(1, msgAt(1))
+// TestAtomicRing_DeleteRejectsWrappedOccupant is the successor to the old
+// stale-tagToSeq guard. That test poisoned the tag->slot map to prove Delete
+// would not trust a stale mapping; slots are now addressed arithmetically as
+// tag&mask, so there is no map left to poison and that exact failure mode is
+// structurally impossible.
+//
+// The equivalent hazard in the arithmetic design is WRAPAROUND: two tags one
+// full lap apart share a slot, so a slot can hold an occupant that is not the
+// tag being asked about. Delete must refuse in that case — deleting the current
+// occupant on behalf of a stale tag from a previous lap would discard a live,
+// unacked message and silently corrupt the queue's depth accounting, since
+// Delete's CompareAndSwap result is the arbitration point
+// DeleteMessageIfPresent relies on for exactly-once accounting.
+//
+// This is the same invariant the old test protected — Delete never acts on a
+// tag it cannot positively identify in the slot — expressed against the
+// mechanism that replaced the map.
+func TestAtomicRing_DeleteRejectsWrappedOccupant(t *testing.T) {
+	const ringSize = 4
+	r := NewAtomicRing(ringSize)
+
+	// tag 1 and tag 1+ringSize are exactly one lap apart, so they share a slot.
+	// The ring never overwrites an occupied slot, so the lap is simulated the
+	// only way it can actually occur: the first occupant is removed, then the
+	// next lap's tag takes the slot.
+	_, spilled, err := r.Store(1, msgAt(1))
 	require.NoError(t, err)
+	require.False(t, spilled)
 	require.True(t, r.Delete(1))
 
-	for tag := uint64(2); tag <= 4; tag++ {
-		_, _, err := r.Store(tag, msgAt(tag))
-		require.NoError(t, err)
-	}
-	_, _, err = r.Store(5, msgAt(5))
+	const wrapped = uint64(1 + ringSize)
+	_, spilled, err = r.Store(wrapped, msgAt(wrapped))
 	require.NoError(t, err)
+	require.False(t, spilled)
 
-	r.tagMu.Lock()
-	r.tagToSeq[1] = 0
-	r.tagMu.Unlock()
+	// The stale tag from the previous lap must not be able to evict the current
+	// occupant, even though both address the same slot.
+	require.False(t, r.Delete(1),
+		"Delete(1) must refuse: slot %d now holds tag %d from the next lap, not tag 1",
+		wrapped&r.mask, wrapped)
 
-	require.False(t, r.Delete(1))
+	got, ok := r.LoadByTag(wrapped)
+	require.True(t, ok, "the wrapped occupant must still be resident after the refused delete")
+	require.Equal(t, wrapped, got.DeliveryTag)
+	require.Equal(t, uint64(1), r.Count())
 
-	got, ok := r.LoadByTag(5)
-	require.True(t, ok)
-	require.Equal(t, uint64(5), got.DeliveryTag)
-	require.Equal(t, uint64(4), r.Count())
+	// And the stale tag must read as a miss rather than returning its lap-mate.
+	_, ok = r.LoadByTag(1)
+	require.False(t, ok, "tag 1 must read as a miss: its slot belongs to tag %d now", wrapped)
 }
 
 func TestAtomicRing_MessageCountAccurate(t *testing.T) {
@@ -301,35 +333,59 @@ func TestAtomicRing_DeleteRange(t *testing.T) {
 	require.True(t, tags[10])
 }
 
-func TestAtomicRing_LoadBySeq(t *testing.T) {
+// TestAtomicRing_StoreReturnsAddressableSlot replaces the old LoadBySeq test.
+// The property it protected — a stored message is retrievable at the
+// coordinate Store handed back — still holds; what changed is that the
+// coordinate is now the tag's slot (tag & mask) rather than a separate
+// monotonic counter, so the same message is reachable by its tag directly.
+func TestAtomicRing_StoreReturnsAddressableSlot(t *testing.T) {
 	r := NewAtomicRing(256)
 	seq, _, err := r.Store(42, msgAt(42))
 	require.NoError(t, err)
-	require.Equal(t, uint64(0), seq)
+	require.Equal(t, uint64(42)&r.mask, seq, "the returned coordinate is the tag's slot")
 
-	got, ok := r.LoadBySeq(seq)
+	got, ok := r.LoadByTag(42)
 	require.True(t, ok)
 	require.Equal(t, uint64(42), got.DeliveryTag)
 
-	_, ok = r.LoadBySeq(999)
+	// A tag that was never stored must miss, including one whose slot is free.
+	_, ok = r.LoadByTag(999)
 	require.False(t, ok)
 }
 
-func TestAtomicRing_LoadBySeqAfterWraparound(t *testing.T) {
-	r := NewAtomicRing(4)
-	r.Store(1, msgAt(1))
-	r.Store(2, msgAt(2))
-	r.Store(3, msgAt(3))
-	r.Store(4, msgAt(4))
-	r.Delete(1)
-	r.Store(5, msgAt(5))
+// TestAtomicRing_LoadRejectsWrappedOccupant is the load-side counterpart to
+// TestAtomicRing_DeleteRejectsWrappedOccupant, and the successor to the old
+// LoadBySeq-after-wraparound test.
+//
+// Under arithmetic slot addressing, tags one full lap apart collide in the same
+// slot. The DeliveryTag identity check inside LoadByTag is the ONLY thing
+// preventing a lookup for a long-gone tag from returning its lap-mate — which
+// would deliver the wrong message body to a consumer under the wrong tag. This
+// pins that check.
+func TestAtomicRing_LoadRejectsWrappedOccupant(t *testing.T) {
+	const ringSize = 4
+	r := NewAtomicRing(ringSize)
+	for tag := uint64(1); tag <= 4; tag++ {
+		_, spilled, err := r.Store(tag, msgAt(tag))
+		require.NoError(t, err)
+		require.False(t, spilled)
+	}
 
-	got, ok := r.LoadBySeq(0)
-	require.False(t, ok, "seq 0 was deleted, should not be found")
+	// Free tag 1's slot, then let the next lap's tag take it.
+	require.True(t, r.Delete(1))
+	const wrapped = uint64(1 + ringSize)
+	_, spilled, err := r.Store(wrapped, msgAt(wrapped))
+	require.NoError(t, err)
+	require.False(t, spilled)
 
-	got, ok = r.LoadBySeq(4)
+	// The departed tag must miss even though its slot is occupied again...
+	_, ok := r.LoadByTag(1)
+	require.False(t, ok, "tag 1 is gone; its slot now belongs to tag %d", wrapped)
+
+	// ...and the current occupant must be returned under its OWN tag only.
+	got, ok := r.LoadByTag(wrapped)
 	require.True(t, ok)
-	require.Equal(t, uint64(5), got.DeliveryTag, "seq 4 should map to tag 5")
+	require.Equal(t, wrapped, got.DeliveryTag)
 }
 
 func TestAtomicRing_StoreNilMessageReturnsError(t *testing.T) {

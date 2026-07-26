@@ -364,6 +364,15 @@ func (b *StorageBroker) republishToTargets(srcQueueName string, targets []string
 
 		qs := b.getOrCreateQueueState(target)
 
+		select {
+		case <-qs.StopCh():
+			// Target queue was deleted out from under us — drop the dead-letter
+			// rather than publishing into a state that will never be recovered.
+			b.recordDeadLetterTargetGone(srcQueueName, target)
+			continue
+		default:
+		}
+
 		// Physical-ring backstop: never block (no WaitForCapacity) and never
 		// overshoot the ring high-water mark.
 		if qs.AtHighWaterMark() {
@@ -388,7 +397,7 @@ func (b *StorageBroker) republishToTargets(srcQueueName string, targets []string
 			}
 		}
 
-		msgID := qs.FrontierReserve(func() uint64 { return b.globalDeliveryTag.Add(1) })
+		msgID := qs.FrontierReserve()
 
 		var storeMsg *protocol.Message
 		if first {
@@ -477,6 +486,22 @@ func (b *StorageBroker) recordDeadLetterDrop(srcQueueName, target string, cause 
 func (b *StorageBroker) recordDeadLetterOverflow(srcQueueName, target string) {
 	if b.logger != nil {
 		b.logger.Warn("dead-letter dropped: target is at x-max-length with x-overflow=reject-publish",
+			interfaces.LogField{Key: "source_queue", Value: srcQueueName},
+			interfaces.LogField{Key: "target_exchange", Value: target})
+	}
+	if rec, ok := b.metricsCollector.(deadLetterDropRecorder); ok {
+		rec.RecordDeadLetterDropped()
+	}
+}
+
+// recordDeadLetterTargetGone surfaces a dead-letter dropped because the target
+// queue was deleted concurrently with the republish (getOrCreateQueueState
+// returns a closed, record-less QueueState in that case — see
+// createQueueStateLocked). Same convention as recordDeadLetterOverflow: a WARN
+// plus the shared optional metrics counter.
+func (b *StorageBroker) recordDeadLetterTargetGone(srcQueueName, target string) {
+	if b.logger != nil {
+		b.logger.Warn("dead-letter dropped: target queue was deleted",
 			interfaces.LogField{Key: "source_queue", Value: srcQueueName},
 			interfaces.LogField{Key: "target_exchange", Value: target})
 	}

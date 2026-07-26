@@ -167,12 +167,15 @@ func TestA1Integration_BackpressureBlocksPublisher(t *testing.T) {
 
 	stop := qs.StopCh()
 
-	qs.Publish(1)
-	qs.Publish(2)
-	qs.Publish(3)
-	qs.ClaimInflight(1)
-	qs.ClaimInflight(2)
-	qs.ClaimInflight(3)
+	tag1 := qs.FrontierReserve()
+	qs.FrontierComplete(tag1, true)
+	tag2 := qs.FrontierReserve()
+	qs.FrontierComplete(tag2, true)
+	tag3 := qs.FrontierReserve()
+	qs.FrontierComplete(tag3, true)
+	qs.ClaimInflight(tag1)
+	qs.ClaimInflight(tag2)
+	qs.ClaimInflight(tag3)
 
 	if d := qs.Depth(); d < 3 {
 		t.Errorf("Depth: got %d, want >= 3", d)
@@ -191,13 +194,13 @@ func TestA1Integration_BackpressureBlocksPublisher(t *testing.T) {
 	}
 
 	broker.storage.RegisterConsumerCursor("test-bp", "bp-consumer")
-	broker.storage.DeliverToConsumer("test-bp", "bp-consumer", 1)
-	broker.storage.DeliverToConsumer("test-bp", "bp-consumer", 2)
-	broker.storage.DeliverToConsumer("test-bp", "bp-consumer", 3)
+	broker.storage.DeliverToConsumer("test-bp", "bp-consumer", tag1)
+	broker.storage.DeliverToConsumer("test-bp", "bp-consumer", tag2)
+	broker.storage.DeliverToConsumer("test-bp", "bp-consumer", tag3)
 
-	broker.storage.AckFromConsumer("test-bp", "bp-consumer", 1)
+	broker.storage.AckFromConsumer("test-bp", "bp-consumer", tag1)
 	qs.SetMinAckCursor(broker.storage.GetMinAckCursor("test-bp"))
-	qs.AckAdvance(1)
+	qs.AckAdvance(tag1)
 
 	select {
 	case <-blocked:

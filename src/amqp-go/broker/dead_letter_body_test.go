@@ -418,10 +418,11 @@ func TestReject_IntoFullTargetReturnsPromptly(t *testing.T) {
 	// Wedge the target at its high-water mark: tiny WM + one ready message.
 	dlq := b.getOrCreateQueueState("dlq")
 	dlq.SetDepthHighWM(1)
+	fillTag := dlq.FrontierReserve()
 	require.NoError(t, b.storage.StoreMessage("dlq", &protocol.Message{
-		Body: []byte("fill"), RoutingKey: "src", DeliveryTag: b.globalDeliveryTag.Add(1),
+		Body: []byte("fill"), RoutingKey: "src", DeliveryTag: fillTag,
 	}))
-	dlq.Publish(dlq.Head()) // Depth()>=WM -> AtHighWaterMark
+	dlq.FrontierComplete(fillTag, true) // Depth()>=WM -> AtHighWaterMark
 
 	done := make(chan struct{})
 	go func() {

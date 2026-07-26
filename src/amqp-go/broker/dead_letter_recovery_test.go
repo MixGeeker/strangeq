@@ -19,14 +19,10 @@ func recoverPersistentIntoQueues(t *testing.T, store interfaces.Storage, b *Stor
 	recovered, err := store.GetRecoverableMessages()
 	require.NoError(t, err)
 
-	var maxDeliveryTag uint64
 	for queueName, msgs := range recovered {
 		var minTag, maxTag, count uint64
 		has := false
 		for _, m := range msgs {
-			if m.DeliveryTag > maxDeliveryTag {
-				maxDeliveryTag = m.DeliveryTag
-			}
 			if m.DeliveryMode != 2 {
 				continue
 			}
@@ -43,9 +39,6 @@ func recoverPersistentIntoQueues(t *testing.T, store interfaces.Storage, b *Stor
 		if has {
 			b.RecoverQueue(queueName, minTag, maxTag, count)
 		}
-	}
-	if maxDeliveryTag > 0 {
-		b.AdvanceDeliveryTag(maxDeliveryTag)
 	}
 }
 

@@ -187,12 +187,14 @@ func TestP0_AckProcessorSurvivesConsumerNotFound(t *testing.T) {
 	conn := protocol.NewConnection(serverConn)
 
 	// First: send an ack for an unknown delivery tag
+	// No wire-tag tracking for 999: it is deliberately an unknown delivery.
 	unknownAckFrame := encodeAckFrame(t, 1, 999, false)
 	conn.AckQueue <- unknownAckFrame
 
 	// Then: set up a real delivery tag and send a valid ack
 	broker.setDeliveryTag(100, "test-consumer")
-	validAckFrame := encodeAckFrame(t, 1, 100, false)
+	validWireTag := registerAckTestDelivery(conn, 1, 100, "test-consumer")
+	validAckFrame := encodeAckFrame(t, 1, validWireTag, false)
 	conn.AckQueue <- validAckFrame
 
 	done := make(chan struct{})

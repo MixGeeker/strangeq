@@ -1,6 +1,7 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -316,6 +317,17 @@ func (b *ServerBuilder) Build() (*Server, error) {
 
 	recoveryStats, err := recoveryManager.PerformRecovery()
 	if err != nil {
+		// ErrLegacyDataDirectory / ErrOrdinalMismatch are the one class of
+		// recovery error that must NOT fall through to "log and continue"
+		// below: they guard against silent cross-queue delivery-tag
+		// collision (broker/tag_packing.go) — a data-loss/corruption hazard,
+		// not a recoverable condition. Every other recovery error keeps the
+		// pre-existing (if debatable) "start with an empty broker" behavior
+		// unchanged; narrowing this to exactly these two sentinel errors is
+		// deliberate so this fix does not change behavior for anything else.
+		if errors.Is(err, ErrLegacyDataDirectory) || errors.Is(err, ErrOrdinalMismatch) {
+			return nil, fmt.Errorf("recovery aborted, refusing to start: %w", err)
+		}
 		logger.Error("Recovery failed", interfaces.LogField{Key: "error", Value: err})
 		// Continue with server startup even if recovery fails
 	} else {

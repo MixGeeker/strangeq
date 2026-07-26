@@ -14,6 +14,21 @@ type requeueEntry struct {
 }
 
 type QueueState struct {
+	// ordinalBase is this queue's composite-tag ordinal pre-shifted into
+	// position (PackTag(ordinal, 0)) so minting is a single OR. Set exactly
+	// once, before any publish or claim on this queue, by SetOrdinal. Zero
+	// value (0) is only ever observed if SetOrdinal was never called, which
+	// is a caller bug — see SetOrdinal's doc comment.
+	ordinalBase uint64
+
+	// nextSeq is this queue's private, zero-based, dense delivery-tag
+	// sequence (broker/tag_packing.go). It is guarded by frontierMu:
+	// FrontierReserve is the ONLY minter and already holds frontierMu for its
+	// other bookkeeping, so nextSeq rides along for free. Deliberately NOT
+	// atomic — an atomic here would let a reader observe it out of step with
+	// the frontierPending append it must stay coupled to.
+	nextSeq uint64
+
 	tail           atomic.Uint64
 	head           atomic.Uint64
 	minAckCursor   atomic.Uint64
@@ -41,7 +56,7 @@ type QueueState struct {
 
 	// maxLenMu serializes the reject-publish (x-overflow=reject-publish)
 	// admission decision — the read of WaitingCount()/ReadyBytes() and the
-	// matching Publish()/AddReadyBytes() increment — so concurrent publishers
+	// matching FrontierComplete()/AddReadyBytes() increment — so concurrent publishers
 	// can never both pass the AT-OR-OVER check at count == limit-1 and push the
 	// ready set permanently past the cap (SQ-11). It is taken ONLY on the
 	// reject-publish admission path: queues with no policy or with the drop-head
@@ -78,19 +93,15 @@ type QueueState struct {
 	// LOWEST still-pending routed tag (or frontierMax+1 if none pending), so a
 	// tag is never claimable before its own fsync.
 	//
-	// frontierActive is set (permanently) BEFORE a durable publish assigns its
-	// global delivery tag, so a concurrent transient publisher that assigns a
-	// higher tag observes it (sequentially-consistent atomics) and routes through
-	// the frontier instead of the lock-free fast path — closing the 0→1 race.
-	// A pure-transient queue never sets it: one atomic load selects today's
-	// lock-free CAS-max Publish (zero regression). frontierMu guards the frontier
-	// structures and is held ONLY for O(1)-amortized bookkeeping, never across
-	// I/O, so a durable completion can drive it from the WAL batch-writer goroutine
-	// (A4). frontierPending holds durable tags awaiting fsync in increasing
-	// (registration) order; frontierDone maps a completed tag to whether it is a
-	// REAL (delivered) message (true) or a dropped fsync-error tag (false, never
-	// delivered — gap-skipped). frontierMax is the highest tag registered.
-	frontierActive  atomic.Bool
+	// EVERY publish routes through the frontier — there is no longer a
+	// conditional fast path to select between, so no activation flag is needed.
+	// frontierMu guards the frontier structures and is held ONLY for
+	// O(1)-amortized bookkeeping, never across I/O, so a durable completion can
+	// drive it from the WAL batch-writer goroutine (A4). frontierPending holds
+	// durable tags awaiting fsync in increasing (registration) order;
+	// frontierDone maps a completed tag to whether it is a REAL (delivered)
+	// message (true) or a dropped fsync-error tag (false, never delivered —
+	// gap-skipped). frontierMax is the highest tag registered.
 	frontierMu      sync.Mutex
 	frontierPending []uint64
 	frontierPHead   int
@@ -125,11 +136,72 @@ func (qs *QueueState) SetDepthHighWM(wm uint64) {
 	qs.depthHighWM.Store(wm)
 }
 
+// SetOrdinal assigns this queue's composite-tag ordinal (broker/tag_packing.go)
+// and MUST be called exactly once, before any publish or claim on this queue
+// (the broker's getOrCreateQueueState cold path does this under its creation
+// mutex, before the QueueState is published to other goroutines).
+//
+// CRITICAL: this also seeds tail, head, and minAckCursor to ordinalBase. These
+// atomic.Uint64 cursors zero-value to 0, but this queue's tags all live at
+// ordinal<<OrdinalShift and up — if the cursors were left at 0, Claim would
+// see tail=0 < head=ordinalBase+1 and gap-crawl the ENTIRE unused tag range
+// below this queue's ordinal (up to ~8.8e13 tags for a mid-range ordinal)
+// one CAS at a time. That is a hang far worse than the starvation bug this
+// design fixes, and it is the single easiest way to get this design
+// catastrophically wrong — so every cursor a fresh queue starts from must be
+// seeded here, together, before anything else touches this QueueState.
+func (qs *QueueState) SetOrdinal(ordinal uint64) {
+	qs.ordinalBase = PackTag(ordinal, 0)
+	qs.tail.Store(qs.ordinalBase)
+	qs.head.Store(qs.ordinalBase)
+	qs.minAckCursor.Store(qs.ordinalBase)
+}
+
+// Ordinal returns this queue's composite-tag ordinal (broker/tag_packing.go),
+// as assigned by SetOrdinal. Read-only; ordinalBase is set exactly once
+// before this QueueState is published to other goroutines (see SetOrdinal's
+// doc comment), so no synchronization is needed to read it afterward.
+// Recovery uses this to assert every recovered tag's ordinal actually
+// matches the queue it was recovered into (server/recovery_manager.go) —
+// the single safeguard against silent cross-queue delivery-tag collision
+// from ordinal drift or a pre-packing (legacy) data directory.
+func (qs *QueueState) Ordinal() uint64 {
+	return TagOrdinal(qs.ordinalBase)
+}
+
 func (qs *QueueState) SetParkTimeout(d time.Duration) {
 	qs.parkTimeout = d
 }
 
 func (qs *QueueState) WaitForCapacity(stop <-chan struct{}) bool {
+	// Teardown must be consulted BEFORE the below-HWM fast return. A queue torn
+	// down by DeleteQueue — or the record-less state createQueueStateLocked
+	// returns for a name with no metadata record — has depth 0, so it is never
+	// AtHighWaterMark and would otherwise sail straight through this gate: the
+	// publish would be durably written and CONFIRMED, then discarded at the next
+	// restart as a deleted queue's records. This is THE teardown gate for the
+	// three publish paths that have no explicit StopCh select of their own
+	// (PublishMessage, fanoutSharedSync, PublishMessageTx).
+	if qs.closed.Load() {
+		return false
+	}
+	// NOT redundant with the check above, despite Close() setting `closed`
+	// before it closes stopCh. The two statements are not atomic together, so
+	// a Close() landing BETWEEN them is caught here and nowhere else:
+	//   this goroutine: closed.Load() -> false
+	//   Close():        closed.CAS(false,true); close(stopCh)
+	//   this goroutine: select -> stop is closed -> refuse
+	// Without this select that interleaving falls through to the below-HWM
+	// fast return and publishes into a queue that is already tearing down.
+	// It narrows — it cannot close — the inherent race where the whole gate
+	// runs before Close() begins; that residual window is spec-sanctioned
+	// (queue.delete destroys enqueued messages) and leaves no record-less
+	// queue. Do not delete this as dead code.
+	select {
+	case <-stop:
+		return false
+	default:
+	}
 	if !qs.AtHighWaterMark() {
 		return true
 	}
@@ -163,46 +235,31 @@ func (qs *QueueState) WaitForCapacity(stop <-chan struct{}) bool {
 	return !qs.closed.Load()
 }
 
-func (qs *QueueState) Publish(tag uint64) {
-	if qs.closed.Load() {
-		return
-	}
-	for {
-		cur := qs.head.Load()
-		if tag+1 <= cur {
-			break
-		}
-		if qs.head.CompareAndSwap(cur, tag+1) {
-			break
-		}
-	}
-	qs.waiting.Add(1)
-	qs.NotifyNewMessage()
-}
-
-// FrontierActive reports whether this queue uses the contiguous durable
-// frontier for visibility. A single sequentially-consistent atomic load; false
-// (a pure-transient queue) selects the lock-free CAS-max Publish fast path.
-func (qs *QueueState) FrontierActive() bool { return qs.frontierActive.Load() }
-
-// FrontierReserve is the atomic {activate + assign tag + register pending} step
-// for a publish routed to this queue that must be ordered through the contiguous
-// durable frontier — a durable publish, OR a transient publish on an already
-// frontier-active queue (mixed queue). assign is called to mint the global
-// delivery tag WHILE frontierMu is held, so this queue's frontier tags are
-// registered strictly in tag order (the frontier ring stays increasing) and no
-// completion can advance head past this tag before it is registered. It
-// activates the frontier BEFORE calling assign, so any concurrent transient
-// publisher that mints a HIGHER tag observes frontierActive==true and routes
-// through the frontier rather than the fast path (closing the 0→1 race). The tag
-// is recorded pending (not yet visible — head is not advanced); the caller marks
-// it ready via FrontierComplete(tag, true) after the message is stored, or
+// FrontierReserve is the atomic {mint tag + register pending} step for a publish
+// routed to this queue. EVERY publish — durable or transient — goes through it;
+// it is this queue's ONLY tag minter. The tag is assigned from this queue's own
+// dense, zero-based sequence (nextSeq), packed with this queue's ordinal
+// (broker/tag_packing.go), WHILE frontierMu is held, so this queue's frontier
+// tags are registered strictly in tag order (the frontier ring stays increasing)
+// and no completion can advance head past this tag before it is registered. The
+// tag is recorded pending (not yet visible — head is not advanced); the caller
+// marks it ready via FrontierComplete(tag, true) after the message is stored, or
 // releases it via FrontierComplete(tag, false) if the store fails. Returns the
 // assigned tag.
-func (qs *QueueState) FrontierReserve(assign func() uint64) uint64 {
+//
+// Panics if this queue's sequence would exceed SeqMask — silent wraparound
+// would collide with the next queue's ordinal bits (cross-queue data
+// corruption), and at 44 bits of per-queue sequence this is unreachable in
+// practice (see broker/tag_packing.go).
+func (qs *QueueState) FrontierReserve() uint64 {
 	qs.frontierMu.Lock()
-	qs.frontierActive.Store(true) // BEFORE assign (see field doc)
-	tag := assign()
+	seq := qs.nextSeq
+	if seq > SeqMask {
+		qs.frontierMu.Unlock()
+		panic("QueueState.FrontierReserve: per-queue delivery-tag sequence exhausted (SeqMask overflow)")
+	}
+	qs.nextSeq++
+	tag := qs.ordinalBase | seq
 	qs.frontierPending = append(qs.frontierPending, tag)
 	if tag > qs.frontierMax {
 		qs.frontierMax = tag
@@ -229,35 +286,33 @@ func (qs *QueueState) FrontierComplete(tag uint64, real bool) {
 	}
 	qs.frontierDone[tag] = real
 	newHead, newlyReal := qs.frontierAdvanceLocked()
-	qs.frontierMu.Unlock()
-
-	qs.casMaxHead(newHead)
+	// Count the popped real tags ready ATOMICALLY WITH THE POP, before releasing
+	// frontierMu. This upholds the invariant Recover already documents ("Store
+	// `waiting` BEFORE `head`: head is the visibility gate the SQ-9 reaper scans
+	// against"): a real tag must be counted before any casMaxHead capable of
+	// exposing it can run.
+	//
+	// Counting after the unlock — even immediately before casMaxHead — leaves a
+	// CROSS-CALL hole that is the actual defect: this call can pop tags, unlock,
+	// and stall, and then a DIFFERENT publisher's casMaxHead exposes those
+	// popped-but-uncounted tags. Under x-message-ttl they are already expired
+	// when exposed, so the reaper and drop-head eviction delete them at once.
+	// Those decrements are legitimate but uncompensated, so `waiting` dives
+	// negative, and a reaper win during the excursion hits ReapDrop's clamp,
+	// which rewrites the whole negative balance to 0 and destroys every in-flight
+	// credit at once. The stalled +N then lands unopposed, leaving `waiting`
+	// permanently above the true ready count. Popping and counting under one lock
+	// closes it: visible-real implies counted, so the gated decrementers can
+	// never drive `waiting` below zero and the clamp can never erase live
+	// credits. The clamp stays as a dead-man's guard against genuine double
+	// decrements. casMaxHead deliberately remains OUTSIDE the lock — frontierMu
+	// is never held across anything but O(1) bookkeeping (invariant A4).
 	if newlyReal > 0 {
 		qs.waiting.Add(int64(newlyReal))
 	}
-	qs.NotifyNewMessage()
-}
-
-// FrontierPublishTransient records an already-stored tag on a frontier-active
-// queue at COMPLETE time (not reserved at mint). It bumps frontierMax so the tag
-// is exposed once the contiguous frontier reaches it, and advances head if no
-// lower still-pending durable tag blocks it (publish-order FIFO). The caller
-// MUST have stored the message first — the store establishes the happens-before
-// that makes late registration strand-free.
-//
-// No production callers remain after the always-reserve-at-mint fix — both
-// PublishMessage and PublishMessageTx now use FrontierReserve + FrontierComplete.
-// Retained for the direct frontier FIFO test (publish_async_test.go).
-func (qs *QueueState) FrontierPublishTransient(tag uint64) {
-	qs.frontierMu.Lock()
-	if tag > qs.frontierMax {
-		qs.frontierMax = tag
-	}
-	newHead, _ := qs.frontierAdvanceLocked()
 	qs.frontierMu.Unlock()
 
 	qs.casMaxHead(newHead)
-	qs.waiting.Add(1) // a transient publish is immediately a ready message
 	qs.NotifyNewMessage()
 }
 
@@ -587,7 +642,49 @@ func (qs *QueueState) Recover(minTag, maxTag, count uint64) {
 	qs.requeueLen = 0
 	qs.requeueCount.Store(0)
 	qs.requeueMu.Unlock()
+	qs.RecoverSeq(TagSeq(maxTag) + 1)
 	qs.NotifyNewMessage()
+}
+
+// RecoverSeq restores this queue's private delivery-tag sequence (nextSeq)
+// after recovery, so the next FrontierReserve mints strictly above every tag
+// this queue is about to re-expose as recovered. Called by Recover with
+// TagSeq(maxTag)+1 — the caller (server/recovery_manager.go) has already
+// asserted TagOrdinal(minTag)==TagOrdinal(maxTag)==this queue's ordinal
+// before Recover runs, so maxTag's low bits are a genuine per-queue sequence
+// value, not a foreign ordinal's bits.
+//
+// Guarded by frontierMu because nextSeq is otherwise only ever touched by
+// FrontierReserve under that same lock (see nextSeq's field doc); Recover
+// runs once, before any consumer/producer touches this queue, but taking the
+// lock here costs nothing and keeps nextSeq's single-writer-under-frontierMu
+// invariant exceptionless.
+//
+// SAFETY of leaving nextSeq at its zero value when this queue recovers ZERO
+// messages (Recover is never called at all — see RecoverQueue's doc comment
+// and server/recovery_manager.go, which only calls it when hasRecovered):
+// storage/wal_manager.go RecoverFromWAL and storage/segment_manager.go
+// RecoverFromSegments do NOT exclude a record from the recovered set because
+// it was acked — they filter WAL records against ackBitmap, but that bitmap
+// is always freshly empty at boot (never persisted, never rebuilt from any
+// durable ack log — a message record is a WAL record; nothing records an ack
+// as one), so a not-yet-reclaimed record is ALWAYS returned by
+// RecoverFromWAL regardless of ack status. RecoverFromSegments filters
+// nothing at all. The only way a record is excluded from recovery is
+// physical absence: the WAL file was deleted (performCheckpoint /
+// tryDeleteOldFiles, both of which only remove a record once it is ACKed)
+// or the segment was compacted (compactSegment, same precondition).
+// Therefore "this queue recovered zero messages" is exactly equivalent to
+// "every record this queue ever wrote is physically gone from disk" — reused
+// low sequence numbers have nothing left anywhere to collide with. Any
+// record still physically present (acked or not) comes back through this
+// exact path with its real tag inside [minTag, maxTag], and nextSeq above
+// resumes past it. No per-queue mirror of a persisted delivery-tag counter is
+// needed to close this gap.
+func (qs *QueueState) RecoverSeq(nextSeq uint64) {
+	qs.frontierMu.Lock()
+	qs.nextSeq = nextSeq
+	qs.frontierMu.Unlock()
 }
 
 func (qs *QueueState) Depth() uint64 {

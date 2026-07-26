@@ -1099,20 +1099,6 @@ func (ds *DisruptorStorage) ExecuteAtomic(operations func(txnStorage interfaces.
 	return staging.commit()
 }
 
-func (ds *DisruptorStorage) SaveDeliveryTagCounter(tag uint64) error {
-	if ds.metadataStore == nil {
-		return fmt.Errorf("metadata store not initialized")
-	}
-	return ds.metadataStore.SaveDeliveryTagCounter(tag)
-}
-
-func (ds *DisruptorStorage) LoadDeliveryTagCounter() (uint64, error) {
-	if ds.metadataStore == nil {
-		return 0, nil
-	}
-	return ds.metadataStore.LoadDeliveryTagCounter()
-}
-
 func (ds *DisruptorStorage) Close() error {
 	ds.queues.Range(func(_, value interface{}) bool {
 		ring := value.(*QueueRing)

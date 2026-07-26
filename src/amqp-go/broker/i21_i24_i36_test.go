@@ -14,7 +14,7 @@ func TestRedeliveredFlagOnNackRequeue(t *testing.T) {
 		stop, cancel := makeStop()
 		defer cancel()
 
-		qs.Publish(0)
+		qs.FrontierComplete(qs.FrontierReserve(), true)
 		tag, _, ok := qs.Claim(stop, testTimer(qs))
 		if !ok || tag != 0 {
 			t.Fatalf("initial claim = %d (ok=%v), want 0", tag, ok)
@@ -39,7 +39,7 @@ func TestRedeliveredFlagOnRejectRequeue(t *testing.T) {
 		stop, cancel := makeStop()
 		defer cancel()
 
-		qs.Publish(0)
+		qs.FrontierComplete(qs.FrontierReserve(), true)
 		tag, redelivered, ok := qs.Claim(stop, testTimer(qs))
 		if !ok || tag != 0 {
 			t.Fatalf("initial claim = %d (ok=%v), want 0", tag, ok)
@@ -89,7 +89,7 @@ func TestRedeliveredFlagOnGetAfterRequeue(t *testing.T) {
 		qs := NewQueueState(0)
 		defer qs.Close()
 
-		qs.Publish(0)
+		qs.FrontierComplete(qs.FrontierReserve(), true)
 		qs.ClaimInflight(0)
 		qs.Requeue(0)
 
@@ -110,9 +110,14 @@ func TestDispatch_SparseDepthNotInflated(t *testing.T) {
 		stop, cancel := makeStop()
 		defer cancel()
 
+		// NewQueueState leaves ordinalBase at 0, so seeding nextSeq to each sparse
+		// value immediately before FrontierReserve (the queue's one tag minter)
+		// reproduces the exact non-contiguous tag values the old Publish(tag)
+		// fixture used — same pattern as broker/publish_async_test.go.
 		tags := []uint64{0, 2, 4, 6, 8}
 		for _, tag := range tags {
-			qs.Publish(tag)
+			qs.nextSeq = tag
+			qs.FrontierComplete(qs.FrontierReserve(), true)
 		}
 
 		if d := qs.Depth(); d != 5 {
@@ -160,7 +165,7 @@ func TestDispatch_DepthInvariantConcurrent(t *testing.T) {
 				if !qs.WaitForCapacity(stop) {
 					return
 				}
-				qs.Publish(i)
+				qs.FrontierComplete(qs.FrontierReserve(), true)
 			}
 		}()
 
@@ -214,7 +219,7 @@ func TestDispatch_RequeueRingReuse(t *testing.T) {
 
 		const N = 5000
 		for i := uint64(0); i < N; i++ {
-			qs.Publish(i)
+			qs.FrontierComplete(qs.FrontierReserve(), true)
 		}
 		tags := make([]uint64, N)
 		for i := uint64(0); i < N; i++ {
@@ -262,7 +267,7 @@ func TestDispatch_RequeueRingBoundedAfterBurstDrain(t *testing.T) {
 
 		const burst = 20000
 		for i := uint64(0); i < burst; i++ {
-			qs.Publish(i)
+			qs.FrontierComplete(qs.FrontierReserve(), true)
 		}
 		for i := uint64(0); i < burst; i++ {
 			tag, _, ok := qs.Claim(stop, testTimer(qs))

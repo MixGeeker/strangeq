@@ -224,11 +224,15 @@ func TestFrontier_OutOfOrderCompletionBlocksHead(t *testing.T) {
 	qs := NewQueueState(0)
 	defer qs.Close()
 
-	t10 := qs.FrontierReserve(func() uint64 { return 10 })
-	t11 := qs.FrontierReserve(func() uint64 { return 11 })
+	// qs.ordinalBase is 0 here (NewQueueState directly, no SetOrdinal — this
+	// test drives the frontier at the QueueState level, not through the
+	// broker's queue-creation path), so seeding nextSeq reproduces the exact
+	// tag values the old mock-assign callback returned.
+	qs.nextSeq = 10
+	t10 := qs.FrontierReserve()
+	t11 := qs.FrontierReserve()
 	require.Equal(t, uint64(10), t10)
 	require.Equal(t, uint64(11), t11)
-	require.True(t, qs.FrontierActive())
 	assert.Equal(t, uint64(0), qs.head.Load(), "no tag visible until its fsync")
 
 	// 11 completes first (out of order): head must stay at/below 10 — 11 is NOT
@@ -252,8 +256,15 @@ func TestFrontier_TransientBehindPendingDurable(t *testing.T) {
 	qs := NewQueueState(0)
 	defer qs.Close()
 
-	qs.FrontierReserve(func() uint64 { return 10 }) // durable, pending
-	qs.FrontierPublishTransient(11)                 // transient, already stored
+	qs.nextSeq = 10
+	qs.FrontierReserve() // durable tag 10, pending
+	// Every production publish (durable and transient alike) now reserves at
+	// mint and completes after store — FrontierReserve+FrontierComplete(real)
+	// is the one production path, so the transient side of this FIFO race is
+	// reproduced the same way: reserve tag 11, then complete it immediately
+	// (as if its synchronous store had already finished).
+	transientTag := qs.FrontierReserve() // transient tag 11, pending
+	qs.FrontierComplete(transientTag, true)
 	assert.LessOrEqual(t, qs.head.Load(), uint64(10),
 		"transient tag 11 must not jump head past the pending durable tag 10 (FIFO, A3)")
 
@@ -268,7 +279,8 @@ func TestFrontier_FsyncErrorAdvancesButNotReady(t *testing.T) {
 	qs := NewQueueState(0)
 	defer qs.Close()
 
-	qs.FrontierReserve(func() uint64 { return 5 })
+	qs.nextSeq = 5
+	qs.FrontierReserve()
 	qs.FrontierComplete(5, false) // fsync error
 	assert.Equal(t, uint64(6), qs.head.Load(), "frontier must advance past the errored tag (no stranding of later tags)")
 	assert.Equal(t, int64(0), qs.WaitingCount(), "an fsync-errored tag is never counted ready")
@@ -435,9 +447,13 @@ func TestFrontier_PerQueueFrontiersIndependent(t *testing.T) {
 	defer qb.Close()
 
 	// One fanout publish assigns tag 7 to A's copy and tag 8 to B's copy (distinct
-	// global tags, distinct per-queue frontiers).
-	qa.FrontierReserve(func() uint64 { return 7 })
-	qb.FrontierReserve(func() uint64 { return 8 })
+	// global tags, distinct per-queue frontiers). Both qa and qb have
+	// ordinalBase 0 here (no SetOrdinal — direct QueueState construction), so
+	// seeding each queue's own nextSeq reproduces the old mock-assign values.
+	qa.nextSeq = 7
+	qa.FrontierReserve()
+	qb.nextSeq = 8
+	qb.FrontierReserve()
 	assert.Equal(t, uint64(0), qa.head.Load())
 	assert.Equal(t, uint64(0), qb.head.Load())
 
@@ -616,9 +632,10 @@ func TestFrontier_TransientReservedAtMintNotPassed(t *testing.T) {
 	qs := NewQueueState(0)
 	defer qs.Close()
 
-	qs.FrontierReserve(func() uint64 { return 5 }) // durable, pending
-	qs.FrontierReserve(func() uint64 { return 6 }) // transient RESERVED AT MINT (I1), pending
-	qs.FrontierReserve(func() uint64 { return 7 }) // durable, pending
+	qs.nextSeq = 5
+	qs.FrontierReserve() // durable, pending
+	qs.FrontierReserve() // transient RESERVED AT MINT (I1), pending
+	qs.FrontierReserve() // durable, pending
 
 	qs.FrontierComplete(7, true) // higher tag done first
 	assert.LessOrEqual(t, qs.head.Load(), uint64(5), "head blocked at pending 5")
