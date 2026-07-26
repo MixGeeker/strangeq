@@ -285,6 +285,16 @@ All numbers below are **end-to-end consumed msg/s** — every published message 
 
 RabbitMQ 4.3 rejects transient non-exclusive queues by default, so the head-to-head is run on durable queues with publisher confirms. Non-durable queues on StrangeQ reach roughly 140K msg/s (1 pub / 1 con, 1 KB, host-native).
 
+### Multi-queue scaling (durable + publisher confirms)
+
+3 producers / 3 consumers per queue, 1 KB bodies, one perftest process per queue. Aggregate consumed msg/s, zero loss, evenly balanced across queues. Measured 2026-07-26.
+
+| Queues | StrangeQ aggregate | vs single queue |
+|---|--:|--:|
+| 1 | 142,159 msg/s | — |
+| 2 | 174,339 msg/s | 1.20x |
+| 4 | 191,109 msg/s | 1.32x |
+
 ### Crash safety
 
 Confirmed durable messages survive `kill -9` and are recovered on restart. The invariant is **confirm ⇒ fsynced ⇒ recoverable**: a publish is confirmed only after its WAL batch is fsynced, so every confirmed message is present after a crash.
