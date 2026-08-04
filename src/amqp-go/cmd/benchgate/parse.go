@@ -98,6 +98,11 @@ func parseBenchstatCSV(csvOutput []byte) ([]benchResult, error) {
 			// count is what a normal comparison row for this table must
 			// match.
 			if isUnitHeader(fields[1]) {
+				if !hasVsBaseColumn(fields) {
+					return nil, fmt.Errorf(
+						"benchstat emitted a single-configuration table for %s (unit header %q has no %q column), meaning the two inputs share no benchstat configuration and NOTHING was compared; refusing to derive a delta from raw values",
+						fields[1], strings.Join(fields[1:], ","), vsBaseColumn)
+				}
 				metric = fields[1]
 				fullWidth = len(fields)
 			}
@@ -148,6 +153,39 @@ func parseBenchstatCSV(csvOutput []byte) ([]benchResult, error) {
 // adds), as opposed to a file path in the filenames header row.
 func isUnitHeader(s string) bool {
 	return strings.HasSuffix(s, "/op")
+}
+
+// vsBaseColumn is benchstat's delta column header. Its PRESENCE in a unit
+// header row is what makes a table a comparison at all.
+const vsBaseColumn = "vs base"
+
+// hasVsBaseColumn reports whether a unit header row describes a real A/B
+// comparison table (",<metric>,CI,<metric>,CI,vs base,P") as opposed to
+// benchstat's degenerate single-configuration table (",<metric>,CI"), which
+// has no delta column because it holds one file's results and nothing to
+// compare them against.
+//
+// This is the guard the old parser lacked, and it is why 41 fabricated
+// regressions were reported in a single run. fullWidth was taken from
+// whatever unit header appeared — a 3-field degenerate header set
+// fullWidth=3, so the one-sided-row guard "len(fields) < fullWidth" could
+// never fire, every row was classified statusCompared, and
+// fields[len(fields)-2] read the RAW METRIC VALUE. B/op 248, identical on
+// both sides, was printed as "regressed +248.00%".
+//
+// Note the layering: main.go already refuses to invoke benchstat when the two
+// sections' goos/goarch/cpu disagree, which is the only way this shape has
+// been observed to arise. This check stays as the parser's own contract
+// assertion, because benchstat keys configurations on ANY "key: value" line
+// in its input, not just the three that go test emits — so a shape main.go
+// does not model must still not become a percentage.
+func hasVsBaseColumn(headerFields []string) bool {
+	for _, f := range headerFields {
+		if f == vsBaseColumn {
+			return true
+		}
+	}
+	return false
 }
 
 func parseDeltaPercent(s string) (float64, error) {

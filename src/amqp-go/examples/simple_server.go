@@ -5,38 +5,25 @@ package main
 import (
 	"log"
 
-	"github.com/maxpert/amqp-go/broker"
-	"github.com/maxpert/amqp-go/protocol"
+	"github.com/maxpert/amqp-go/config"
 	"github.com/maxpert/amqp-go/server"
-	"go.uber.org/zap"
 )
 
 func main() {
-	// Create a new AMQP server
-	srv := server.NewServer(":5672")
+	// Create a new AMQP server. Build() is used directly rather than a
+	// convenience constructor: it can REFUSE to start on a data directory whose
+	// recovery cannot be completed safely (see --unsafe-recovery), and a
+	// constructor that swallowed that error would boot an empty broker and
+	// start confirming durable publishes it can never recover.
+	cfg := config.DefaultConfig()
+	cfg.Network.Address = ":5672"
+	srv, err := server.NewServerBuilder().WithConfig(cfg).Build()
+	if err != nil {
+		log.Fatal("Failed to build server:", err)
+	}
 
 	// Start the server
 	log.Println("Starting AMQP server on :5672...")
-	if err := srv.Start(); err != nil {
-		log.Fatal("Failed to start server:", err)
-	}
-}
-
-// Example with custom logger
-func exampleWithCustomLogger() {
-	// Create a custom logger
-	logger, _ := zap.NewDevelopment()
-
-	// Create server with custom configuration
-	srv := &server.Server{
-		Addr:        ":5672",
-		Connections: make(map[string]*protocol.Connection),
-		Log:         logger,
-		Broker:      server.NewOriginalBrokerAdapter(broker.NewBroker()),
-	}
-
-	// Start the server
-	log.Println("Starting AMQP server with custom logger...")
 	if err := srv.Start(); err != nil {
 		log.Fatal("Failed to start server:", err)
 	}

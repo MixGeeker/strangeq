@@ -79,14 +79,18 @@ func (s *Server) handleBasicQos(conn *protocol.Connection, channelID uint16, pay
 	channel.PrefetchCount = qosMethod.PrefetchCount
 	channel.PrefetchSize = qosMethod.PrefetchSize
 	channel.GlobalPrefetch = qosMethod.Global
-	consumerTags := make([]string, 0, len(channel.Consumers))
-	for tag := range channel.Consumers {
-		consumerTags = append(consumerTags, tag)
+	// Collect the broker-internal identities, not the wire tags: the broker's
+	// consumer map is keyed by identity, and a wire tag is only unique within
+	// this channel — re-gating by tag would re-gate whichever same-tagged
+	// consumer registered last, on any connection.
+	consumerIDs := make([]string, 0, len(channel.Consumers))
+	for _, consumer := range channel.Consumers {
+		consumerIDs = append(consumerIDs, consumer.ID)
 	}
 	channel.Mutex.Unlock()
 
-	for _, tag := range consumerTags {
-		s.Broker.UpdateConsumerPrefetch(tag, qosMethod.PrefetchCount)
+	for _, id := range consumerIDs {
+		s.Broker.UpdateConsumerPrefetch(id, qosMethod.PrefetchCount)
 	}
 
 	return s.sendBasicQosOK(conn, channelID)
@@ -574,6 +578,59 @@ func (s *Server) processCompleteMessage(conn *protocol.Connection, channelID uin
 	return nil
 }
 
+// generatedTagDraws bounds the re-draw loop in claimConsumerTag. Each draw is
+// 128 bits of crypto/rand, so a single collision with an occupied tag is
+// already vanishingly unlikely and eight consecutive ones are impossible in
+// practice — the bound exists so a degraded entropy source (crypto/rand
+// failing into the counter-based fallbackID, which a squatting client could in
+// principle predict) cannot spin this loop forever. Exhausting it is reported
+// as a duplicate-tag error rather than silently overwriting a live consumer.
+const generatedTagDraws = 8
+
+// claimConsumerTag atomically claims a consumer tag on a channel and installs
+// the consumer under it, leaving the claimed tag in consumer.Tag. It reports
+// false if the tag is already in use on this channel (the 530 not-allowed
+// case), in which case nothing was installed and consumer.Tag is untouched.
+//
+// consumer.Tag == "" means the client asked the server to generate a tag
+// (AMQP 0-9-1 basic.consume, consumer-tag: "If this field is empty the server
+// will generate a unique tag"). The generated tag is drawn from
+// s.consumerTagGenerator() and CHECKED against
+// the channel's live tags inside the same critical section that installs it,
+// so it cannot collide with a client-supplied tag — the property is asserted
+// at runtime rather than assumed from the width of the random draw.
+//
+// PUBLICATION ORDER: consumer.Tag is assigned HERE, under the channel mutex,
+// BEFORE the consumer is inserted into channel.Consumers. Inserting first and
+// stamping the tag afterwards at the call site is a data race: the insert
+// publishes the consumer to the connection's delivery loop, which reads
+// consumer.Tag under the same mutex (discoverConsumers), so any write after the
+// insert races the reader — caught by -race on the first certification run.
+func (s *Server) claimConsumerTag(channel *protocol.Channel, consumer *protocol.Consumer) bool {
+	channel.Mutex.Lock()
+	defer channel.Mutex.Unlock()
+
+	if tag := consumer.Tag; tag != "" {
+		if _, taken := channel.Consumers[tag]; taken {
+			return false
+		}
+		channel.Consumers[tag] = consumer
+		return true
+	}
+
+	generate := s.consumerTagGenerator()
+	for i := 0; i < generatedTagDraws; i++ {
+		tag := generate()
+		if _, taken := channel.Consumers[tag]; taken {
+			continue
+		}
+		consumer.Tag = tag
+		channel.Consumers[tag] = consumer
+		return true
+	}
+	return false
+}
+
 // handleBasicConsume handles the basic.consume method
 func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16, payload []byte) error {
 	// Deserialize the basic.consume method
@@ -626,9 +683,13 @@ func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16,
 		zap.Uint16("prefetch_count", channel.PrefetchCount),
 		zap.Int("buffer_size", bufferSize))
 
-	// Create a new consumer
+	// Create a new consumer. The broker-internal identity is minted HERE,
+	// before the consumer becomes visible to the connection's delivery loop:
+	// discoverConsumers routes by Consumer.ID, so a consumer published into
+	// channel.Consumers with an empty ID would be discovered unroutable.
 	consumer := &protocol.Consumer{
 		Tag:           consumeMethod.ConsumerTag,
+		ID:            protocol.NewConsumerID(),
 		Channel:       channel,
 		Queue:         consumeMethod.Queue,
 		NoAck:         consumeMethod.NoAck,
@@ -640,15 +701,57 @@ func (s *Server) handleBasicConsume(conn *protocol.Connection, channelID uint16,
 		Cancel:   make(chan struct{}, 1),                    // Channel to signal cancellation
 	}
 
-	// Add the consumer to the channel
-	channel.Mutex.Lock()
-	channel.Consumers[consumer.Tag] = consumer
-	channel.Mutex.Unlock()
+	// Claim the tag on THIS channel. AMQP 0-9-1 scopes the consumer tag to a
+	// channel, so channel.Consumers is the authority on uniqueness, and the
+	// check and the insert must be one critical section — two concurrent
+	// basic.consume frames carrying the same tag must not both see it free.
+	//
+	// An empty tag means "server, generate one" (§1.8.3.3): claimConsumerTag
+	// draws from protocol.GenerateConsumerTag and re-draws if the drawn tag is
+	// already taken on this channel, so a generated tag can never collide with
+	// a client-supplied one. The tag it returns is the one echoed in
+	// consume-ok and stamped on every delivery.
+	if !s.claimConsumerTag(channel, consumer) {
+		// Duplicate tag on the same channel. AMQP 0-9-1: "The client MUST NOT
+		// specify a tag that refers to an existing consumer. Error code:
+		// not-allowed". 530 not-allowed is a CONNECTION exception in the
+		// spec's reply-code table (unlike 403/404/405/406), so this closes the
+		// connection, not the channel. The returned error is what makes the
+		// frame loop tear the connection down.
+		replyText := fmt.Sprintf("NOT_ALLOWED - attempt to reuse consumer tag '%s'", consumeMethod.ConsumerTag)
+		s.Log.Warn("Duplicate consumer tag on channel",
+			zap.String("consumer_tag", consumeMethod.ConsumerTag),
+			zap.String("connection_id", conn.ID),
+			zap.Uint16("channel_id", channelID))
+		if cerr := s.sendConnectionClose(conn, 530, replyText, 60, 20); cerr != nil {
+			s.Log.Error("Failed to send connection.close for duplicate consumer tag", zap.Error(cerr))
+		}
+		return errors.New(replyText)
+	}
+	// consumer.Tag now holds the claimed tag (set inside claimConsumerTag, under
+	// the channel mutex and before publication). Stamping it here instead would
+	// race the delivery loop's discovery scan.
 	conn.ConsumersDirty.Store(true)
 
-	// Register the consumer with the broker
-	err = s.Broker.RegisterConsumer(consumeMethod.Queue, consumer.Tag, consumer)
+	// Register the consumer with the broker under its internal identity.
+	err = s.Broker.RegisterConsumer(consumeMethod.Queue, consumer.ID, consumer)
 	if err != nil {
+		// Registration failed: release the tag so the channel does not hold a
+		// consumer the broker never accepted (which would make the tag
+		// permanently unusable on this channel and leak it into the delivery
+		// loop's discovery scan).
+		//
+		// The channel map is the only thing to release. RegisterConsumer
+		// persists before it publishes anything, so a failure there leaves no
+		// broker-side state — no ConsumerState, no ack cursor, no
+		// queueConsumers entry, no poll-loop goroutine — and there is nothing
+		// for this handler to unregister.
+		channel.Mutex.Lock()
+		if channel.Consumers[consumer.Tag] == consumer {
+			delete(channel.Consumers, consumer.Tag)
+		}
+		channel.Mutex.Unlock()
+		conn.ConsumersDirty.Store(true)
 		s.Log.Error("Failed to register consumer with broker",
 			zap.Error(err),
 			zap.String("consumer_tag", consumer.Tag),
@@ -715,8 +818,12 @@ func (s *Server) handleBasicCancel(conn *protocol.Connection, channelID uint16, 
 	channel.Mutex.Unlock()
 	conn.ConsumersDirty.Store(true)
 
-	// Unregister the consumer with the broker
-	err = s.Broker.UnregisterConsumer(cancelMethod.ConsumerTag)
+	// Unregister the consumer with the broker by its internal identity. Using
+	// the wire tag here would cancel whichever same-tagged consumer registered
+	// last, anywhere on the broker — one connection's basic.cancel tearing down
+	// another connection's consumer. The tag resolves to a consumer only within
+	// this channel, which is the resolution the lookup above just performed.
+	err = s.Broker.UnregisterConsumer(consumer.ID)
 	if err != nil {
 		s.Log.Error("Failed to unregister consumer with broker",
 			zap.Error(err),
@@ -1039,7 +1146,7 @@ func (s *Server) wireChannel(conn *protocol.Connection, channelID uint16) *proto
 // unknown, already settled (duplicate/no-ack/stale), or there is no channel
 // to resolve it against, and the caller must no-op, matching AMQP's tolerant
 // handling of stale acks.
-func (s *Server) resolveDeliveryTag(channel *protocol.Channel, wireTag uint64) (msgID uint64, consumerTag string, isGet, known bool) {
+func (s *Server) resolveDeliveryTag(channel *protocol.Channel, wireTag uint64) (msgID uint64, consumerID string, isGet, known bool) {
 	if channel == nil {
 		return 0, "", false, false
 	}
@@ -1047,7 +1154,7 @@ func (s *Server) resolveDeliveryTag(channel *protocol.Channel, wireTag uint64) (
 	if !ok {
 		return 0, "", false, false
 	}
-	return ref.MsgID, ref.ConsumerTag, ref.IsGet, true
+	return ref.MsgID, ref.ConsumerID, ref.IsGet, true
 }
 
 // handleBasicAck handles the basic.ack method
@@ -1071,7 +1178,7 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 		return nil
 	}
 
-	msgID, consumerTag, isGet, known := s.resolveDeliveryTag(channel, wireTag)
+	msgID, consumerID, isGet, known := s.resolveDeliveryTag(channel, wireTag)
 	if !known {
 		s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
 			zap.Uint64("delivery_tag", wireTag),
@@ -1080,7 +1187,7 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 	}
 
 	if tx {
-		op := transaction.NewAckOperation(consumerTag, msgID, multiple)
+		op := transaction.NewAckOperation(consumerID, msgID, multiple)
 		return s.TransactionManager.AddOperation(channelID, op)
 	}
 
@@ -1088,10 +1195,10 @@ func (s *Server) handleBasicAck(conn *protocol.Connection, channelID uint16, pay
 		if err := s.Broker.AcknowledgeGetDelivery(msgID); err != nil {
 			return err
 		}
-	} else if err := s.Broker.AcknowledgeMessage(consumerTag, msgID, false); err != nil {
+	} else if err := s.Broker.AcknowledgeMessage(consumerID, msgID, false); err != nil {
 		s.Log.Error("Failed to acknowledge message in broker",
 			zap.Error(err),
-			zap.String("consumer_tag", consumerTag),
+			zap.String("consumer_id", consumerID),
 			zap.Uint64("msg_id", msgID))
 		return err
 	}
@@ -1111,7 +1218,7 @@ func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, 
 	}
 	channel := s.wireChannel(conn, channelID)
 
-	msgID, consumerTag, isGet, known := s.resolveDeliveryTag(channel, wireTag)
+	msgID, consumerID, isGet, known := s.resolveDeliveryTag(channel, wireTag)
 	if !known {
 		s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
 			zap.Uint64("delivery_tag", wireTag),
@@ -1121,7 +1228,7 @@ func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, 
 
 	// Buffer into transaction if channel is in transactional mode
 	if s.TransactionManager != nil && s.TransactionManager.IsTransactional(channelID) {
-		op := transaction.NewRejectOperation(consumerTag, msgID, requeue)
+		op := transaction.NewRejectOperation(consumerID, msgID, requeue)
 		return s.TransactionManager.AddOperation(channelID, op)
 	}
 
@@ -1129,10 +1236,10 @@ func (s *Server) handleBasicReject(conn *protocol.Connection, channelID uint16, 
 		if err := s.Broker.RejectGetDelivery(msgID, requeue); err != nil {
 			return err
 		}
-	} else if err := s.Broker.RejectMessage(consumerTag, msgID, requeue); err != nil {
+	} else if err := s.Broker.RejectMessage(consumerID, msgID, requeue); err != nil {
 		s.Log.Error("Failed to reject message in broker",
 			zap.Error(err),
-			zap.String("consumer_tag", consumerTag),
+			zap.String("consumer_id", consumerID),
 			zap.Uint64("msg_id", msgID),
 			zap.Bool("requeue", requeue))
 		return err
@@ -1164,7 +1271,7 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 		return nil
 	}
 
-	msgID, consumerTag, isGet, known := s.resolveDeliveryTag(channel, wireTag)
+	msgID, consumerID, isGet, known := s.resolveDeliveryTag(channel, wireTag)
 	if !known {
 		s.Log.Debug("Delivery tag already processed (consumer cancelled?)",
 			zap.Uint64("delivery_tag", wireTag),
@@ -1173,7 +1280,7 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 	}
 
 	if tx {
-		op := transaction.NewNackOperation(consumerTag, msgID, multiple, requeue)
+		op := transaction.NewNackOperation(consumerID, msgID, multiple, requeue)
 		return s.TransactionManager.AddOperation(channelID, op)
 	}
 
@@ -1181,10 +1288,10 @@ func (s *Server) handleBasicNack(conn *protocol.Connection, channelID uint16, pa
 		if err := s.Broker.NackGetDelivery(msgID, requeue); err != nil {
 			return err
 		}
-	} else if err := s.Broker.NacknowledgeMessage(consumerTag, msgID, false, requeue); err != nil {
+	} else if err := s.Broker.NacknowledgeMessage(consumerID, msgID, false, requeue); err != nil {
 		s.Log.Error("Failed to nack message in broker",
 			zap.Error(err),
-			zap.String("consumer_tag", consumerTag),
+			zap.String("consumer_id", consumerID),
 			zap.Uint64("msg_id", msgID),
 			zap.Bool("requeue", requeue))
 		return err
@@ -1245,9 +1352,9 @@ func (s *Server) cumulativeSettle(channel *protocol.Channel, wireTag uint64, kin
 		case ref.IsGet:
 			s.Broker.NackGetDelivery(ref.MsgID, requeue)
 		case kind == settleAck:
-			s.Broker.AcknowledgeMessage(ref.ConsumerTag, ref.MsgID, false)
+			s.Broker.AcknowledgeMessage(ref.ConsumerID, ref.MsgID, false)
 		default:
-			s.Broker.NacknowledgeMessage(ref.ConsumerTag, ref.MsgID, false, requeue)
+			s.Broker.NacknowledgeMessage(ref.ConsumerID, ref.MsgID, false, requeue)
 		}
 	}
 }
@@ -1273,18 +1380,21 @@ func (s *Server) handleBasicRecover(conn *protocol.Connection, channelID uint16,
 	}
 	channel := value.(*protocol.Channel)
 
+	// basic.recover is scoped to this channel's consumers, addressed by their
+	// broker-internal identities (the broker's ledger is keyed by identity;
+	// a wire tag is only channel-unique).
 	channel.Mutex.RLock()
-	consumerTags := make([]string, 0, len(channel.Consumers))
-	for tag := range channel.Consumers {
-		consumerTags = append(consumerTags, tag)
+	consumerIDs := make([]string, 0, len(channel.Consumers))
+	for _, consumer := range channel.Consumers {
+		consumerIDs = append(consumerIDs, consumer.ID)
 	}
 	channel.Mutex.RUnlock()
 
-	for _, tag := range consumerTags {
-		if err := s.Broker.RequeueAllForConsumer(tag); err != nil {
+	for _, id := range consumerIDs {
+		if err := s.Broker.RequeueAllForConsumer(id); err != nil {
 			s.Log.Error("Failed to requeue messages for consumer",
 				zap.Error(err),
-				zap.String("consumer_tag", tag))
+				zap.String("consumer_id", id))
 		}
 	}
 

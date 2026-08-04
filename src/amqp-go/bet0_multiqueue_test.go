@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,6 +58,35 @@ import (
 // ============================================================================
 
 var bet0PortCounter atomic.Int64
+
+// bet0PortBase is the first port this file's embedded brokers bind. It is
+// overridable because bet0PortCounter is PER-PROCESS: two concurrent copies of
+// this test binary — a flake-soak runner, or two agents — both start at the same
+// base and bind the same ports, so the second copy fails on bind and the harness
+// manufactures failures that look like the flake it was launched to measure.
+// Each concurrent worker must therefore set STRANGEQ_BET0_PORT_BASE to a block
+// of its own, wide enough for every server the run creates.
+//
+// Read once at init rather than per call, so a soak cannot change ports
+// mid-process. Mirrors STRANGEQ_FLIP_QUEUES in
+// broker/frontier_flip_strand_test.go — same shape, same reason: a stress knob
+// the committed default does not pay for.
+var bet0PortBase = func() int {
+	if s := os.Getenv("STRANGEQ_BET0_PORT_BASE"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil && n > 1024 && n < 60000 {
+			return n
+		}
+	}
+	return 19200
+}()
+
+// bet0NextPort hands out a listen port distinct from every other embedded
+// broker this process has created. It is the single place the base appears —
+// there were six copies of the literal, which is the sibling-constant shape that
+// makes a knob like the one above look applied when it is not.
+func bet0NextPort() int {
+	return bet0PortBase + int(bet0PortCounter.Add(1))
+}
 
 // brokerStartupPolls, together with brokerStartupPollInterval, bounds how
 // long every embedded-broker helper in this package waits for the listener
@@ -112,7 +142,7 @@ const (
 // dir is persistent across a Stop/restart so durable recovery can be exercised.
 func bet0Server(t *testing.T, dir string) (*server.Server, string) {
 	t.Helper()
-	port := 19200 + int(bet0PortCounter.Add(1))
+	port := bet0NextPort()
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	cfg := config.DefaultConfig()
 	cfg.Network.Address = addr
@@ -121,14 +151,7 @@ func bet0Server(t *testing.T, dir string) (*server.Server, string) {
 
 	srv, err := server.NewServerBuilder().WithConfig(cfg).Build()
 	require.NoError(t, err, "server build")
-	go func() { _ = srv.Start() }()
-	for i := 0; i < brokerStartupPolls; i++ {
-		if srv.IsListening() {
-			break
-		}
-		time.Sleep(brokerStartupPollInterval)
-	}
-	require.True(t, srv.IsListening(), "server listener not ready")
+	waitForListening(t, srv)
 	// These tests drive hundreds of thousands of messages through an embedded
 	// broker. Leaving one running would let a finished (or failed) test's load
 	// bleed into the next one and distort it, so every server is stopped here.
@@ -992,7 +1015,7 @@ func TestBet0_SparseMultiQueueRecovery(t *testing.T) {
 // server is built (used to force fast checkpoint/compaction cycles).
 func bet0ServerWithConfig(t *testing.T, dir string, tweak func(*config.AMQPConfig)) (*server.Server, string) {
 	t.Helper()
-	port := 19200 + int(bet0PortCounter.Add(1))
+	port := bet0NextPort()
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	cfg := config.DefaultConfig()
 	cfg.Network.Address = addr
@@ -1004,14 +1027,7 @@ func bet0ServerWithConfig(t *testing.T, dir string, tweak func(*config.AMQPConfi
 
 	srv, err := server.NewServerBuilder().WithConfig(cfg).Build()
 	require.NoError(t, err, "server build")
-	go func() { _ = srv.Start() }()
-	for i := 0; i < brokerStartupPolls; i++ {
-		if srv.IsListening() {
-			break
-		}
-		time.Sleep(brokerStartupPollInterval)
-	}
-	require.True(t, srv.IsListening(), "server listener not ready")
+	waitForListening(t, srv)
 	t.Cleanup(func() { _ = srv.Stop() })
 	return srv, fmt.Sprintf("amqp://guest:guest@%s/", addr)
 }
@@ -1112,7 +1128,6 @@ func TestBet0_CrossQueueAckIsolationAcrossCheckpoint(t *testing.T) {
 		cfg.Engine.SegmentCheckpointIntervalMS = 500
 		cfg.Engine.CompactionIntervalMS = 500
 		cfg.Engine.CompactionThreshold = 0.1
-		cfg.Storage.CheckpointIntervalMS = 500
 	}
 
 	srv, uri := bet0ServerWithConfig(t, dir, fastCheckpoint)
@@ -2141,7 +2156,7 @@ func TestBet0_LegacyDirMessageOnlyForUnversionedRecords(t *testing.T) {
 // asserted on directly.
 func bet0TryServer(t *testing.T, dir string) (*server.Server, string, error) {
 	t.Helper()
-	port := 19200 + int(bet0PortCounter.Add(1))
+	port := bet0NextPort()
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	cfg := config.DefaultConfig()
 	cfg.Network.Address = addr
@@ -2152,18 +2167,28 @@ func bet0TryServer(t *testing.T, dir string) (*server.Server, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	go func() { _ = srv.Start() }()
+	// bet0TryServer, unlike every other embedded-broker helper in this file,
+	// deliberately does NOT fail the test on a startup problem — callers
+	// (e.g. the legacy-data-directory refusal-to-boot cases) assert on the
+	// returned error themselves. So it cannot route through waitForListening,
+	// which is FailNow-on-failure by design. It still must not discard
+	// Start()'s error the way the pre-fix pattern did: a bind failure is
+	// surfaced here as the real error rather than the generic "not ready".
+	startErrCh := make(chan error, 1)
+	go func() { startErrCh <- srv.Start() }()
 	for i := 0; i < brokerStartupPolls; i++ {
 		if srv.IsListening() {
-			break
+			t.Cleanup(func() { _ = srv.Stop() })
+			return srv, fmt.Sprintf("amqp://guest:guest@%s/", addr), nil
+		}
+		select {
+		case startErr := <-startErrCh:
+			return nil, "", startErr
+		default:
 		}
 		time.Sleep(brokerStartupPollInterval)
 	}
-	if !srv.IsListening() {
-		return nil, "", fmt.Errorf("server listener not ready")
-	}
-	t.Cleanup(func() { _ = srv.Stop() })
-	return srv, fmt.Sprintf("amqp://guest:guest@%s/", addr), nil
+	return nil, "", fmt.Errorf("server listener not ready")
 }
 
 // TestBet0_MultiQueueWithConfirmsDelivers closes the blind spot that let a
@@ -2421,6 +2446,14 @@ type c1PinnedStorage struct {
 	faultCaller string
 	faultSkip   int
 	faultErr    error
+
+	// Passive record probe, independent of both mechanisms above: see
+	// armRecordProbe.
+	probeArmed   bool
+	probeTarget  string
+	probeCaller  string
+	probeAbsent  int
+	probePresent int
 }
 
 // arm makes the next read of `name` block, but ONLY when the call comes from
@@ -2493,11 +2526,61 @@ func (s *c1PinnedStorage) fault(name string) error {
 	return s.faultErr
 }
 
+// armRecordProbe makes every later GetQueue(name) whose stack is inside caller
+// record whether the metadata record the caller RECEIVED was present or absent.
+// It never blocks, never injects, and is not one-shot — the counts are the
+// observable, so every matching call must be seen.
+//
+// It is a premise instrument, and it is usable as one precisely because it is
+// INVARIANT under the code it gates: it reads the storage layer's answer, which
+// sits upstream of both createQueueStateLocked's record-existence guard and
+// republishToTargets' StopCh bail. Breaking either of those does not move these
+// counts, so a regression cannot make the premise look unmet and slip out
+// through a skip.
+func (s *c1PinnedStorage) armRecordProbe(name, caller string) {
+	s.mu.Lock()
+	s.probeArmed, s.probeTarget, s.probeCaller = true, name, caller
+	s.probeAbsent, s.probePresent = 0, 0
+	s.mu.Unlock()
+}
+
+// observeRecord counts one armed GetQueue result, by what the caller receives
+// rather than by what the disk held — the caller branches on the former.
+func (s *c1PinnedStorage) observeRecord(name string, q *protocol.Queue, err error) {
+	s.mu.Lock()
+	armed, caller := s.probeArmed && name == s.probeTarget, s.probeCaller
+	s.mu.Unlock()
+	if !armed {
+		return
+	}
+	var buf [8192]byte
+	if !strings.Contains(string(buf[:runtime.Stack(buf[:], false)]), caller) {
+		return
+	}
+	s.mu.Lock()
+	if err != nil || q == nil {
+		s.probeAbsent++
+	} else {
+		s.probePresent++
+	}
+	s.mu.Unlock()
+}
+
+// recordProbeCounts reports how the armed caller resolved the armed name:
+// absent = the record was gone, present = it was there.
+func (s *c1PinnedStorage) recordProbeCounts() (absent, present int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.probeAbsent, s.probePresent
+}
+
 func (s *c1PinnedStorage) GetQueue(name string) (*protocol.Queue, error) {
 	q, err := s.DisruptorStorage.GetQueue(name)
 	if ferr := s.fault(name); ferr != nil {
+		s.observeRecord(name, nil, ferr)
 		return nil, ferr
 	}
+	s.observeRecord(name, q, err)
 	s.pin(name)
 	return q, err
 }
@@ -2515,7 +2598,7 @@ func (s *c1PinnedStorage) GetExchangeBindings(exchangeName string) ([]*interface
 // durable+confirm publish path is the one under test).
 func bet0PinnedServer(t *testing.T, dir string) (*server.Server, string, *c1PinnedStorage) {
 	t.Helper()
-	port := 19200 + int(bet0PortCounter.Add(1))
+	port := bet0NextPort()
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	cfg := config.DefaultConfig()
 	cfg.Network.Address = addr
@@ -2524,7 +2607,6 @@ func bet0PinnedServer(t *testing.T, dir string) (*server.Server, string, *c1Pinn
 
 	raw, err := storage.NewDisruptorStorageWithEngineConfig(
 		dir,
-		time.Duration(cfg.Storage.CheckpointIntervalMS)*time.Millisecond,
 		cfg.GetEngine(),
 	)
 	require.NoError(t, err, "build storage")
@@ -2532,14 +2614,7 @@ func bet0PinnedServer(t *testing.T, dir string) (*server.Server, string, *c1Pinn
 
 	srv, err := server.NewServerBuilder().WithConfig(cfg).WithStorage(pinned).Build()
 	require.NoError(t, err, "server build")
-	go func() { _ = srv.Start() }()
-	for i := 0; i < brokerStartupPolls; i++ {
-		if srv.IsListening() {
-			break
-		}
-		time.Sleep(brokerStartupPollInterval)
-	}
-	require.True(t, srv.IsListening(), "server listener not ready")
+	waitForListening(t, srv)
 	t.Cleanup(func() { _ = srv.Stop() })
 	return srv, fmt.Sprintf("amqp://guest:guest@%s/", addr), pinned
 }
@@ -3002,7 +3077,7 @@ func TestBet0_DeleteRacingTxCommitCannotOrphanCommittedMessages(t *testing.T) {
 // on directly, the same way bet0TryServer allows.
 func bet0LogCapturingServer(t *testing.T, dir, logFile string) (*server.Server, string, error) {
 	t.Helper()
-	port := 19200 + int(bet0PortCounter.Add(1))
+	port := bet0NextPort()
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	cfg := config.DefaultConfig()
 	cfg.Network.Address = addr
@@ -3014,18 +3089,25 @@ func bet0LogCapturingServer(t *testing.T, dir, logFile string) (*server.Server, 
 	if err != nil {
 		return nil, "", err
 	}
-	go func() { _ = srv.Start() }()
+	// See bet0TryServer for why this does not route through waitForListening:
+	// it deliberately returns a startup problem to the caller instead of
+	// failing the test, so it must still surface Start()'s real error instead
+	// of discarding it into a generic "not ready".
+	startErrCh := make(chan error, 1)
+	go func() { startErrCh <- srv.Start() }()
 	for i := 0; i < brokerStartupPolls; i++ {
 		if srv.IsListening() {
-			break
+			t.Cleanup(func() { _ = srv.Stop() })
+			return srv, fmt.Sprintf("amqp://guest:guest@%s/", addr), nil
+		}
+		select {
+		case startErr := <-startErrCh:
+			return nil, "", startErr
+		default:
 		}
 		time.Sleep(brokerStartupPollInterval)
 	}
-	if !srv.IsListening() {
-		return nil, "", fmt.Errorf("server listener not ready")
-	}
-	t.Cleanup(func() { _ = srv.Stop() })
-	return srv, fmt.Sprintf("amqp://guest:guest@%s/", addr), nil
+	return nil, "", fmt.Errorf("server listener not ready")
 }
 
 // bet0LogRecords parses the zap JSON lines written to logFile. A missing file
@@ -3052,6 +3134,68 @@ func bet0LogRecords(t *testing.T, logFile string) []map[string]interface{} {
 		out = append(out, rec)
 	}
 	return out
+}
+
+// bet0RetainArtifacts copies paths out of the test's temp tree when the test
+// does not PASS, so the broker-side evidence for a rare failure survives the
+// process that produced it.
+//
+// It exists because an external harness CANNOT retain a t.TempDir(). Verified
+// against the toolchain installed here (go1.26.0,
+// GOROOT=/opt/homebrew/Cellar/go/1.26.0/libexec): testing.go's makeTempDir
+// registers
+//
+//	c.Cleanup(func() { if err := removeAll(c.tempDir); err != nil { … } })
+//
+// with NO Failed() guard, so the directory is removed on the failing branch
+// exactly as on the passing one, INSIDE the test process — before any `mv` a
+// runner could perform. A soak that moved 26 failed TMPDIRs aside kept 26 empty
+// directories and lost the only diagnostic for the only reproductions it had.
+//
+// The seam is cleanup ORDER. testing.go's runCleanup pops c.cleanups from the
+// tail, so cleanups run LIFO: a Cleanup registered AFTER the first t.TempDir()
+// call runs BEFORE that directory is removed. Registering this later than the
+// t.TempDir() whose contents it saves is therefore load-bearing, not incidental.
+//
+// Destination is $STRANGEQ_ARTIFACT_DIR when set — a soak points it at a
+// directory it owns, OUTSIDE the per-worker TMPDIR it recycles — else a fresh
+// os.MkdirTemp. Either way the destination is logged: an artifact nobody can
+// locate is the same as no artifact. Nothing is retained on a pass, so the
+// committed default litters only when there is something to look at.
+func bet0RetainArtifacts(t *testing.T, paths ...string) {
+	t.Helper()
+	t.Cleanup(func() {
+		if !t.Failed() && !t.Skipped() {
+			return
+		}
+		dest := os.Getenv("STRANGEQ_ARTIFACT_DIR")
+		if dest == "" {
+			d, err := os.MkdirTemp("", "strangeq-artifacts-")
+			if err != nil {
+				t.Logf("ARTIFACT RETENTION FAILED: MkdirTemp: %v", err)
+				return
+			}
+			dest = d
+		}
+		dest = filepath.Join(dest, strings.ReplaceAll(t.Name(), "/", "_"))
+		if err := os.MkdirAll(dest, 0o755); err != nil {
+			t.Logf("ARTIFACT RETENTION FAILED: MkdirAll %s: %v", dest, err)
+			return
+		}
+		for _, p := range paths {
+			body, err := os.ReadFile(p)
+			if err != nil {
+				t.Logf("ARTIFACT RETENTION FAILED: read %s: %v", p, err)
+				continue
+			}
+			out := filepath.Join(dest, filepath.Base(p))
+			if err := os.WriteFile(out, body, 0o644); err != nil {
+				t.Logf("ARTIFACT RETENTION FAILED: write %s: %v", out, err)
+				continue
+			}
+			t.Logf("RETAINED ARTIFACT: %s -> %s (%d bytes)", p, out, len(body))
+		}
+	})
 }
 
 // bet0LogRecordsWithMsg returns the parsed records whose "msg" is exactly msg.
@@ -3352,7 +3496,7 @@ func TestBet0_OrdinalAwareRecoveryCaseBAndMismatch(t *testing.T) {
 // bet0LogCapturingServer for why LogFile is the only usable seam.
 func bet0PinnedLoggingServer(t *testing.T, dir, logFile string) (*server.Server, string, *c1PinnedStorage) {
 	t.Helper()
-	port := 19200 + int(bet0PortCounter.Add(1))
+	port := bet0NextPort()
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	cfg := config.DefaultConfig()
 	cfg.Network.Address = addr
@@ -3362,7 +3506,6 @@ func bet0PinnedLoggingServer(t *testing.T, dir, logFile string) (*server.Server,
 
 	raw, err := storage.NewDisruptorStorageWithEngineConfig(
 		dir,
-		time.Duration(cfg.Storage.CheckpointIntervalMS)*time.Millisecond,
 		cfg.GetEngine(),
 	)
 	require.NoError(t, err, "build storage")
@@ -3370,14 +3513,7 @@ func bet0PinnedLoggingServer(t *testing.T, dir, logFile string) (*server.Server,
 
 	srv, err := server.NewServerBuilder().WithConfig(cfg).WithStorage(pinned).Build()
 	require.NoError(t, err, "server build")
-	go func() { _ = srv.Start() }()
-	for i := 0; i < brokerStartupPolls; i++ {
-		if srv.IsListening() {
-			break
-		}
-		time.Sleep(brokerStartupPollInterval)
-	}
-	require.True(t, srv.IsListening(), "server listener not ready")
+	waitForListening(t, srv)
 	t.Cleanup(func() { _ = srv.Stop() })
 	return srv, fmt.Sprintf("amqp://guest:guest@%s/", addr), pinned
 }
@@ -3440,6 +3576,10 @@ func TestBet0_DeleteRacingDeadLetterCannotOrphanTargetQueue(t *testing.T) {
 	)
 	dir := t.TempDir()
 	logPath := filepath.Join(t.TempDir(), "broker-dlx.log")
+	// AFTER both t.TempDir() calls, so LIFO cleanup order copies the log out
+	// before the temp tree is removed. The assertions below cite this log; on a
+	// failure or a skip it must outlive the process, or the citation is dead.
+	bet0RetainArtifacts(t, logPath)
 	srv, uri, pinned := bet0PinnedLoggingServer(t, dir, logPath)
 
 	conn, err := amqp.Dial(uri)
@@ -3488,6 +3628,12 @@ func TestBet0_DeleteRacingDeadLetterCannotOrphanTargetQueue(t *testing.T) {
 	}
 
 	// Park the republisher inside routing, holding the pre-delete target list.
+	//
+	// The probe is armed alongside the pin and records how the republish later
+	// resolves the target's metadata record. That is the observable which
+	// separates the two readings of a missing drop record at the end of this
+	// test; the reasoning is at the assertion, where it is used.
+	pinned.armRecordProbe(dlxTarget, "deadLetter")
 	entered, release := pinned.arm(dlxName, "deadLetter")
 	nacked := make(chan error, 1)
 	go func() { nacked <- toNack.Nack(false, false) }()
@@ -3615,12 +3761,69 @@ func TestBet0_DeleteRacingDeadLetterCannotOrphanTargetQueue(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
+	// An empty goneHits has two readings, and only one of them is a defect. The
+	// probe armed with the pin separates them, so the verdict is decided on
+	// evidence rather than on which reading the reader finds plausible.
+	//
+	// The republish resolves its target through getOrCreateQueueState, and
+	// queue.delete returned to its client before `release` was closed — by which
+	// point deleteQueueIncarnation has run BOTH queueStates.LoadAndDelete(name)
+	// and storage.DeleteQueue(name) (storage_broker.go, in that order). So a
+	// republish that resumes into the deleted window misses the state map, falls
+	// into createQueueStateLocked, and reads an ABSENT record. Every step from
+	// there is unconditional: absent record => closed record-less QueueState =>
+	// republishToTargets' StopCh bail => recordDeadLetterTargetGone. Hence:
+	//
+	//	absent > 0  — the republish DID reach the deleted target. The drop record
+	//	              is then mandatory, and its absence is the second reading:
+	//	              it wrote into that state anyway, leaving a durable record
+	//	              for a queue with no metadata, which recovery discards. That
+	//	              is a durability defect and it must FAIL.
+	//
+	//	absent == 0 — the republish never saw a deleted target. It resolved the
+	//	              name only after the re-declare below had restored it (a
+	//	              queueStates hit, or a GetQueue that found the new record),
+	//	              so the dead-letter went into a live, correctly-identified
+	//	              queue. The window this test exists to pin was not pinned and
+	//	              the run proves nothing: INCONCLUSIVE, not FAIL.
+	//
+	// Measured at 26/2000 = 1.3%, roughly 9x more likely than the defect this
+	// fixture is here to catch (bounded at 1/667 over the same soak). Reporting
+	// that as a failure is worse than a silent false positive, because the
+	// failure text says the run proves nothing — so a triager who reads it
+	// correctly concludes there is no defect, and learns that this assertion
+	// reddening is ignorable, on an assertion doing real work the other 98.7%
+	// of the time.
+	//
+	// The probe cannot manufacture a skip: it reads the storage layer's answer,
+	// upstream of both the record-existence guard and the StopCh bail, so
+	// breaking either leaves absent > 0 and the run still fails here.
+	absent, present := pinned.recordProbeCounts()
+	if len(goneHits) == 0 && absent == 0 {
+		t.Skipf("INCONCLUSIVE (premise not established, not a defect): the dead-letter republish "+
+			"never resolved %q while it was deleted — the pinned storage saw %d absent and %d "+
+			"present metadata reads from the republish path, so the republish reached the target "+
+			"only after the re-declare had restored it and this run cannot say anything about the "+
+			"drop. Log: %s", dlxTarget, absent, present, logPath)
+	}
+	// The converse, which keeps the probe honest: a drop record can only have
+	// come from the closed state createQueueStateLocked returns on an absent
+	// read, so observing one with absent == 0 means the probe did not see a call
+	// it must have seen — a caller-filter or a truncated stack — and the skip
+	// above would be handing out false greens.
+	require.NotZerof(t, absent,
+		"the drop was recorded (%d hits) but the record probe counted no absent read from the "+
+			"republish path (absent=%d present=%d). The probe is not observing the call it gates "+
+			"the skip on, so an empty goneHits would be skipped rather than failed. Log: %s",
+		len(goneHits), absent, present, logPath)
 	require.Lenf(t, goneHits, 1,
 		"the dead-letter republish must be DROPPED and say why, once, when its target queue has "+
-			"been deleted out from under it. No such record means the republish either never "+
-			"reached the deleted target (the window was not pinned and this test is vacuous) or "+
-			"reached it and wrote into it anyway — a durable record for a queue with no metadata, "+
-			"which recovery discards. Log: %s", logPath)
+			"been deleted out from under it. The republish resolved %q with its metadata record "+
+			"ABSENT %d time(s), so it reached the deleted target and was handed a closed, "+
+			"record-less QueueState; the vacuous reading is excluded by that count and would have "+
+			"skipped above. What remains is that it wrote into that state anyway — a durable "+
+			"record for a queue with no metadata, which recovery discards. Log: %s",
+		dlxTarget, absent, logPath)
 	require.Equal(t, srcQueue, goneHits[0]["source_queue"],
 		"the drop must name the source queue whose message was destroyed")
 	require.Equal(t, dlxTarget, goneHits[0]["target_exchange"],

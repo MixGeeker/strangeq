@@ -46,7 +46,8 @@ func TestSegmentPreservesMetadata(t *testing.T) {
 	}
 
 	// Read it back
-	qs := sm.getOrCreateQueueSegments("test-queue")
+	qs, qsErr := sm.getOrCreateQueueSegments("test-queue")
+	require.NoError(t, qsErr)
 	msg, err := qs.readMessage(42)
 	if err != nil {
 		t.Fatalf("readMessage failed: %v", err)
@@ -86,7 +87,8 @@ func TestSegmentEmptyExchangeAndRoutingKey(t *testing.T) {
 		t.Fatalf("CheckpointBatch failed: %v", err)
 	}
 
-	qs := sm.getOrCreateQueueSegments("test-queue")
+	qs, qsErr := sm.getOrCreateQueueSegments("test-queue")
+	require.NoError(t, qsErr)
 	msg, err := qs.readMessage(1)
 	if err != nil {
 		t.Fatalf("readMessage failed: %v", err)
@@ -117,7 +119,8 @@ func TestSegmentRoundtripMultipleMessages(t *testing.T) {
 		t.Fatalf("CheckpointBatch failed: %v", err)
 	}
 
-	qs := sm.getOrCreateQueueSegments("test-queue")
+	qs, qsErr := sm.getOrCreateQueueSegments("test-queue")
+	require.NoError(t, qsErr)
 	for _, original := range messages {
 		msg, err := qs.readMessage(original.DeliveryTag)
 		if err != nil {
@@ -153,7 +156,8 @@ func TestCheckpointBatchFsyncsSegment(t *testing.T) {
 
 	// If fsync was called, the data should be durable on disk.
 	// We verify by reading it back immediately (no sleep needed if fsync'd).
-	qs := sm.getOrCreateQueueSegments("ckpt-queue")
+	qs, qsErr := sm.getOrCreateQueueSegments("ckpt-queue")
+	require.NoError(t, qsErr)
 	readMsg, err := qs.readMessage(1)
 	if err != nil {
 		t.Fatalf("readMessage after checkpoint failed: %v", err)

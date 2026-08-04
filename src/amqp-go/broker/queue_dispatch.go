@@ -169,6 +169,28 @@ func (qs *QueueState) Ordinal() uint64 {
 	return TagOrdinal(qs.ordinalBase)
 }
 
+// TagBand returns the inclusive composite-delivery-tag range this queue
+// INCARNATION owns (broker/tag_packing.go).
+//
+// It exists so a control-plane mutator can be handed an INCARNATION rather than
+// only a name. Queue ordinals are never reused within a broker run, so a
+// destructive range-scoped operation carrying one incarnation's band cannot
+// touch a successor that later took the same name — which is what makes the
+// purge path safe without holding a lock across it.
+//
+// DO NOT read this as "every message in this queue's ring lies in this band".
+// An earlier version of this comment claimed exactly that, on the grounds that
+// FrontierReserve is the only minter and mints from ordinalBase. The minting is
+// in-band; the STORING is not. republishToTargets (broker/dead_letter.go) and
+// PublishMessage both resolve a target QueueState, mint from it, and then store
+// BY NAME with nothing revalidating in between — so a delete+redeclare in that
+// gap lands a predecessor-band tag in the successor's ring. That race is the
+// deliberately deferred half of B-2, so out-of-band residents are reachable
+// today. See purgeIncarnation for what that costs.
+func (qs *QueueState) TagBand() (minTag, maxTag uint64) {
+	return qs.ordinalBase, qs.ordinalBase | SeqMask
+}
+
 func (qs *QueueState) SetParkTimeout(d time.Duration) {
 	qs.parkTimeout = d
 }
@@ -665,22 +687,39 @@ func (qs *QueueState) Recover(minTag, maxTag, count uint64) {
 // and server/recovery_manager.go, which only calls it when hasRecovered):
 // storage/wal_manager.go RecoverFromWAL and storage/segment_manager.go
 // RecoverFromSegments do NOT exclude a record from the recovered set because
-// it was acked — they filter WAL records against ackBitmap, but that bitmap
-// is always freshly empty at boot (never persisted, never rebuilt from any
-// durable ack log — a message record is a WAL record; nothing records an ack
-// as one), so a not-yet-reclaimed record is ALWAYS returned by
-// RecoverFromWAL regardless of ack status. RecoverFromSegments filters
-// nothing at all. The only way a record is excluded from recovery is
-// physical absence: the WAL file was deleted (performCheckpoint /
-// tryDeleteOldFiles, both of which only remove a record once it is ACKed)
-// or the segment was compacted (compactSegment, same precondition).
-// Therefore "this queue recovered zero messages" is exactly equivalent to
-// "every record this queue ever wrote is physically gone from disk" — reused
-// low sequence numbers have nothing left anywhere to collide with. Any
-// record still physically present (acked or not) comes back through this
-// exact path with its real tag inside [minTag, maxTag], and nextSeq above
+// it was acked — RecoverFromWAL filters against the WAL's own ackBitmap,
+// which is this incarnation's live ack set and is therefore still empty at
+// boot, and RecoverFromSegments filters nothing at all. So a not-yet-reclaimed
+// record is ALWAYS returned regardless of ack status. The only way a record is
+// excluded from RECOVERY is physical absence: the WAL file was deleted
+// (performCheckpoint / tryDeleteOldFiles, both of which only remove a record
+// once it is ACKed) or the segment was compacted (compactSegment, same
+// precondition). Therefore "this queue recovered zero messages" is exactly
+// equivalent to "every record this queue ever wrote is physically gone from
+// disk" — reused low sequence numbers have nothing left anywhere to collide
+// with. Any record still physically present (acked or not) comes back through
+// this exact path with its real tag inside [minTag, maxTag], and nextSeq above
 // resumes past it. No per-queue mirror of a persisted delivery-tag counter is
 // needed to close this gap.
+//
+// THE UNWRITTEN PREMISE, made explicit because a feature nearly falsified it:
+// everything above reduces tag-reuse safety to "a tag is only dangerous while
+// its bytes are physically present". That reduction is sound only while NO
+// durable, tag-keyed state outlives those bytes. Today none does —
+// acknowledgement is not persisted (storage/wal_boot_state.go), so the WAL's
+// ackBitmap is empty at every boot and nothing survives a record's reclamation
+// that still refers to its tag.
+//
+// A durable ack snapshot was built, reviewed three times and WITHDRAWN for
+// exactly this reason: a drained queue whose WAL files were reclaimed recovers
+// zero records, resumes at seq 0, and re-mints tags straight into an inherited
+// ack set — silently destroying every message published on them (measured:
+// 198/200). Intersecting the ack set with the physically-present offsets does
+// not fix it, because the intersection compares TAG VALUES, and tag values are
+// re-mintable by design; it delays the hazard by one incarnation. Anything
+// added here that is durable AND keyed by delivery tag must first solve
+// attribution to the RECORD an ack cancels, not to its tag. See
+// .notes/loop-2/deferred-ack-durability.md.
 func (qs *QueueState) RecoverSeq(nextSeq uint64) {
 	qs.frontierMu.Lock()
 	qs.nextSeq = nextSeq

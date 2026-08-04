@@ -19,8 +19,7 @@
     "MessageTTL": 0,
     "CacheSize": 67108864,
     "MaxOpenFiles": 100,
-    "CompactionAge": 86400000000000,
-    "OffsetCheckpointInterval": 5000000000
+    "CompactionAge": 86400000000000
   },
   "security": {
     "TLSEnabled": false,

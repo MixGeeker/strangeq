@@ -111,7 +111,7 @@ func registerManualConsumer(t *testing.T, b *StorageBroker, queue, tag string, p
 		Messages:      make(chan *protocol.Delivery, buf),
 		PrefetchCount: prefetch,
 	}
-	require.NoError(t, b.RegisterConsumer(queue, tag, c))
+	require.NoError(t, registerConsumer(b, queue, tag, c))
 	return c
 }
 

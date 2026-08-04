@@ -17,7 +17,7 @@ func TestP3_RingBufferSizeFromConfig(t *testing.T) {
 		SpillThresholdPercent: 75,
 	}
 
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), 5000, ec)
+	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), ec)
 	require.NoError(t, err)
 
 	ring := ds.getOrCreateQueueRing("test-queue-p3")
@@ -41,7 +41,7 @@ func TestP3_RingBufferMaskWorks(t *testing.T) {
 		SpillThresholdPercent: 80,
 	}
 
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), 5000, ec)
+	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), ec)
 	require.NoError(t, err)
 
 	msg := &protocol.Message{
@@ -71,7 +71,7 @@ func TestP3_DefaultsWhenConfigZero(t *testing.T) {
 
 	ec := interfaces.EngineConfig{}
 
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), 5000, ec)
+	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), ec)
 	require.NoError(t, err)
 
 	if ds.ringBufferSize != DefaultRingBufferSize {
@@ -94,7 +94,7 @@ func TestP3_SpillThresholdAtCorrectPercent(t *testing.T) {
 		SpillThresholdPercent: 50,
 	}
 
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), 5000, ec)
+	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), ec)
 	require.NoError(t, err)
 	defer ds.Close()
 

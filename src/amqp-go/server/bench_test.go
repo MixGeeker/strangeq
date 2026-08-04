@@ -34,7 +34,7 @@ func newProcessCompleteMessageBenchServer(b *testing.B) *Server {
 	cfg.Storage.Path = b.TempDir()
 	cfg.Engine.RingBufferSize = 1 << 21 // power of 2; ~1.67M-message spill threshold at 80%
 
-	storageImpl, err := storage.NewDisruptorStorageWithEngineConfig(cfg.Storage.Path, storage.DefaultCheckpointInterval, cfg.GetEngine())
+	storageImpl, err := storage.NewDisruptorStorageWithEngineConfig(cfg.Storage.Path, cfg.GetEngine())
 	if err != nil {
 		b.Fatalf("failed to create storage: %v", err)
 	}

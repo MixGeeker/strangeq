@@ -165,16 +165,7 @@ func writevRaceServer(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("Build failed: %v", err)
 	}
-	go func() { _ = srv.Start() }()
-	for i := 0; i < brokerStartupPolls; i++ {
-		if srv.IsListening() {
-			break
-		}
-		time.Sleep(brokerStartupPollInterval)
-	}
-	if !srv.IsListening() {
-		t.Fatal("server listener not ready")
-	}
+	waitForListening(t, srv)
 	t.Cleanup(func() { _ = srv.Stop() })
 	return fmt.Sprintf("amqp://guest:guest@%s/", srv.Listener.Addr().String())
 }

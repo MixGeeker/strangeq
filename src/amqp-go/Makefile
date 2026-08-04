@@ -98,16 +98,72 @@ BENCH_SERVER_REGEX := ^BenchmarkProcessCompleteMessage$$
 # pass" for the measured per-sample timing/CV this was tuned against).
 BENCH_TIME_SERVER ?= 1500000x
 
+# ---- storage: the package the gate used to be blind to --------------------
+#
+# All 21 storage benchmarks were ungated while this loop's largest fixes land
+# in exactly this package. The four below are the ones whose noise was
+# MEASURED on the gating machine at -count=10 and found resolvable at the 2%
+# threshold; every other storage benchmark is excluded for a stated reason
+# (see .notes/loop-2/step0-report.md "D3"), not because nobody looked:
+#
+#   GetConsumerPendingAcks_Indexed  sec/op +-2%   B/op +-0%   allocs/op +-0%
+#   SegmentWriteReadWithMetadata    sec/op +-1%   B/op +-0%   allocs/op +-0%
+#   WALReadWithCache                sec/op +-3%   B/op +-0%   allocs/op +-0%
+#   SharedWAL_Acknowledge           sec/op +-3%   B/op +-0%   allocs/op +-0%
+#
+# Excluded, with the reason recorded rather than left implicit:
+#   * the fsync-bound write path (SharedWAL_SingleQueueWrites,
+#     _MultiQueueWrites, _MessageSizes/*, _QueueScaling/*, WALWrite_Sequential,
+#     PublishDurable1P1C, AppendMessageRecord_NoProps) sits at ~2.7 ms/op on
+#     macOS -- one F_FULLFSYNC per operation. A 2% sec/op gate over those
+#     measures the disk, not the diff, and their un-measured fsync'd setup
+#     makes a -count=10 capture cost minutes per benchmark.
+#   * the concurrency-bound set (SharedWAL_ConcurrentWrites, WALWrite_Parallel
+#     at SetParallelism(16), Single/MultiQueueConcurrentPublish,
+#     ConcurrentGetAndDelete) is goroutine-scheduling bound.
+#   * DeleteMessage and GetMessageRingBuffer index a fixed 1000/10000-message
+#     fixture with `i % numMessages`, so once b.N exceeds the fixture the
+#     operation being measured changes character.
+#   * GetConsumerPendingAcks_FullScanBaseline is an intentional O(n) control
+#     that exists only to be compared against the Indexed variant.
+#   * SharedWAL_Read pre-populates 10000 fsync'd messages per sample; its CV
+#     could not be resolved within the measurement budget.
+#
+# NOTHING here covers WAL RECOVERY: no storage benchmark exercises the
+# recovery path at all, so a green bench-gate after this loop's recovery
+# fixes says nothing about them. That is a coverage statement, not a caveat.
+BENCH_STORAGE_REGEX := ^Benchmark(GetConsumerPendingAcks_Indexed|SegmentWriteReadWithMetadata|WALReadWithCache|SharedWAL_Acknowledge)$$
+BENCH_TIME_STORAGE  ?= 200000x
+
+# BENCH_SUITE is the single definition of what the gate measures and how.
+# bench-gate and bench-baseline-refresh BOTH expand it, so the run being
+# gated and the run the baseline was captured from cannot drift apart in
+# package set, -bench regex, -benchtime or -count. They used to be two
+# hand-maintained copies of the same four facts; benchstat compares fixed
+# iteration counts, so a -benchtime that differed between the two would have
+# produced a meaningless comparison that nothing could detect.
+# $(1) is the output file to append to.
+define BENCH_SUITE
+go test . -run='^$$' -bench='$(BENCH_ROOT_REGEX)' -benchmem -benchtime=$(BENCH_TIME) -count=$(BENCH_COUNT) >> $(1)
+go test ./broker -run='^$$' -bench='$(BENCH_BROKER_REGEX)' -benchmem -benchtime=$(BENCH_TIME) -count=$(BENCH_COUNT) >> $(1)
+go test ./server -run='^$$' -bench='$(BENCH_SERVER_REGEX)' -benchmem -benchtime=$(BENCH_TIME_SERVER) -count=$(BENCH_COUNT) >> $(1)
+go test ./storage -run='^$$' -bench='$(BENCH_STORAGE_REGEX)' -benchmem -benchtime=$(BENCH_TIME_STORAGE) -count=$(BENCH_COUNT) >> $(1)
+endef
+
 # Runs the in-scope benchmarks against the CURRENT worktree and gates the
 # result against the committed baseline. Fails (non-zero) on any benchmark
 # whose mean regresses >2% at p<0.05, or whose allocs/op (or other
 # non-latency /op metric) increases at all, significantly.
+#
+# It also fails, WITHOUT reporting any percentage, when the baseline was
+# captured on different hardware from the machine running the gate -- the CPU
+# model and count are part of what makes two runs comparable. If that is what
+# you are seeing, re-capture with bench-baseline-refresh on this machine and
+# review the diff; do not reach for a way to normalise it away.
 bench-gate:
 	@mkdir -p $(BENCH_OUT_DIR)
 	@rm -f $(BENCH_NEW)
-	go test . -run='^$$' -bench='$(BENCH_ROOT_REGEX)' -benchmem -benchtime=$(BENCH_TIME) -count=$(BENCH_COUNT) >> $(BENCH_NEW)
-	go test ./broker -run='^$$' -bench='$(BENCH_BROKER_REGEX)' -benchmem -benchtime=$(BENCH_TIME) -count=$(BENCH_COUNT) >> $(BENCH_NEW)
-	go test ./server -run='^$$' -bench='$(BENCH_SERVER_REGEX)' -benchmem -benchtime=$(BENCH_TIME_SERVER) -count=$(BENCH_COUNT) >> $(BENCH_NEW)
+	$(call BENCH_SUITE,$(BENCH_NEW))
 	go run ./cmd/benchgate -baseline $(BENCH_BASELINE) -new $(BENCH_NEW)
 
 # Regenerates the committed baseline from the CURRENT worktree. Run this
@@ -116,6 +172,4 @@ bench-gate:
 bench-baseline-refresh:
 	@mkdir -p $(BENCH_OUT_DIR) testdata
 	@rm -f $(BENCH_BASELINE)
-	go test . -run='^$$' -bench='$(BENCH_ROOT_REGEX)' -benchmem -benchtime=$(BENCH_TIME) -count=$(BENCH_COUNT) >> $(BENCH_BASELINE)
-	go test ./broker -run='^$$' -bench='$(BENCH_BROKER_REGEX)' -benchmem -benchtime=$(BENCH_TIME) -count=$(BENCH_COUNT) >> $(BENCH_BASELINE)
-	go test ./server -run='^$$' -bench='$(BENCH_SERVER_REGEX)' -benchmem -benchtime=$(BENCH_TIME_SERVER) -count=$(BENCH_COUNT) >> $(BENCH_BASELINE)
+	$(call BENCH_SUITE,$(BENCH_BASELINE))

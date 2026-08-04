@@ -199,26 +199,39 @@ func (b *ServerBuilder) Build() (*Server, error) {
 	if b.storage != nil {
 		storageImpl = b.storage
 	} else {
-		// Create new disruptor storage with configurable checkpoint interval and engine config
-		checkpointInterval := time.Duration(b.config.Storage.CheckpointIntervalMS) * time.Millisecond
+		// Create new disruptor storage with the engine config
 		var err error
 		storageImpl, err = storage.NewDisruptorStorageWithEngineConfig(
 			b.config.Storage.Path,
-			checkpointInterval,
 			b.config.GetEngine(),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to initialize durable storage at %q: %w", b.config.Storage.Path, err)
 		}
-		if checkpointInterval == 0 {
-			logger.Info("Using disruptor-based storage with offset checkpointing disabled")
-		} else {
-			logger.Info("Using disruptor-based storage",
-				interfaces.LogField{Key: "offset_checkpoint_interval", Value: b.config.Storage.CheckpointIntervalMS})
-		}
+		logger.Info("Using disruptor-based storage")
 	}
 
-	// Create broker if not provided
+	// The storage tiers have cold-path durability failures the call stack cannot
+	// return: a checkpoint that cannot run leaves a WAL file unreclaimed
+	// forever, and a segment withdrawn from compaction is invisible without a
+	// line naming the file (review-4 B-2, B-4, N-7). Wired HERE, next to the
+	// storage, rather than inside the broker branch below — an injected broker
+	// must not decide whether the storage tier can report.
+	if ls, ok := storageImpl.(interface {
+		SetLogger(interfaces.Logger)
+	}); ok {
+		ls.SetLogger(logger)
+	}
+
+	// Create broker if not provided.
+	//
+	// ordinalGating carries any boot-gating fault raised HERE forward to the
+	// degraded-boot bookkeeping below. The Server object does not exist yet at
+	// this point, so a broker gated ONLY by this branch used to log once at
+	// startup and then be silent forever: no pinned gauge, no 5-minute nag,
+	// UnsafeRecoveryFaults() empty. Nothing guaranteed the recovery branch
+	// would cover for it.
+	var ordinalGating []*interfaces.RecoveryFault
 	var unifiedBroker UnifiedBroker
 	if b.broker != nil {
 		unifiedBroker = b.broker
@@ -227,6 +240,32 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		// Phase 6G: Pass engine config for tunable parameters
 		storageBroker := broker.NewStorageBroker(storageImpl, b.config.GetEngine())
 		storageBroker.SetLogger(logger)
+		// initOrdinalAllocator establishes the delivery-tag ordinal high-water
+		// mark. It cannot report through the constructor's signature, and a
+		// zero mark hands a brand-new queue an ordinal whose records are still
+		// physically on disk — a cross-queue tag collision in a WAL keyed by a
+		// bare uint64. Checked HERE rather than relying on PerformRecovery to
+		// hit the same underlying error a few lines below, because "the other
+		// check will catch it" is exactly the unwritten load-bearing premise
+		// this step exists to remove.
+		//
+		// The gate is `len(gating) > 0`, NOT `ierr != nil`: InitError can carry
+		// a benign-only error (it folds in GetRecoverableMessages' fault, and
+		// the segment tier lands a new producer there in Step 4), and a refusal
+		// whose artifact list is empty tells an operator nothing. The
+		// unreachability of that today rests on storage.joinFaults filtering
+		// benign faults out — an unwritten load-bearing premise in a different
+		// package — so it is checked here rather than inherited.
+		if ierr := storageBroker.InitError(); ierr != nil {
+			ordinalGating = gatingFaultList(interfaces.ExplainedFaults("ordinal-allocator", ierr))
+			if len(ordinalGating) > 0 {
+				if !b.config.Storage.UnsafeRecovery {
+					return nil, errors.New(interfaces.RecoveryRefusalMessage(
+						"delivery-tag ordinal recovery", ordinalGating))
+				}
+				logUnsafeRecovery(logger, "ordinal-allocator", ordinalGating)
+			}
+		}
 		unifiedBroker = NewStorageBrokerAdapter(storageBroker)
 	}
 
@@ -316,28 +355,106 @@ func (b *ServerBuilder) Build() (*Server, error) {
 	recoveryManager := NewRecoveryManager(storageImpl, unifiedBroker, logger.(*ZapLoggerAdapter).logger)
 
 	recoveryStats, err := recoveryManager.PerformRecovery()
-	if err != nil {
-		// ErrLegacyDataDirectory / ErrOrdinalMismatch are the one class of
-		// recovery error that must NOT fall through to "log and continue"
-		// below: they guard against silent cross-queue delivery-tag
-		// collision (broker/tag_packing.go) — a data-loss/corruption hazard,
-		// not a recoverable condition. Every other recovery error keeps the
-		// pre-existing (if debatable) "start with an empty broker" behavior
-		// unchanged; narrowing this to exactly these two sentinel errors is
-		// deliberate so this fix does not change behavior for anything else.
-		if errors.Is(err, ErrLegacyDataDirectory) || errors.Is(err, ErrOrdinalMismatch) {
-			return nil, fmt.Errorf("recovery aborted, refusing to start: %w", err)
+
+	// THE INVERSION. This used to be an ALLOW-LIST of two fatal sentinels:
+	// anything else logged "Recovery failed" and fell through to
+	// `return server, nil`, so the DEFAULT for every recovery error nobody had
+	// thought of yet was "boot with an empty broker and start accepting and
+	// confirming durable publishes". Measured end to end: recovery aborts with
+	// `unsupported WAL file format version: got 1, want 4`, a durable
+	// StoreMessage then returns OK — which is where the publisher confirm is
+	// sent — the bytes land on disk, and the next boot recovers zero.
+	//
+	// Now the severity comes from the site that produced the error
+	// (interfaces.RecoveryOutcome), an unclassified error is FATAL by the
+	// type's zero value, and only --unsafe-recovery proceeds.
+	faults := interfaces.ExplainedFaults("recovery", err)
+	gating := gatingFaultList(faults)
+	if len(gating) > 0 && !b.config.Storage.UnsafeRecovery {
+		return nil, errors.New(interfaces.RecoveryRefusalMessage("recovery", gating))
+	}
+	if len(gating) > 0 {
+		logUnsafeRecovery(logger, "recovery", gating)
+	}
+	// EVERY gating fault this boot overrode is marked and measured, wherever it
+	// was raised — the ordinal-allocator branch above included — and each
+	// ARTIFACT is counted once. initOrdinalAllocator and PerformRecovery both
+	// read GetRecoverableMessages, so the same damaged file legitimately
+	// surfaces twice; a gauge that said "2 artifacts discarded" for one
+	// discarded file would be a cost statement that overstates, which is
+	// exactly as wrong as one that understates.
+	if degraded := dedupeFaultsByArtifact(ordinalGating, gating); len(degraded) > 0 {
+		server.markUnsafeRecovery(degraded)
+		metricsCollector.SetUnsafeRecoveryArtifacts(len(degraded))
+	}
+	for _, f := range faults {
+		if !f.Outcome.GatesBoot() {
+			logger.Warn("recovery discarded records it was allowed to discard",
+				interfaces.LogField{Key: "stage", Value: f.Stage},
+				interfaces.LogField{Key: "artifact", Value: f.Artifact},
+				interfaces.LogField{Key: "detail", Value: f.Detail})
 		}
-		logger.Error("Recovery failed", interfaces.LogField{Key: "error", Value: err})
-		// Continue with server startup even if recovery fails
-	} else {
-		logger.Info("Recovery completed successfully",
+	}
+	if recoveryStats != nil {
+		logger.Info("Recovery completed",
 			interfaces.LogField{Key: "exchanges_recovered", Value: recoveryStats.DurableExchangesRecovered},
 			interfaces.LogField{Key: "queues_recovered", Value: recoveryStats.DurableQueuesRecovered},
-			interfaces.LogField{Key: "messages_recovered", Value: recoveryStats.PersistentMessagesRecovered})
+			interfaces.LogField{Key: "messages_recovered", Value: recoveryStats.PersistentMessagesRecovered},
+			interfaces.LogField{Key: "faults", Value: len(faults)})
 	}
 
 	return server, nil
+}
+
+// dedupeFaultsByArtifact concatenates fault lists, keeping the first fault for
+// each (outcome, artifact) pair. Order is preserved so an operator reads them
+// in the order recovery hit them.
+func dedupeFaultsByArtifact(lists ...[]*interfaces.RecoveryFault) []*interfaces.RecoveryFault {
+	type key struct {
+		outcome  interfaces.RecoveryOutcome
+		artifact string
+	}
+	seen := make(map[key]struct{})
+	var out []*interfaces.RecoveryFault
+	for _, l := range lists {
+		for _, f := range l {
+			k := key{f.Outcome, f.Artifact}
+			if _, dup := seen[k]; dup {
+				continue
+			}
+			seen[k] = struct{}{}
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func gatingFaultList(faults []*interfaces.RecoveryFault) []*interfaces.RecoveryFault {
+	out := make([]*interfaces.RecoveryFault, 0, len(faults))
+	for _, f := range faults {
+		if f.Outcome.GatesBoot() {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// logUnsafeRecovery names EVERY discarded artifact by path, one line each, at
+// ERROR level. A single startup line is precisely what let two contaminated
+// data directories sit unnoticed in this repository for three weeks.
+func logUnsafeRecovery(logger interfaces.Logger, context string, faults []*interfaces.RecoveryFault) {
+	for _, f := range faults {
+		if !f.Outcome.GatesBoot() {
+			continue
+		}
+		logger.Error("unsafe-recovery: DISCARDING an artifact this broker could not recover",
+			interfaces.LogField{Key: "context", Value: context},
+			interfaces.LogField{Key: "outcome", Value: f.Outcome.String()},
+			interfaces.LogField{Key: "stage", Value: f.Stage},
+			interfaces.LogField{Key: "path", Value: f.Artifact},
+			interfaces.LogField{Key: "cause", Value: f.Detail},
+			interfaces.LogField{Key: "cost", Value: f.Cost})
+	}
 }
 
 // constructAuthenticator builds an authenticator from the security config.

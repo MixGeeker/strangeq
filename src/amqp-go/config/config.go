@@ -41,12 +41,11 @@ func DefaultConfig() *AMQPConfig {
 			// Durable by default: an explicit non-nil true so --generate-config
 			// emits `fsync: true` (not `fsync: null`) and the no-config path is
 			// unambiguously durable. Set fsync:false to opt out of the barrier.
-			Fsync:                boolPtr(true),
-			CRCCheck:             boolPtr(true),
-			CacheMB:              64,       // 64 MB metadata cache
-			MaxFiles:             100,      // Max open file handles
-			RetentionMS:          86400000, // 24 hours
-			CheckpointIntervalMS: 5000,     // 5 seconds
+			Fsync:       boolPtr(true),
+			CRCCheck:    boolPtr(true),
+			CacheMB:     64,       // 64 MB metadata cache
+			MaxFiles:    100,      // Max open file handles
+			RetentionMS: 86400000, // 24 hours
 		},
 		Security: interfaces.SecurityConfig{
 			TLSEnabled:             false,
@@ -167,11 +166,15 @@ func (c *AMQPConfig) CRCEnabled() bool {
 // GetEngine returns engine tuning configuration. It overlays the single user
 // fsync knob onto the internal (inverted) WALSyncDisabled transport and the
 // CRC knob onto WALCRCDisabled so the storage layer honors both while every
-// zero-value path stays durable and integrity-checked.
+// zero-value path stays durable and integrity-checked. Storage.UnsafeRecovery
+// rides the same overlay (same sense, not inverted: false = refuse to start on
+// an unrecoverable directory) because storage CONSTRUCTION is where an
+// unparseable WAL framing version is first detected.
 func (c *AMQPConfig) GetEngine() interfaces.EngineConfig {
 	e := c.Engine
 	e.WALSyncDisabled = !c.FsyncEnabled()
 	e.WALCRCDisabled = !c.CRCEnabled()
+	e.UnsafeRecovery = c.Storage.UnsafeRecovery
 	return e
 }
 
@@ -290,13 +293,26 @@ func (c *AMQPConfig) Validate() error {
 	return nil
 }
 
-// Load loads configuration from a JSON file
-// Load loads configuration from file (YAML/JSON/TOML) with environment variable overrides
-// Environment variables use AMQP_ prefix and underscore separators (e.g., AMQP_NETWORK_PORT=5673)
+// Load reads configuration from a file, then applies AMQP_-prefixed environment
+// variable overrides (e.g. AMQP_NETWORK_PORT=5673).
+//
+// It ALWAYS parses with the YAML parser, whatever the file is named. YAML is a
+// superset of JSON, so a .json file happens to work; TOML does not parse at all.
+// The two lines this replaced advertised "YAML/JSON/TOML based on extension" —
+// three claims, one of them silently false, and neither line matched the code.
+//
+// Keys bind by CASE-INSENSITIVE FIELD NAME, not by the `json:` tags on these
+// structs. koanf's Unmarshal defaults its tag name to "koanf", no field here
+// carries one, so mapstructure falls back to matching field names. That is why
+// the shipped samples spell keys "retentionms" rather than "retention_ms": a
+// snake_case key matching a `json:` tag would NOT bind, and would fail silently.
+// Unknown keys are ignored — koanf leaves ErrorUnused false — so a stale key in
+// an operator's file produces no diagnostic either.
 func (c *AMQPConfig) Load(source string) error {
 	k := koanf.New(".")
 
-	// Load from file (supports YAML, JSON, TOML based on extension)
+	// Always the YAML parser, regardless of the file's extension. See the
+	// function comment: JSON survives because YAML is a superset of it.
 	if err := k.Load(file.Provider(source), yaml.Parser()); err != nil {
 		return fmt.Errorf("failed to load config file: %w", err)
 	}

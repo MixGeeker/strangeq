@@ -27,12 +27,13 @@ type spyMetricsCollector struct {
 	consumersTotal atomic.Int64
 }
 
-func (s *spyMetricsCollector) RecordConnectionCreated() {}
-func (s *spyMetricsCollector) RecordConnectionClosed()  {}
-func (s *spyMetricsCollector) RecordChannelCreated()    {}
-func (s *spyMetricsCollector) RecordChannelClosed()     {}
-func (s *spyMetricsCollector) RecordQueueDeclared()     {}
-func (s *spyMetricsCollector) RecordQueueDeleted()      {}
+func (s *spyMetricsCollector) RecordConnectionCreated()             {}
+func (s *spyMetricsCollector) RecordConnectionClosed()              {}
+func (s *spyMetricsCollector) RecordChannelCreated()                {}
+func (s *spyMetricsCollector) RecordChannelClosed()                 {}
+func (s *spyMetricsCollector) RecordQueueDeclared()                 {}
+func (s *spyMetricsCollector) SetUnsafeRecoveryArtifacts(count int) {}
+func (s *spyMetricsCollector) RecordQueueDeleted()                  {}
 func (s *spyMetricsCollector) UpdateQueueMetrics(queueName, vhost string, ready, unacked, consumers int) {
 }
 func (s *spyMetricsCollector) DeleteQueueMetrics(queueName, vhost string) {}
@@ -63,6 +64,7 @@ func (s *spyMetricsCollector) UpdateSegmentMetrics(queueName string, count, size
 }
 func (s *spyMetricsCollector) DeleteSegmentMetrics(queueName string) {}
 func (s *spyMetricsCollector) RecordSegmentCompaction()              {}
+func (s *spyMetricsCollector) RecordSegmentCompactionFailure()       {}
 func (s *spyMetricsCollector) RecordSegmentReadError()               {}
 func (s *spyMetricsCollector) UpdateRingBufferUtilization(queueName string, utilization float64) {
 }
@@ -257,7 +259,7 @@ func TestMetricsRejectedAndRedeliveredThroughRealPath(t *testing.T) {
 		// real delivery path that assigns and tracks the per-channel wire tag.
 		// Register that mapping so handleBasicReject can translate the tag back
 		// to the broker msgID.
-		channel.TrackDelivery(delivery.DeliveryTag, delivery.DeliveryTag, delivery.ConsumerTag, false)
+		channel.TrackDelivery(delivery.DeliveryTag, delivery.DeliveryTag, delivery.ConsumerID, false)
 		err := srv.handleBasicReject(conn, 1, makeRejectPayload(delivery.DeliveryTag, true))
 		require.NoError(t, err)
 		assert.Equal(t, int64(1), spy.rejects.Load(), "RecordMessageRejected must fire through handleBasicReject")

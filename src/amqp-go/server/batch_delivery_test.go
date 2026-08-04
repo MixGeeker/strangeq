@@ -72,7 +72,7 @@ func makeDelivery(tag uint64, body []byte) *protocol.Delivery {
 		DeliveryTag: tag,
 		Exchange:    "test-exchange",
 		RoutingKey:  "test.key",
-		ConsumerTag: "test-consumer",
+		ConsumerID:  "test-consumer",
 	}
 }
 

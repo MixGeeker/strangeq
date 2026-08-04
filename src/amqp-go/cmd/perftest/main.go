@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -15,6 +17,37 @@ import (
 	hdrhistogram "github.com/HdrHistogram/hdrhistogram-go"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
+
+// Consumer tags for this perftest process (Loop-2 backlog item 11).
+//
+// amqp091-go derives its DEFAULT consumer tag from os.Args[0] plus a
+// package-local counter, so two instances of the same binary mint identical
+// tags. Benchmarks that leave the tag empty therefore depend on the binary's
+// path — the ambient property that produced a whole class of phantom results.
+//
+// perftestRunID is drawn once from crypto/rand rather than from the pid: pids
+// are reused, are not unique across containers or hosts, and are exactly the
+// kind of ambient process identity this item exists to stop depending on. A
+// 64-bit random run ID plus a per-process counter makes each tag unique with
+// no reference to anything outside this process.
+var (
+	perftestRunID     = newPerftestRunID()
+	perftestConsumers atomic.Uint64
+)
+
+func newPerftestRunID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand failing is not a reason to fall back to a colliding tag;
+		// the wall clock is still independent of the binary path.
+		return fmt.Sprintf("t%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+func nextConsumerTag() string {
+	return fmt.Sprintf("perftest-%s-%d", perftestRunID, perftestConsumers.Add(1))
+}
 
 // latencyHistogram wraps HDR histogram with a mutex for concurrent access.
 type latencyHistogram struct {
@@ -580,7 +613,7 @@ func runConsumer(ctx context.Context, url, queueName string, prefetch int, durab
 		return
 	}
 
-	msgs, err := ch.Consume(queueName, "", false, false, false, false, nil)
+	msgs, err := ch.Consume(queueName, nextConsumerTag(), false, false, false, false, nil)
 	if err != nil {
 		log.Printf("consumer: consume failed: %v", err)
 		return

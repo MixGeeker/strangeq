@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,7 +36,6 @@ type DisruptorStorage struct {
 	spillThreshold uint64
 
 	metadataStore *PersistentMetadataStore
-	offsetStore   *OffsetCheckpointStore
 	wal           *WALManager
 	segments      *SegmentManager
 
@@ -44,8 +44,12 @@ type DisruptorStorage struct {
 
 	pendingAcks sync.Map
 
-	// consumerPendingAcks is a secondary index over pendingAcks keyed by
-	// consumerTag -> *sync.Map{ deliveryTag -> *PendingAck }.
+	// consumerPendingAcks is a secondary index over pendingAcks keyed by the
+	// broker-internal consumer identity (protocol.Consumer.ID, carried in the
+	// PendingAck.ConsumerTag field, which keeps its name for on-disk
+	// compatibility) -> *sync.Map{ deliveryTag -> *PendingAck }. It is NOT
+	// keyed by the client-visible wire tag: AMQP 0-9-1 scopes that tag per
+	// channel, so two consumers may legitimately share one.
 	//
 	// Safety invariant: at all times the index is a SUPERSET of pendingAcks for
 	// every consumer, so GetConsumerPendingAcks can transiently observe an
@@ -100,11 +104,7 @@ func NewDisruptorStorage() (*DisruptorStorage, error) {
 }
 
 func NewDisruptorStorageWithDataDir(dataDir string) (*DisruptorStorage, error) {
-	return NewDisruptorStorageWithCheckpointInterval(dataDir, DefaultCheckpointInterval)
-}
-
-func NewDisruptorStorageWithCheckpointInterval(dataDir string, checkpointInterval time.Duration) (*DisruptorStorage, error) {
-	return NewDisruptorStorageWithEngineConfig(dataDir, checkpointInterval, interfaces.EngineConfig{})
+	return NewDisruptorStorageWithEngineConfig(dataDir, interfaces.EngineConfig{})
 }
 
 func WALConfigFromEngine(ec interfaces.EngineConfig) WALConfig {
@@ -113,6 +113,7 @@ func WALConfigFromEngine(ec interfaces.EngineConfig) WALConfig {
 	// CRC ON (safe).
 	cfg.SyncDisabled = ec.WALSyncDisabled
 	cfg.CRCDisabled = ec.WALCRCDisabled
+	cfg.UnsafeRecovery = ec.UnsafeRecovery
 	if ec.WALBatchSize > 0 {
 		cfg.BatchSize = ec.WALBatchSize
 	}
@@ -152,7 +153,29 @@ func SegmentConfigFromEngine(ec interfaces.EngineConfig) SegmentConfig {
 	return cfg
 }
 
-func NewDisruptorStorageWithEngineConfig(dataDir string, checkpointInterval time.Duration, engineCfg interfaces.EngineConfig) (*DisruptorStorage, error) {
+func NewDisruptorStorageWithEngineConfig(dataDir string, engineCfg interfaces.EngineConfig) (*DisruptorStorage, error) {
+	// review-4 N-4. Every recovery fault names its artifact by path, and the
+	// refusal message instructs the operator to "move the listed files OUT OF
+	// THE DIRECTORY" — advice that is only actionable if the path is absolute.
+	// The tests asserted filepath.IsAbs and passed because t.TempDir() is
+	// absolute; there was no filepath.Abs anywhere in production code, and
+	// config.DefaultConfig() ships Storage.Path: "./data". So at SHIPPED
+	// DEFAULTS every artifact in a refusal message was relative to whatever
+	// directory the process happened to start in. Absolutised ONCE, here, at the
+	// single point every tier's dataDir flows from (canon rule 12).
+	//
+	// A failure here is REPORTED, not swallowed. filepath.Abs fails only when
+	// the process has no working directory (its cwd was removed), and the old
+	// no-else form fell back silently to the relative path — reinstating, in
+	// the one place that fixes it, exactly the condition the paragraph above
+	// says makes every refusal message unactionable (review-5 MINOR-10).
+	abs, aerr := filepath.Abs(dataDir)
+	if aerr != nil {
+		return nil, fmt.Errorf("the storage data directory %q could not be resolved to an absolute path, "+
+			"so no recovery fault could name its artifacts actionably: %w", dataDir, aerr)
+	}
+	dataDir = abs
+
 	ringBufferSize := engineCfg.RingBufferSize
 	if ringBufferSize <= 0 {
 		ringBufferSize = DefaultRingBufferSize
@@ -169,11 +192,6 @@ func NewDisruptorStorageWithEngineConfig(dataDir string, checkpointInterval time
 	metadataStore, err := NewPersistentMetadataStore(dataDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create metadata store: %w", err)
-	}
-
-	offsetStore, err := NewOffsetCheckpointStoreWithInterval(dataDir, checkpointInterval)
-	if err != nil {
-		offsetStore = nil
 	}
 
 	walCfg := WALConfigFromEngine(engineCfg)
@@ -197,7 +215,6 @@ func NewDisruptorStorageWithEngineConfig(dataDir string, checkpointInterval time
 		ringBufferSize: ringBufferSize,
 		spillThreshold: uint64(ringBufferSize) * uint64(spillPercent) / 100,
 		metadataStore:  metadataStore,
-		offsetStore:    offsetStore,
 		wal:            walManager,
 		segments:       segmentManager,
 		transactions:   make(map[string]*interfaces.Transaction),
@@ -559,12 +576,12 @@ func (ds *DisruptorStorage) GetQueueMessageCount(queueName string) (int, error) 
 	return int(ring.ring.Count()), nil
 }
 
-func (ds *DisruptorStorage) PurgeQueue(queueName string) (int, error) {
+func (ds *DisruptorStorage) PurgeQueue(queueName string, minTag, maxTag uint64) (int, error) {
 	ring := ds.getQueueRing(queueName)
 	if ring == nil {
 		return 0, interfaces.ErrQueueNotFound
 	}
-	return ring.ring.Purge(), nil
+	return ring.ring.DeleteRange(minTag, maxTag), nil
 }
 
 func (ds *DisruptorStorage) GetMessageRange(queueName string, startTag, endTag uint64) ([]*protocol.Message, error) {
@@ -584,28 +601,6 @@ func (ds *DisruptorStorage) DeleteMessageRange(queueName string, startTag, endTa
 	return nil
 }
 
-func (ds *DisruptorStorage) AddUnacked(queueName, consumerTag string, deliveryTag uint64) error {
-	ring := ds.getQueueRing(queueName)
-	if ring == nil {
-		return interfaces.ErrQueueNotFound
-	}
-	ring.ack.OnDeliver(deliveryTag, consumerTag)
-	return nil
-}
-
-func (ds *DisruptorStorage) RemoveUnacked(queueName, consumerTag string, deliveryTag uint64) error {
-	ring := ds.getQueueRing(queueName)
-	if ring == nil {
-		return interfaces.ErrQueueNotFound
-	}
-	ring.ack.OnAck(deliveryTag, consumerTag)
-
-	if ds.offsetStore != nil {
-		ds.offsetStore.UpdateOffset(queueName, consumerTag, deliveryTag)
-	}
-	return nil
-}
-
 func (ds *DisruptorStorage) GetUnackedCount(queueName, consumerTag string) (int, error) {
 	ring := ds.getQueueRing(queueName)
 	if ring == nil {
@@ -621,14 +616,6 @@ func (ds *DisruptorStorage) GetUnackedTags(queueName, consumerTag string) ([]uin
 	}
 
 	return ring.ack.GetUnackedTags(consumerTag), nil
-}
-
-func (ds *DisruptorStorage) GetLowestUnackedAcrossConsumers(queueName string) (uint64, error) {
-	ring := ds.getQueueRing(queueName)
-	if ring == nil {
-		return 0, interfaces.ErrQueueNotFound
-	}
-	return ring.ack.MinAckCursor(), nil
 }
 
 func (ds *DisruptorStorage) StoreExchange(exchange *protocol.Exchange) error {
@@ -690,11 +677,30 @@ func (ds *DisruptorStorage) DeleteQueue(name string) error {
 	return nil
 }
 
+// ListQueues enumerates persisted queue metadata records.
+//
+// Its errors are CLASSIFIED HERE, at the site that knows both the semantics and
+// the absolute path (review-3 H-3). broker.initOrdinalAllocator used to build
+// the fault itself and could only name the artifact `metadata/queues` — a
+// RELATIVE path, in a refusal message an operator with several brokers has to
+// act on. RecoveryFault.Artifact's own doc requires an absolute path when a
+// file is involved.
 func (ds *DisruptorStorage) ListQueues() ([]*protocol.Queue, error) {
+	queuesDir := filepath.Join(ds.dataDir, MetadataDir, QueuesDir)
 	if ds.metadataStore == nil {
-		return nil, fmt.Errorf("metadata store not initialized")
+		return nil, interfaces.FatalFault("metadata", queuesDir,
+			"the metadata store was never initialized, so no queue record can be read",
+			"the delivery-tag ordinal high-water mark cannot be established; a newly declared queue may be handed an ordinal whose records are still on disk, colliding with them in a WAL keyed by a bare delivery tag",
+			nil)
 	}
-	return ds.metadataStore.ListQueues()
+	queues, err := ds.metadataStore.ListQueues()
+	if err != nil {
+		return queues, interfaces.FatalFault("metadata", queuesDir,
+			"the queue metadata directory could not be enumerated, so recovery cannot know which queues exist or what delivery-tag ordinal each owns",
+			"the delivery-tag ordinal high-water mark cannot be established; a newly declared queue may be handed an ordinal whose records are still on disk, colliding with them in a WAL keyed by a bare delivery tag",
+			err)
+	}
+	return queues, nil
 }
 
 func (ds *DisruptorStorage) StoreBinding(queueName, exchangeName, routingKey string, arguments map[string]interface{}) error {
@@ -753,6 +759,19 @@ func (ds *DisruptorStorage) GetExchangeBindingsFrom(source string) ([]*interface
 	return ds.metadataStore.GetExchangeBindingsFrom(source)
 }
 
+// SetLogger wires a structured logger into the storage tiers' cold paths.
+//
+// Before this existed the storage package had NO logger, so three durability
+// conditions were completely invisible: a checkpoint that could not run (the
+// queue's WAL then grows every 5 minutes forever — review-4 B-2), a segment
+// withdrawn from compaction (review-4 B-4), and a segment fault discovered on
+// the write path rather than at boot (review-4 N-7). nil disables logging.
+func (ds *DisruptorStorage) SetLogger(l interfaces.Logger) {
+	if ds.segments != nil {
+		ds.segments.SetLogger(l)
+	}
+}
+
 func (ds *DisruptorStorage) StoreConsumer(queueName, consumerTag string, consumer *protocol.Consumer) error {
 	if ds.metadataStore == nil {
 		return fmt.Errorf("metadata store not initialized")
@@ -770,9 +789,6 @@ func (ds *DisruptorStorage) GetConsumer(queueName, consumerTag string) (*protoco
 func (ds *DisruptorStorage) DeleteConsumer(queueName, consumerTag string) error {
 	if ds.metadataStore == nil {
 		return fmt.Errorf("metadata store not initialized")
-	}
-	if ds.offsetStore != nil {
-		_ = ds.offsetStore.RemoveConsumer(queueName, consumerTag)
 	}
 	return ds.metadataStore.DeleteConsumer(queueName, consumerTag)
 }
@@ -980,19 +996,24 @@ func (ds *DisruptorStorage) StoreDurableEntityMetadata(metadata *protocol.Durabl
 
 func (ds *DisruptorStorage) GetDurableEntityMetadata() (*protocol.DurableEntityMetadata, error) {
 	if ds.metadataStore == nil {
-		return nil, fmt.Errorf("metadata store not initialized")
+		return nil, interfaces.FatalFault("metadata", filepath.Join(ds.dataDir, MetadataDir),
+			"the metadata store was never initialized, so no exchange, queue or ordinal can be read",
+			"every durable entity in this data directory is abandoned and every recovered record becomes an orphan",
+			nil)
 	}
 
 	metadata := &protocol.DurableEntityMetadata{
 		Exchanges:   []*protocol.Exchange{},
 		Queues:      []*protocol.Queue{},
-		Bindings:    []protocol.Binding{},
 		LastUpdated: time.Now(),
 	}
 
 	exchanges, err := ds.metadataStore.ListExchanges()
 	if err != nil {
-		return nil, fmt.Errorf("failed to list exchanges: %w", err)
+		return nil, interfaces.FatalFault("metadata", filepath.Join(ds.dataDir, MetadataDir, ExchangesDir),
+			"the exchange metadata directory could not be enumerated, so recovery cannot know which durable exchanges exist",
+			"every durable exchange and every binding through it is abandoned; messages published to them would be silently unroutable",
+			err)
 	}
 	for _, exchange := range exchanges {
 		if exchange.Durable {
@@ -1002,7 +1023,10 @@ func (ds *DisruptorStorage) GetDurableEntityMetadata() (*protocol.DurableEntityM
 
 	queues, err := ds.metadataStore.ListQueues()
 	if err != nil {
-		return nil, fmt.Errorf("failed to list queues: %w", err)
+		return nil, interfaces.FatalFault("metadata", filepath.Join(ds.dataDir, MetadataDir, QueuesDir),
+			"the queue metadata directory could not be enumerated, so recovery cannot know which durable queues exist or what delivery-tag ordinal each owns",
+			"every durable queue is abandoned and its confirmed durable records become unattributable",
+			err)
 	}
 	for _, queue := range queues {
 		if queue.Durable {
@@ -1021,13 +1045,29 @@ func (ds *DisruptorStorage) RepairCorruption(autoRepair bool) (*protocol.Recover
 	return &protocol.RecoveryStats{}, nil
 }
 
+// GetRecoverableMessages returns everything recovery should consider, together
+// with a CLASSIFIED fault (interfaces.RecoveryOutcome) describing anything that
+// went wrong reading it.
+//
+// It returns partial data alongside a non-fatal fault deliberately: a torn tail
+// or one quarantined file must not cost the caller the records it DID read, and
+// the boot decision belongs to the caller, not here. A fatal fault means the
+// map cannot be trusted as an inventory of the directory.
 func (ds *DisruptorStorage) GetRecoverableMessages() (map[string][]*protocol.Message, error) {
 	messagesByQueue := make(map[string][]*protocol.Message)
+	var faults []error
 
 	if ds.wal != nil {
+		// PARTIAL DATA IS KEPT EVEN WHEN THE FAULT IS FATAL. RecoverFromWAL
+		// confines a fatal fault to the file that produced it and scans the
+		// rest of the directory anyway, so what comes back is the complete
+		// inventory of everything that COULD be read. Discarding it here — the
+		// previous behaviour — is half of review-3's B-1: five healthy 59 MB
+		// files' worth of confirmed durable messages were thrown away because
+		// a sixth file had one flipped bit.
 		recoveredMessages, err := ds.wal.RecoverFromWAL()
 		if err != nil {
-			return nil, fmt.Errorf("WAL recovery failed: %w", err)
+			faults = append(faults, err)
 		}
 
 		for _, recoveryMsg := range recoveredMessages {
@@ -1039,9 +1079,25 @@ func (ds *DisruptorStorage) GetRecoverableMessages() (map[string][]*protocol.Mes
 	}
 
 	if ds.segments != nil {
+		// STEP 4 SLOT. RecoverFromSegments cannot currently return a non-nil
+		// error (it swallows its own ReadDir failure and every per-segment
+		// read error), so this branch is unreachable today. Step 4 makes the
+		// segment tier authoritative — performCheckpoint unlinks the source WAL
+		// file, so the segment becomes the only copy — and its error
+		// classification lands HERE, in exactly this shape: a segment fault is
+		// constructed with interfaces.FatalFault/DegradedFault at the site that
+		// knows the semantics and appended to `faults`. Nothing above or below
+		// needs restructuring; the outcome type, the join, the refusal message
+		// and the --unsafe-recovery gate are all tier-agnostic.
+		//
+		// STEP 3-FIX CHANGED THIS SLOT'S CONTRACT, and Step 4 must honour it:
+		// a fatal fault no longer returns early and no longer discards the map.
+		// RecoverFromSegments must therefore confine a fatal segment fault to
+		// the segment file that produced it — quarantine it, keep scanning, and
+		// return everything else — exactly as RecoverFromWAL now does.
 		segmentMessages, err := ds.segments.RecoverFromSegments()
 		if err != nil {
-			return nil, fmt.Errorf("segment recovery failed: %w", err)
+			faults = append(faults, err)
 		}
 
 		walKeys := make(map[string]map[uint64]bool)
@@ -1067,7 +1123,7 @@ func (ds *DisruptorStorage) GetRecoverableMessages() (map[string][]*protocol.Mes
 		}
 	}
 
-	return messagesByQueue, nil
+	return messagesByQueue, joinFaults(faults)
 }
 
 func (ds *DisruptorStorage) MarkRecoveryComplete(stats *protocol.RecoveryStats) error {
@@ -1111,10 +1167,6 @@ func (ds *DisruptorStorage) Close() error {
 
 	if ds.metadataStore != nil {
 		_ = ds.metadataStore.Close()
-	}
-
-	if ds.offsetStore != nil {
-		_ = ds.offsetStore.Close()
 	}
 
 	if ds.wal != nil {

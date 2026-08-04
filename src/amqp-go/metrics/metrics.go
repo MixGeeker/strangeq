@@ -52,6 +52,11 @@ type Collector struct {
 	// Server metrics
 	ServerUptime prometheus.Gauge
 
+	// UnsafeRecoveryArtifacts is pinned for the lifetime of the process to the
+	// number of artifacts recovery DISCARDED because --unsafe-recovery was
+	// set. 0 on a clean boot. Alert on > 0.
+	UnsafeRecoveryArtifacts prometheus.Gauge
+
 	// Latency metrics
 	MessagePublishDuration  prometheus.Histogram
 	MessageDeliveryDuration prometheus.Histogram
@@ -72,7 +77,11 @@ type Collector struct {
 	SegmentCount           *prometheus.GaugeVec
 	SegmentSizeBytes       *prometheus.GaugeVec
 	SegmentCompactionTotal prometheus.Counter
-	SegmentReadErrorsTotal prometheus.Counter
+	// SegmentCompactionFailuresTotal counts segments WITHDRAWN from compaction
+	// because their bytes cannot be rewritten. It is monotonic and bounded by
+	// the number of damaged segments, not by the number of ticks.
+	SegmentCompactionFailuresTotal prometheus.Counter
+	SegmentReadErrorsTotal         prometheus.Counter
 
 	// Ring buffer metrics
 	RingBufferUtilization *prometheus.GaugeVec
@@ -260,6 +269,12 @@ func NewCollector(namespace string) *Collector {
 			Help:      "Server uptime in seconds",
 		}),
 
+		UnsafeRecoveryArtifacts: promauto.NewGauge(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "unsafe_recovery_discarded_artifacts",
+			Help:      "Number of data artifacts discarded at boot because --unsafe-recovery was set; 0 on a clean boot. Non-zero means this broker is serving from data it could not fully recover.",
+		}),
+
 		// Latency metrics
 		MessagePublishDuration: promauto.NewHistogram(prometheus.HistogramOpts{
 			Namespace: namespace,
@@ -334,6 +349,11 @@ func NewCollector(namespace string) *Collector {
 			Namespace: namespace,
 			Name:      "segment_compaction_total",
 			Help:      "Total number of segment compactions performed",
+		}),
+		SegmentCompactionFailuresTotal: promauto.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "segment_compaction_failures_total",
+			Help:      "Segments withdrawn from compaction because they cannot be rewritten (no data is lost; acked records are not reclaimed)",
 		}),
 		SegmentReadErrorsTotal: promauto.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
@@ -524,6 +544,12 @@ func (c *Collector) UpdateServerUptime(seconds float64) {
 	c.ServerUptime.Set(seconds)
 }
 
+// SetUnsafeRecoveryArtifacts pins the degraded-boot gauge for the lifetime of
+// the process. See MetricsCollector.SetUnsafeRecoveryArtifacts.
+func (c *Collector) SetUnsafeRecoveryArtifacts(count int) {
+	c.UnsafeRecoveryArtifacts.Set(float64(count))
+}
+
 // RecordPublishLatency records the time taken to publish a message
 func (c *Collector) RecordPublishLatency(duration float64) {
 	c.MessagePublishDuration.Observe(duration)
@@ -588,6 +614,11 @@ func (c *Collector) DeleteSegmentMetrics(queueName string) {
 // RecordSegmentCompaction records a segment compaction
 func (c *Collector) RecordSegmentCompaction() {
 	c.SegmentCompactionTotal.Inc()
+}
+
+// RecordSegmentCompactionFailure records a segment withdrawn from compaction
+func (c *Collector) RecordSegmentCompactionFailure() {
+	c.SegmentCompactionFailuresTotal.Inc()
 }
 
 // RecordSegmentReadError records a segment read error

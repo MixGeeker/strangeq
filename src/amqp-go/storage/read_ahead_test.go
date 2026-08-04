@@ -21,7 +21,7 @@ func newReadAheadTestStorage(t *testing.T, tmpDir string, ringSize int) *Disrupt
 		SpillThresholdPercent: 80,
 		WALSyncDisabled:       true,
 	}
-	storage, err := NewDisruptorStorageWithEngineConfig(tmpDir, DefaultCheckpointInterval, ec)
+	storage, err := NewDisruptorStorageWithEngineConfig(tmpDir, ec)
 	require.NoError(t, err)
 	return storage
 }

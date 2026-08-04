@@ -106,12 +106,6 @@ func (b *ConfigBuilder) WithRetention(retention time.Duration) *ConfigBuilder {
 	return b
 }
 
-// WithCheckpointInterval sets the consumer offset checkpoint interval
-func (b *ConfigBuilder) WithCheckpointInterval(interval time.Duration) *ConfigBuilder {
-	b.config.Storage.CheckpointIntervalMS = interval.Milliseconds()
-	return b
-}
-
 // Security Configuration
 
 // WithTLS enables TLS with the specified certificate and key files

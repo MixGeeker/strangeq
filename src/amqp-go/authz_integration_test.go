@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"testing"
@@ -111,6 +110,14 @@ func startAuthzTestServer(t *testing.T, port string) *server.Server {
 	cfg.Storage.Path = t.TempDir()
 	cfg.Security.AuthenticationEnabled = true
 	cfg.Security.AuthorizationEnabled = true
+	// Name the auth file the test actually wrote. This used to be omitted and
+	// the omission was invisible: the config was handed to server.NewServer,
+	// which discarded it, so Security.AuthenticationFilePath kept its default
+	// of "./auth.json" and nothing ever read it. Every security field here was
+	// applied only by patching the built server afterwards, so the builder's
+	// own authenticator path — the one production takes — was never exercised
+	// by any authz test.
+	cfg.Security.AuthenticationFilePath = authFile
 	cfg.Security.AuthMechanisms = []string{"PLAIN"}
 
 	authenticator, err := auth.NewFileAuthenticator(authFile)
@@ -119,19 +126,11 @@ func startAuthzTestServer(t *testing.T, port string) *server.Server {
 	}
 	registry := auth.DefaultRegistry()
 
-	srv := server.NewServer(cfg.Network.Address)
-	srv.Config = cfg
+	srv := newIsolatedTestServer(t, cfg)
 	srv.Authenticator = authenticator
 	srv.MechanismRegistry = server.NewMechanismRegistryAdapter(registry)
 
-	go func() {
-		if err := srv.Start(); err != nil {
-			log.Printf("test server stopped: %v", err)
-		}
-	}()
-
-	// Wait for server to start
-	time.Sleep(500 * time.Millisecond)
+	waitForListening(t, srv)
 	t.Cleanup(func() {
 		srv.Mutex.Lock()
 		srv.Shutdown = true

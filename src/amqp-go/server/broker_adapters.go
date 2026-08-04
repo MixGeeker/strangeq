@@ -65,28 +65,30 @@ func (a *StorageBrokerAdapter) PublishMessageTx(txnStore interfaces.Storage, exc
 	return a.broker.PublishMessageTx(txnStore, exchangeName, routingKey, message)
 }
 
-func (a *StorageBrokerAdapter) RegisterConsumer(queueName, consumerTag string, consumer *protocol.Consumer) error {
-	return a.broker.RegisterConsumer(queueName, consumerTag, consumer)
+// Consumer operations: consumerID is the broker-internal consumer identity
+// (protocol.Consumer.ID), not the client-visible tag. See UnifiedBroker.
+func (a *StorageBrokerAdapter) RegisterConsumer(queueName, consumerID string, consumer *protocol.Consumer) error {
+	return a.broker.RegisterConsumer(queueName, consumerID, consumer)
 }
 
-func (a *StorageBrokerAdapter) UnregisterConsumer(consumerTag string) error {
-	return a.broker.UnregisterConsumer(consumerTag)
+func (a *StorageBrokerAdapter) UnregisterConsumer(consumerID string) error {
+	return a.broker.UnregisterConsumer(consumerID)
 }
 
-func (a *StorageBrokerAdapter) AcknowledgeMessage(consumerTag string, deliveryTag uint64, multiple bool) error {
-	return a.broker.AcknowledgeMessage(consumerTag, deliveryTag, multiple)
+func (a *StorageBrokerAdapter) AcknowledgeMessage(consumerID string, deliveryTag uint64, multiple bool) error {
+	return a.broker.AcknowledgeMessage(consumerID, deliveryTag, multiple)
 }
 
-func (a *StorageBrokerAdapter) RejectMessage(consumerTag string, deliveryTag uint64, requeue bool) error {
-	return a.broker.RejectMessage(consumerTag, deliveryTag, requeue)
+func (a *StorageBrokerAdapter) RejectMessage(consumerID string, deliveryTag uint64, requeue bool) error {
+	return a.broker.RejectMessage(consumerID, deliveryTag, requeue)
 }
 
-func (a *StorageBrokerAdapter) NacknowledgeMessage(consumerTag string, deliveryTag uint64, multiple, requeue bool) error {
-	return a.broker.NacknowledgeMessage(consumerTag, deliveryTag, multiple, requeue)
+func (a *StorageBrokerAdapter) NacknowledgeMessage(consumerID string, deliveryTag uint64, multiple, requeue bool) error {
+	return a.broker.NacknowledgeMessage(consumerID, deliveryTag, multiple, requeue)
 }
 
-func (a *StorageBrokerAdapter) RequeueAllForConsumer(consumerTag string) error {
-	return a.broker.RequeueAllForConsumer(consumerTag)
+func (a *StorageBrokerAdapter) RequeueAllForConsumer(consumerID string) error {
+	return a.broker.RequeueAllForConsumer(consumerID)
 }
 
 func (a *StorageBrokerAdapter) GetConsumerForDelivery(deliveryTag uint64) (string, bool) {
@@ -121,8 +123,8 @@ func (a *StorageBrokerAdapter) RecoverQueue(queueName string, minTag, maxTag, co
 	a.broker.RecoverQueue(queueName, minTag, maxTag, count)
 }
 
-func (a *StorageBrokerAdapter) RebuildDeliveryIndex(deliveryTag uint64, consumerTag string) {
-	a.broker.RebuildDeliveryIndex(deliveryTag, consumerTag)
+func (a *StorageBrokerAdapter) RebuildDeliveryIndex(deliveryTag uint64, consumerID string) {
+	a.broker.RebuildDeliveryIndex(deliveryTag, consumerID)
 }
 
 func (a *StorageBrokerAdapter) GetQueues() map[string]*protocol.Queue {
@@ -137,6 +139,6 @@ func (a *StorageBrokerAdapter) GetConsumers() map[string]*protocol.Consumer {
 	return a.broker.GetConsumers()
 }
 
-func (a *StorageBrokerAdapter) UpdateConsumerPrefetch(consumerTag string, prefetchCount uint16) {
-	a.broker.UpdateConsumerPrefetch(consumerTag, prefetchCount)
+func (a *StorageBrokerAdapter) UpdateConsumerPrefetch(consumerID string, prefetchCount uint16) {
+	a.broker.UpdateConsumerPrefetch(consumerID, prefetchCount)
 }

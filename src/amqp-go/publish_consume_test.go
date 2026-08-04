@@ -20,13 +20,8 @@ import (
 // TestBasicPublishConsume tests basic message publishing and consumption
 func TestBasicPublishConsume(t *testing.T) {
 	// Start a server in a goroutine
-	srv := server.NewServer(":5690") // Use a different port to avoid conflicts
-	go func() {
-		_ = srv.Start()
-	}()
-
-	// Give the server a moment to start
-	time.Sleep(200 * time.Millisecond)
+	srv := newIsolatedTestServer(t, isolatedTestConfig(t, ":5690")) // Use a different port to avoid conflicts
+	waitForListening(t, srv)
 
 	// Connect using the standard AMQP client
 	conn, err := amqp.Dial("amqp://guest:guest@localhost:5690//")
@@ -88,13 +83,8 @@ func TestBasicPublishConsume(t *testing.T) {
 // TestManualAcknowledgment tests manual message acknowledgment
 func TestManualAcknowledgment(t *testing.T) {
 	// Start a server in a goroutine
-	srv := server.NewServer(":5691") // Use a different port to avoid conflicts
-	go func() {
-		_ = srv.Start()
-	}()
-
-	// Give the server a moment to start
-	time.Sleep(200 * time.Millisecond)
+	srv := newIsolatedTestServer(t, isolatedTestConfig(t, ":5691")) // Use a different port to avoid conflicts
+	waitForListening(t, srv)
 
 	// Connect using the standard AMQP client
 	conn, err := amqp.Dial("amqp://guest:guest@localhost:5691//")
@@ -160,13 +150,8 @@ func TestManualAcknowledgment(t *testing.T) {
 // TestMessageRejection tests message rejection with requeuing
 func TestMessageRejection(t *testing.T) {
 	// Start a server in a goroutine
-	srv := server.NewServer(":5692") // Use a different port to avoid conflicts
-	go func() {
-		_ = srv.Start()
-	}()
-
-	// Give the server a moment to start
-	time.Sleep(200 * time.Millisecond)
+	srv := newIsolatedTestServer(t, isolatedTestConfig(t, ":5692")) // Use a different port to avoid conflicts
+	waitForListening(t, srv)
 
 	// Connect using the standard AMQP client
 	conn, err := amqp.Dial("amqp://guest:guest@localhost:5692//")
@@ -232,13 +217,8 @@ func TestMessageRejection(t *testing.T) {
 // TestMultipleConsumers tests multiple consumers on the same queue
 func TestMultipleConsumers(t *testing.T) {
 	// Start a server in a goroutine
-	srv := server.NewServer(":5694") // Use a different port to avoid conflicts
-	go func() {
-		_ = srv.Start()
-	}()
-
-	// Give the server a moment to start
-	time.Sleep(200 * time.Millisecond)
+	srv := newIsolatedTestServer(t, isolatedTestConfig(t, ":5694")) // Use a different port to avoid conflicts
+	waitForListening(t, srv)
 
 	// Connect using the standard AMQP client
 	conn, err := amqp.Dial("amqp://guest:guest@localhost:5694//")
@@ -346,13 +326,8 @@ func TestMultipleConsumers(t *testing.T) {
 // TestNegativeAcknowledgment tests message negative acknowledgment (nack)
 func TestNegativeAcknowledgment(t *testing.T) {
 	// Start a server in a goroutine
-	srv := server.NewServer(":5695") // Use a different port to avoid conflicts
-	go func() {
-		_ = srv.Start()
-	}()
-
-	// Give the server a moment to start
-	time.Sleep(200 * time.Millisecond)
+	srv := newIsolatedTestServer(t, isolatedTestConfig(t, ":5695")) // Use a different port to avoid conflicts
+	waitForListening(t, srv)
 
 	// Connect using the standard AMQP client
 	conn, err := amqp.Dial("amqp://guest:guest@localhost:5695//")
@@ -453,14 +428,7 @@ func stageBServer(t *testing.T, dir string) (*server.Server, string) {
 
 	srv, err := server.NewServerBuilder().WithConfig(cfg).Build()
 	require.NoError(t, err, "server build")
-	go func() { _ = srv.Start() }()
-	for i := 0; i < brokerStartupPolls; i++ {
-		if srv.IsListening() {
-			break
-		}
-		time.Sleep(brokerStartupPollInterval)
-	}
-	require.True(t, srv.IsListening(), "server listener not ready")
+	waitForListening(t, srv)
 	return srv, fmt.Sprintf("amqp://guest:guest@%s/", addr)
 }
 

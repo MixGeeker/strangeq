@@ -180,7 +180,7 @@ func TestStoreMessageAsync_NotRetrievableBeforeFsync(t *testing.T) {
 	defer restore()
 	defer once.Do(func() { close(release) })
 
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), DefaultCheckpointInterval, interfaces.EngineConfig{})
+	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), interfaces.EngineConfig{})
 	require.NoError(t, err)
 	defer ds.Close()
 
@@ -409,7 +409,7 @@ func TestStoreMessageAsync_FsyncErrorNoRingStore(t *testing.T) {
 	})
 	defer restore()
 
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), DefaultCheckpointInterval, interfaces.EngineConfig{})
+	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), interfaces.EngineConfig{})
 	require.NoError(t, err)
 	defer ds.Close()
 

@@ -63,20 +63,7 @@ func versusURI(b *testing.B) (string, func()) {
 	if err != nil {
 		b.Fatalf("Build failed: %v", err)
 	}
-	go func() {
-		if err := srv.Start(); err != nil {
-			b.Logf("Server stopped: %v", err)
-		}
-	}()
-	for i := 0; i < brokerStartupPolls; i++ {
-		if srv.IsListening() {
-			break
-		}
-		time.Sleep(brokerStartupPollInterval)
-	}
-	if !srv.IsListening() {
-		b.Fatal("server listener not ready")
-	}
+	waitForListening(b, srv)
 	return fmt.Sprintf("amqp://guest:guest@%s/", addr), func() { srv.Stop() }
 }
 

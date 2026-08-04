@@ -67,7 +67,7 @@ func TestExclusiveQueueRegisterConsumer_RejectsOtherConnection(t *testing.T) {
 		Cancel:        make(chan struct{}, 1),
 		Channel:       chB,
 	}
-	err := broker.RegisterConsumer("excl-consume-q", "c-b", consumer)
+	err := registerConsumer(broker, "excl-consume-q", "c-b", consumer)
 	assert.Error(t, err, "consumer from another connection should be rejected on exclusive queue")
 }
 
@@ -90,7 +90,7 @@ func TestExclusiveQueueRegisterConsumer_AllowsOwningConnection(t *testing.T) {
 		Cancel:        make(chan struct{}, 1),
 		Channel:       chA,
 	}
-	err := broker.RegisterConsumer("excl-consume-ok-q", "c-a", consumer)
+	err := registerConsumer(broker, "excl-consume-ok-q", "c-a", consumer)
 	assert.NoError(t, err, "owning connection should be able to consume from its exclusive queue")
 
 	broker.UnregisterConsumer("c-a")
@@ -202,7 +202,7 @@ func TestAutoDeleteQueueDeletedWhenLastConsumerLeaves(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 10),
 		Cancel:        make(chan struct{}, 1),
 	}
-	err := broker.RegisterConsumer("auto-del-q", "c1", consumer1)
+	err := registerConsumer(broker, "auto-del-q", "c1", consumer1)
 	require.NoError(t, err)
 
 	_, err = broker.storage.GetQueue("auto-del-q")
@@ -247,7 +247,7 @@ func TestExclusiveConsumerRejectsSecondConsumer(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 10),
 		Cancel:        make(chan struct{}, 1),
 	}
-	err := broker.RegisterConsumer("excl-q", "excl-c1", consumer1)
+	err := registerConsumer(broker, "excl-q", "excl-c1", consumer1)
 	require.NoError(t, err)
 
 	consumer2 := &protocol.Consumer{
@@ -257,7 +257,7 @@ func TestExclusiveConsumerRejectsSecondConsumer(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 10),
 		Cancel:        make(chan struct{}, 1),
 	}
-	err = broker.RegisterConsumer("excl-q", "excl-c2", consumer2)
+	err = registerConsumer(broker, "excl-q", "excl-c2", consumer2)
 	assert.Error(t, err, "second consumer should be rejected on exclusive queue")
 
 	broker.UnregisterConsumer("excl-c1")
@@ -277,7 +277,7 @@ func TestExclusiveConsumerRejectsNonExclusiveSecond(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 10),
 		Cancel:        make(chan struct{}, 1),
 	}
-	err := broker.RegisterConsumer("excl-q2", "excl-c1", consumer1)
+	err := registerConsumer(broker, "excl-q2", "excl-c1", consumer1)
 	require.NoError(t, err)
 
 	consumer2 := &protocol.Consumer{
@@ -287,7 +287,7 @@ func TestExclusiveConsumerRejectsNonExclusiveSecond(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 10),
 		Cancel:        make(chan struct{}, 1),
 	}
-	err = broker.RegisterConsumer("excl-q2", "non-excl-c2", consumer2)
+	err = registerConsumer(broker, "excl-q2", "non-excl-c2", consumer2)
 	assert.Error(t, err)
 
 	broker.UnregisterConsumer("excl-c1")
@@ -357,7 +357,7 @@ func TestQueueDeclareOK_RealConsumerCount(t *testing.T) {
 			Messages:      make(chan *protocol.Delivery, 10),
 			Cancel:        make(chan struct{}, 1),
 		}
-		err := broker.RegisterConsumer("cc-q", c.Tag, c)
+		err := registerConsumer(broker, "cc-q", c.Tag, c)
 		require.NoError(t, err)
 	}
 
@@ -540,7 +540,7 @@ func TestConcurrentAutoDeleteNoDeadlock(t *testing.T) {
 				Messages:      make(chan *protocol.Delivery, 10),
 				Cancel:        make(chan struct{}, 1),
 			}
-			if err := broker.RegisterConsumer("deadlock-q", tag, c); err != nil {
+			if err := registerConsumer(broker, "deadlock-q", tag, c); err != nil {
 				return
 			}
 			broker.UnregisterConsumer(tag)
@@ -580,13 +580,13 @@ func TestDeclareExchangeTypeMismatchReturnsSentinelError(t *testing.T) {
 	assert.ErrorIs(t, err, ErrExchangeTypeMismatch)
 }
 
-func TestGetQueueConsumerTags(t *testing.T) {
+func TestGetQueueConsumerIDs(t *testing.T) {
 	broker, cleanup := createTestBroker(t)
 	defer cleanup()
 
 	broker.DeclareQueue("tags-q", false, false, false, nil)
 
-	tags := broker.GetQueueConsumerTags("tags-q")
+	tags := broker.GetQueueConsumerIDs("tags-q")
 	assert.Empty(t, tags)
 
 	c1 := &protocol.Consumer{
@@ -596,7 +596,7 @@ func TestGetQueueConsumerTags(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 10),
 		Cancel:        make(chan struct{}, 1),
 	}
-	err := broker.RegisterConsumer("tags-q", "tag1", c1)
+	err := registerConsumer(broker, "tags-q", "tag1", c1)
 	require.NoError(t, err)
 
 	c2 := &protocol.Consumer{
@@ -606,10 +606,10 @@ func TestGetQueueConsumerTags(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 10),
 		Cancel:        make(chan struct{}, 1),
 	}
-	err = broker.RegisterConsumer("tags-q", "tag2", c2)
+	err = registerConsumer(broker, "tags-q", "tag2", c2)
 	require.NoError(t, err)
 
-	tags = broker.GetQueueConsumerTags("tags-q")
+	tags = broker.GetQueueConsumerIDs("tags-q")
 	assert.ElementsMatch(t, []string{"tag1", "tag2"}, tags)
 
 	broker.UnregisterConsumer("tag1")

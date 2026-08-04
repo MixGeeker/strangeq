@@ -49,16 +49,7 @@ func f1Server(t *testing.T, fsync bool) (string, func()) {
 	if err != nil {
 		t.Fatalf("Build failed: %v", err)
 	}
-	go func() { _ = srv.Start() }()
-	for i := 0; i < brokerStartupPolls; i++ {
-		if srv.IsListening() {
-			break
-		}
-		time.Sleep(brokerStartupPollInterval)
-	}
-	if !srv.IsListening() {
-		t.Fatal("server listener not ready")
-	}
+	waitForListening(t, srv)
 	cleanup := func() { _ = srv.Stop() }
 	return fmt.Sprintf("amqp://guest:guest@%s/", addr), cleanup
 }

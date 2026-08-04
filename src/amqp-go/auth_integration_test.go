@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"log"
 	"os"
 	"testing"
 	"time"
@@ -59,6 +58,7 @@ func TestAuthenticationPLAIN(t *testing.T) {
 
 	cfg := config.DefaultConfig()
 	cfg.Network.Address = ":15672"
+	cfg.Storage.Path = t.TempDir()
 	cfg.Security.AuthenticationEnabled = true
 	cfg.Security.AuthenticationFilePath = authFile
 	cfg.Security.AuthMechanisms = []string{"PLAIN"}
@@ -71,20 +71,12 @@ func TestAuthenticationPLAIN(t *testing.T) {
 	registry := auth.DefaultRegistry()
 
 	// Create server
-	srv := server.NewServer(cfg.Network.Address)
-	srv.Config = cfg
+	srv := newIsolatedTestServer(t, cfg)
 	srv.Authenticator = authenticator
 	srv.MechanismRegistry = server.NewMechanismRegistryAdapter(registry)
 
-	// Start server in background
-	go func() {
-		if err := srv.Start(); err != nil {
-			log.Printf("test server stopped: %v", err)
-		}
-	}()
-
-	// Wait for server to start
-	time.Sleep(500 * time.Millisecond)
+	// Start server in background and wait for its listener to bind.
+	waitForListening(t, srv)
 
 	// Test successful authentication with guest/guest
 	t.Run("SuccessfulAuthentication", func(t *testing.T) {
@@ -141,7 +133,16 @@ func TestAuthenticationANONYMOUS(t *testing.T) {
 
 	cfg := config.DefaultConfig()
 	cfg.Network.Address = ":15673"
+	cfg.Storage.Path = t.TempDir()
 	cfg.Security.AuthenticationEnabled = true
+	// Name the auth file the test actually wrote. This used to be omitted and
+	// the omission was invisible: the config was handed to server.NewServer,
+	// which discarded it, so Security.AuthenticationFilePath kept its default
+	// of "./auth.json" and nothing ever read it. Building from this config for
+	// real makes the builder construct the authenticator itself, exactly as
+	// production does, and it refuses to bring up an auth-enabled server whose
+	// auth file does not exist.
+	cfg.Security.AuthenticationFilePath = authFile
 	cfg.Security.AuthMechanisms = []string{"PLAIN", "ANONYMOUS"}
 
 	authenticator, err := auth.NewFileAuthenticator(authFile)
@@ -151,20 +152,12 @@ func TestAuthenticationANONYMOUS(t *testing.T) {
 
 	registry := auth.RegistryForMechanisms([]string{"PLAIN", "ANONYMOUS"})
 
-	srv := server.NewServer(cfg.Network.Address)
-	srv.Config = cfg
+	srv := newIsolatedTestServer(t, cfg)
 	srv.Authenticator = authenticator
 	srv.MechanismRegistry = server.NewMechanismRegistryAdapter(registry)
 
-	// Start server in background
-	go func() {
-		if err := srv.Start(); err != nil {
-			log.Printf("test server stopped: %v", err)
-		}
-	}()
-
-	// Wait for server to start
-	time.Sleep(500 * time.Millisecond)
+	// Start server in background and wait for its listener to bind.
+	waitForListening(t, srv)
 
 	// Test anonymous authentication (any credentials should work)
 	t.Run("AnonymousAccess", func(t *testing.T) {
@@ -201,21 +194,14 @@ func TestAuthenticationDisabled(t *testing.T) {
 	// Start server with authentication disabled
 	cfg := config.DefaultConfig()
 	cfg.Network.Address = ":15674"
+	cfg.Storage.Path = t.TempDir()
 	cfg.Security.AuthenticationEnabled = false
 
 	// Create server
-	srv := server.NewServer(cfg.Network.Address)
-	srv.Config = cfg
+	srv := newIsolatedTestServer(t, cfg)
 
-	// Start server in background
-	go func() {
-		if err := srv.Start(); err != nil {
-			log.Printf("test server stopped: %v", err)
-		}
-	}()
-
-	// Wait for server to start
-	time.Sleep(500 * time.Millisecond)
+	// Start server in background and wait for its listener to bind.
+	waitForListening(t, srv)
 
 	// Test connection without authentication
 	t.Run("NoAuthentication", func(t *testing.T) {
@@ -252,6 +238,7 @@ func TestAuthenticationWithMessaging(t *testing.T) {
 
 	cfg := config.DefaultConfig()
 	cfg.Network.Address = ":15675"
+	cfg.Storage.Path = t.TempDir()
 	cfg.Security.AuthenticationEnabled = true
 	cfg.Security.AuthenticationFilePath = authFile
 	cfg.Security.AuthMechanisms = []string{"PLAIN"}
@@ -264,20 +251,12 @@ func TestAuthenticationWithMessaging(t *testing.T) {
 	registry := auth.DefaultRegistry()
 
 	// Create server
-	srv := server.NewServer(cfg.Network.Address)
-	srv.Config = cfg
+	srv := newIsolatedTestServer(t, cfg)
 	srv.Authenticator = authenticator
 	srv.MechanismRegistry = server.NewMechanismRegistryAdapter(registry)
 
-	// Start server in background
-	go func() {
-		if err := srv.Start(); err != nil {
-			log.Printf("test server stopped: %v", err)
-		}
-	}()
-
-	// Wait for server to start
-	time.Sleep(500 * time.Millisecond)
+	// Start server in background and wait for its listener to bind.
+	waitForListening(t, srv)
 
 	// Connect with valid credentials
 	conn, err := amqp.Dial("amqp://guest:guest@localhost:15675/")

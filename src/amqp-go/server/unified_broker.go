@@ -40,19 +40,24 @@ type UnifiedBroker interface {
 	// parked, so the confirm tag is never stranded. nil means capacity headroom.
 	PublishMessageAsyncConfirm(exchangeName, routingKey string, message *protocol.Message, onDurable func(error)) (durableInflight bool, backpressure protocol.DepthGate, err error)
 
-	// Consumer operations
-	RegisterConsumer(queueName, consumerTag string, consumer *protocol.Consumer) error
-	UnregisterConsumer(consumerTag string) error
+	// Consumer operations. Every consumerID below is the BROKER-INTERNAL
+	// consumer identity (protocol.Consumer.ID), never the client-visible
+	// consumer tag: AMQP 0-9-1 scopes the tag per channel, so it cannot key a
+	// broker-wide map without letting one client's registration overwrite
+	// another's.
+	RegisterConsumer(queueName, consumerID string, consumer *protocol.Consumer) error
+	UnregisterConsumer(consumerID string) error
 
 	// Acknowledgment operations
-	AcknowledgeMessage(consumerTag string, deliveryTag uint64, multiple bool) error
-	RejectMessage(consumerTag string, deliveryTag uint64, requeue bool) error
-	NacknowledgeMessage(consumerTag string, deliveryTag uint64, multiple, requeue bool) error
+	AcknowledgeMessage(consumerID string, deliveryTag uint64, multiple bool) error
+	RejectMessage(consumerID string, deliveryTag uint64, requeue bool) error
+	NacknowledgeMessage(consumerID string, deliveryTag uint64, multiple, requeue bool) error
 
 	// Recovery — requeue all unacked messages for a consumer (basic.recover)
-	RequeueAllForConsumer(consumerTag string) error
+	RequeueAllForConsumer(consumerID string) error
 
-	// Delivery lookup (NEW - for O(1) ACK routing)
+	// Delivery lookup (NEW - for O(1) ACK routing). Returns the owning
+	// consumer's internal identity, or "" for a basic.get delivery.
 	GetConsumerForDelivery(deliveryTag uint64) (string, bool)
 
 	// Synchronous message retrieval (basic.get)
@@ -76,12 +81,14 @@ type UnifiedBroker interface {
 	RecoverQueue(queueName string, minTag, maxTag, count uint64)
 
 	// Recovery support — rebuilds delivery index entry for a recovered pending ack
-	RebuildDeliveryIndex(deliveryTag uint64, consumerTag string)
+	RebuildDeliveryIndex(deliveryTag uint64, consumerID string)
 
-	// Management operations (optional for some implementations)
+	// Management operations (optional for some implementations).
+	// GetConsumers is keyed by internal consumer identity; each value's Tag
+	// field carries the client-visible tag.
 	GetQueues() map[string]*protocol.Queue
 	GetExchanges() map[string]*protocol.Exchange
 	GetConsumers() map[string]*protocol.Consumer
 
-	UpdateConsumerPrefetch(consumerTag string, prefetchCount uint16)
+	UpdateConsumerPrefetch(consumerID string, prefetchCount uint16)
 }

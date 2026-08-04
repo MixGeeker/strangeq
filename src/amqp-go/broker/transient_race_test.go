@@ -42,7 +42,7 @@ func TestTransientRace_NoStrandUnderConcurrentPublishers(t *testing.T) {
 			}
 		}()
 		cons := &protocol.Consumer{Tag: "c", Queue: qname, NoAck: true, Messages: msgs}
-		require.NoError(t, b.RegisterConsumer(qname, "c", cons))
+		require.NoError(t, registerConsumer(b, qname, "c", cons))
 
 		var wg sync.WaitGroup
 		start := make(chan struct{})

@@ -77,7 +77,7 @@ func TestFrontierFlip_DeadLetterSibling_NoStrand(t *testing.T) {
 		}
 	}()
 	cons := &protocol.Consumer{Tag: "c", Queue: target, NoAck: true, Messages: msgs}
-	require.NoError(t, b.RegisterConsumer(target, "c", cons))
+	require.NoError(t, registerConsumer(b, target, "c", cons))
 
 	// Close the barrier: a durable tag that is prematurely exposed (the bug) is
 	// now not ring-resident and GetMessage-misses -> gap-skip.

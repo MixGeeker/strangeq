@@ -261,6 +261,7 @@ func TestRequeueAllForConsumer(t *testing.T) {
 
 	consumer := &protocol.Consumer{
 		Tag:           "test-requeue-tag",
+		ID:            "test-requeue-tag",
 		Queue:         "test-requeue-q",
 		NoAck:         false,
 		PrefetchCount: 10,
@@ -315,6 +316,7 @@ func TestRequeueAllForConsumerMultipleMessages(t *testing.T) {
 
 	consumer := &protocol.Consumer{
 		Tag:           "test-multi-requeue-tag",
+		ID:            "test-multi-requeue-tag",
 		Queue:         "test-multi-requeue-q",
 		NoAck:         false,
 		PrefetchCount: 10,
@@ -644,6 +646,7 @@ func TestHandleBasicRecoverRequeuesMessages(t *testing.T) {
 
 	consumer := &protocol.Consumer{
 		Tag:           "recover-test-tag",
+		ID:            "recover-test-tag",
 		Queue:         "recover-test-q",
 		NoAck:         false,
 		PrefetchCount: 10,

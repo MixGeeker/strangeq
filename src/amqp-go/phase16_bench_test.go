@@ -39,22 +39,7 @@ func startBenchServer(b *testing.B) (string, func()) {
 		b.Fatalf("Build failed: %v", err)
 	}
 
-	go func() {
-		if err := srv.Start(); err != nil {
-			b.Logf("Server stopped: %v", err)
-		}
-	}()
-
-	// Poll until listener is ready
-	for i := 0; i < brokerStartupPolls; i++ {
-		if srv.IsListening() {
-			break
-		}
-		time.Sleep(brokerStartupPollInterval)
-	}
-	if !srv.IsListening() {
-		b.Fatal("server listener not ready")
-	}
+	waitForListening(b, srv)
 
 	uri := fmt.Sprintf("amqp://guest:guest@%s/", addr)
 	cleanup := func() {

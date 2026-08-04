@@ -34,12 +34,14 @@ func TestM1_FanInMultipleConsumers(t *testing.T) {
 	ch.Mutex.Lock()
 	ch.Consumers = make(map[string]*protocol.Consumer)
 	ch.Consumers["consumer-a"] = &protocol.Consumer{
+		ID:       "consumer-a",
 		Tag:      "consumer-a",
 		Queue:    "queue-a",
 		Messages: make(chan *protocol.Delivery, 10),
 		Cancel:   make(chan struct{}),
 	}
 	ch.Consumers["consumer-b"] = &protocol.Consumer{
+		ID:       "consumer-b",
 		Tag:      "consumer-b",
 		Queue:    "queue-b",
 		Messages: make(chan *protocol.Delivery, 10),
@@ -79,7 +81,7 @@ func TestM1_FanInMultipleConsumers(t *testing.T) {
 			RoutingKey:  "queue-a",
 		},
 		DeliveryTag: 1,
-		ConsumerTag: "consumer-a",
+		ConsumerID:  "consumer-a",
 		Exchange:    "",
 		RoutingKey:  "queue-a",
 	}
@@ -92,7 +94,7 @@ func TestM1_FanInMultipleConsumers(t *testing.T) {
 			RoutingKey:  "queue-b",
 		},
 		DeliveryTag: 2,
-		ConsumerTag: "consumer-b",
+		ConsumerID:  "consumer-b",
 		Exchange:    "",
 		RoutingKey:  "queue-b",
 	}
@@ -142,6 +144,7 @@ func TestM1_FanInNoGoroutineLeak(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		tag := string(rune('a' + i))
 		ch.Consumers[tag] = &protocol.Consumer{
+			ID:       tag,
 			Tag:      tag,
 			Queue:    "queue-" + tag,
 			Messages: make(chan *protocol.Delivery, 10),
@@ -219,6 +222,7 @@ func TestM1_FanInConsumerRemoval(t *testing.T) {
 	ch.Mutex.Lock()
 	ch.Consumers = make(map[string]*protocol.Consumer)
 	ch.Consumers["consumer-x"] = &protocol.Consumer{
+		ID:       "consumer-x",
 		Tag:      "consumer-x",
 		Queue:    "queue-x",
 		Messages: make(chan *protocol.Delivery, 10),
@@ -248,6 +252,7 @@ func TestM1_FanInConsumerRemoval(t *testing.T) {
 	// Re-add a consumer with the same tag (simulates new basic.consume)
 	ch.Mutex.Lock()
 	ch.Consumers["consumer-x"] = &protocol.Consumer{
+		ID:       "consumer-x",
 		Tag:      "consumer-x",
 		Queue:    "queue-x",
 		Messages: make(chan *protocol.Delivery, 10),
@@ -268,7 +273,7 @@ func TestM1_FanInConsumerRemoval(t *testing.T) {
 			RoutingKey:  "queue-x",
 		},
 		DeliveryTag: 1,
-		ConsumerTag: "consumer-x",
+		ConsumerID:  "consumer-x",
 		Exchange:    "",
 		RoutingKey:  "queue-x",
 	}

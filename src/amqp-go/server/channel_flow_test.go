@@ -246,7 +246,7 @@ func TestForwardConsumerMessages_BlocksWhenFlowInactive(t *testing.T) {
 	fanIn := make(chan *protocol.Delivery, 1)
 	stop := make(chan struct{})
 
-	msgChan <- &protocol.Delivery{DeliveryTag: 1, ConsumerTag: "c1"}
+	msgChan <- &protocol.Delivery{DeliveryTag: 1, ConsumerID: "c1"}
 	go forwardConsumerMessages(ch, msgChan, fanIn, stop)
 
 	select {
@@ -266,7 +266,7 @@ func TestForwardConsumerMessages_ResumesOnFlowWake(t *testing.T) {
 	fanIn := make(chan *protocol.Delivery, 1)
 	stop := make(chan struct{})
 
-	msgChan <- &protocol.Delivery{DeliveryTag: 1, ConsumerTag: "c1"}
+	msgChan <- &protocol.Delivery{DeliveryTag: 1, ConsumerID: "c1"}
 	go forwardConsumerMessages(ch, msgChan, fanIn, stop)
 
 	select {
@@ -299,7 +299,7 @@ func TestForwardConsumerMessages_UnblocksOnStop(t *testing.T) {
 	fanIn := make(chan *protocol.Delivery, 1)
 	stop := make(chan struct{})
 
-	msgChan <- &protocol.Delivery{DeliveryTag: 1, ConsumerTag: "c1"}
+	msgChan <- &protocol.Delivery{DeliveryTag: 1, ConsumerID: "c1"}
 
 	done := make(chan struct{})
 	go func() {

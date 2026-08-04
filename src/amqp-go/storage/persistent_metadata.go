@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -22,7 +23,33 @@ const (
 	ConsumersDir        = "consumers"
 	FileExtension       = ".cbor"
 	TempFileExtension   = ".tmp"
+
+	// bindingComponentMaxLen is the per-component budget for the three-part
+	// binding filenames. A binding name is "<A>_<B>_<C>" + FileExtension, and
+	// atomicWriteFile writes through a sibling carrying TempFileExtension too,
+	// so the longest path component this can produce must fit NAME_MAX (255)
+	// WITH the temp suffix on it: 255 - len(".cbor") - len(".tmp") - 2
+	// separators = 244, split three ways.
+	//
+	// The old join had no bound at all, so three legal 255-byte AMQP shortstrs
+	// produced a ~772-byte name and failed ENAMETOOLONG on APFS and ext4 for
+	// entirely non-adversarial input.
+	bindingComponentMaxLen = (255 - len(FileExtension) - len(TempFileExtension) - 2) / 3
 )
+
+// ErrQueueRecordUnreadable is returned by StoreQueue when a metadata record
+// for the queue name is PRESENT ON DISK but cannot be read or decoded.
+//
+// It exists because "absent" and "present but unreadable" demanded opposite
+// answers and were indistinguishable: existingOrdinalLocked returned 0 for
+// both, so StoreQueue treated an unreadable record as "no record" and wrote a
+// FRESH composite-tag ordinal over it. Every confirmed durable record already
+// on disk under the old ordinal then took recovery's Case B "dead incarnation"
+// branch and was discarded with a Warn while the boot reported success. The
+// write-once-ordinal invariant now fails closed instead: a declare against an
+// unreadable record errors loudly rather than silently retiring the queue's
+// entire tag band.
+var ErrQueueRecordUnreadable = errors.New("queue metadata record exists but cannot be read; refusing to overwrite its delivery-tag ordinal")
 
 // PersistentMetadataStore implements persistent metadata storage using CBOR binary format
 // Phase 3: Simple, debuggable file-based metadata
@@ -38,12 +65,13 @@ type PersistentMetadataStore struct {
 	queueCache    sync.Map // name -> *protocol.Queue
 
 	// Binding cache (Phase 6H) - critical for routing performance
-	bindingCache          sync.Map // "queue:exchange:key" -> *interfaces.QueueBinding
+	bindingCache          sync.Map // makeBindingCacheKey(triple) -> *interfaces.QueueBinding
 	queueBindingsCache    sync.Map // queueName -> []*interfaces.QueueBinding
 	exchangeBindingsCache sync.Map // exchangeName -> []*interfaces.QueueBinding
 
-	// Exchange-to-exchange binding cache
-	exchBindingCache      sync.Map // "source:dest:key" -> *interfaces.ExchangeBinding
+	// Exchange-to-exchange binding cache. Keyed by source only: the per-triple
+	// map that used to sit beside this one was written and deleted but never
+	// read once, so it cost a key-collision bug and bought nothing.
 	exchBindingsFromCache sync.Map // source -> []*interfaces.ExchangeBinding
 
 	cacheEnabled bool
@@ -84,29 +112,26 @@ func NewPersistentMetadataStore(dataDir string) (*PersistentMetadataStore, error
 // loadCacheFromDisk pre-populates the cache on startup
 func (pm *PersistentMetadataStore) loadCacheFromDisk() {
 	// Load all exchanges into cache
-	exchangesDir := filepath.Join(pm.baseDir, ExchangesDir)
-	if entries, err := os.ReadDir(exchangesDir); err == nil {
-		for _, entry := range entries {
-			if !entry.IsDir() && strings.HasSuffix(entry.Name(), FileExtension) {
-				name := strings.TrimSuffix(entry.Name(), FileExtension)
-				if exchange, err := pm.loadExchangeFromDisk(name); err == nil {
-					pm.exchangeCache.Store(name, exchange)
-				}
-			}
+	// The RECORD names its owner, not the filename: a slot whose name is a
+	// generated one cannot be turned back into a queue name by inspection, and
+	// trying would attribute it to the wrong entity (review-4 N-1 / B-1).
+	exchangePaths, _ := metadataSlotPaths(filepath.Join(pm.baseDir, ExchangesDir))
+	for _, path := range exchangePaths {
+		exchange, err := pm.decodeExchangeFile(path)
+		if err != nil {
+			continue
 		}
+		pm.exchangeCache.Store(exchange.Name, exchange)
 	}
 
 	// Load all queues into cache
-	queuesDir := filepath.Join(pm.baseDir, QueuesDir)
-	if entries, err := os.ReadDir(queuesDir); err == nil {
-		for _, entry := range entries {
-			if !entry.IsDir() && strings.HasSuffix(entry.Name(), FileExtension) {
-				name := strings.TrimSuffix(entry.Name(), FileExtension)
-				if queue, err := pm.loadQueueFromDisk(name); err == nil {
-					pm.queueCache.Store(name, queue)
-				}
-			}
+	queuePaths, _ := metadataSlotPaths(filepath.Join(pm.baseDir, QueuesDir))
+	for _, path := range queuePaths {
+		queue, err := pm.decodeQueueFile(path)
+		if err != nil {
+			continue
 		}
+		pm.queueCache.Store(queue.Name, queue)
 	}
 
 	// Load all bindings into cache (Phase 6H)
@@ -139,8 +164,6 @@ func (pm *PersistentMetadataStore) loadCacheFromDisk() {
 		if exchBindings, err := pm.loadExchangeBindingsFromDisk(); err == nil {
 			fromIndex := make(map[string][]*interfaces.ExchangeBinding)
 			for _, eb := range exchBindings {
-				cacheKey := makeExchangeBindingCacheKey(eb.Source, eb.Destination, eb.RoutingKey)
-				pm.exchBindingCache.Store(cacheKey, eb)
 				fromIndex[eb.Source] = append(fromIndex[eb.Source], eb)
 			}
 			for source, bindings := range fromIndex {
@@ -150,9 +173,19 @@ func (pm *PersistentMetadataStore) loadCacheFromDisk() {
 	}
 }
 
-// makeBindingCacheKey creates a unique cache key for a binding
+// makeBindingCacheKey maps a binding's triple to its cache key.
+//
+// The bare "%s:%s:%s" join this replaced had makeBindingFilename's collision in
+// a second place: ("q", "a:b", "c") and ("q:a", "b", "c") both keyed "q:a:b:c",
+// so one binding's cache entry displaced another's and DeleteBinding could
+// evict an entry belonging to a different triple. Length-prefixing each
+// component makes the join injective without bounding or escaping anything —
+// a cache key has no NAME_MAX to respect, so it needs neither.
 func makeBindingCacheKey(queueName, exchangeName, routingKey string) string {
-	return fmt.Sprintf("%s:%s:%s", queueName, exchangeName, routingKey)
+	return fmt.Sprintf("%d:%s:%d:%s:%s",
+		len(queueName), queueName,
+		len(exchangeName), exchangeName,
+		routingKey)
 }
 
 // loadBindingsFromDisk loads all bindings from disk (helper for cache preload)
@@ -205,47 +238,7 @@ func (pm *PersistentMetadataStore) loadBindingsFromDisk() ([]*interfaces.QueueBi
 // favored over speed. There is exactly one file fsync and one directory fsync
 // per write — no more syncing than required.
 func (pm *PersistentMetadataStore) atomicWrite(path string, data []byte) error {
-	// Ensure parent directory exists
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("failed to create directory: %w", err)
-	}
-
-	// Write to temp file and fsync it before renaming so its contents are on
-	// stable storage. Any error cleans up the temp file so no .tmp is left
-	// behind and the failure is surfaced (never swallowed).
-	tempPath := path + TempFileExtension
-	f, err := os.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
-	}
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tempPath)
-		return fmt.Errorf("failed to write temp file: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tempPath)
-		return fmt.Errorf("failed to fsync temp file: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tempPath)
-		return fmt.Errorf("failed to close temp file: %w", err)
-	}
-
-	// Atomic rename
-	if err := os.Rename(tempPath, path); err != nil {
-		_ = os.Remove(tempPath) // Clean up on failure
-		return fmt.Errorf("failed to rename temp file: %w", err)
-	}
-
-	// fsync the parent directory so the rename survives a crash/power loss.
-	if err := syncDir(dir); err != nil {
-		return fmt.Errorf("failed to fsync directory: %w", err)
-	}
-
-	return nil
+	return atomicWriteFile(path, data, 0644)
 }
 
 // StoreExchange persists an exchange to disk and updates cache
@@ -258,7 +251,12 @@ func (pm *PersistentMetadataStore) StoreExchange(exchange *protocol.Exchange) er
 		return fmt.Errorf("failed to marshal exchange: %w", err)
 	}
 
-	path := filepath.Join(pm.baseDir, ExchangesDir, exchange.Name+FileExtension)
+	path := filepath.Join(pm.baseDir, ExchangesDir, metadataSlotName(exchange.Name))
+	if metadataSlotIsEscaped(exchange.Name) {
+		if cerr := pm.metadataSlotIsFree(path, exchange.Name, decodeExchangeName); cerr != nil {
+			return cerr
+		}
+	}
 	if err := pm.atomicWrite(path, data); err != nil {
 		return err
 	}
@@ -289,7 +287,7 @@ func (pm *PersistentMetadataStore) loadExchangeFromDisk(name string) (*protocol.
 	pm.mutex.RLock()
 	defer pm.mutex.RUnlock()
 
-	path := filepath.Join(pm.baseDir, ExchangesDir, name+FileExtension)
+	path := filepath.Join(pm.baseDir, ExchangesDir, metadataSlotName(name))
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -301,6 +299,11 @@ func (pm *PersistentMetadataStore) loadExchangeFromDisk(name string) (*protocol.
 	var exchange protocol.Exchange
 	if err := cbor.Unmarshal(data, &exchange); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal exchange: %w", err)
+	}
+
+	// IDENTITY CHECK — see loadQueueFromDisk.
+	if exchange.Name != name {
+		return nil, interfaces.ErrExchangeNotFound
 	}
 
 	// Update cache on load (Phase 6D)
@@ -316,7 +319,7 @@ func (pm *PersistentMetadataStore) DeleteExchange(name string) error {
 	pm.mutex.Lock()
 	defer pm.mutex.Unlock()
 
-	path := filepath.Join(pm.baseDir, ExchangesDir, name+FileExtension)
+	path := filepath.Join(pm.baseDir, ExchangesDir, metadataSlotName(name))
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to delete exchange file: %w", err)
 	}
@@ -329,13 +332,135 @@ func (pm *PersistentMetadataStore) DeleteExchange(name string) error {
 	return nil
 }
 
+// metadataSlotPaths lists every slot in a tier directory: the literal files
+// directly in it, then the generated ones inside metadataEscapeDir. ONE function,
+// so no scan site can forget the subdirectory (canon rule 12) — an enumeration
+// that missed it would leave a record invisible at boot, which is the ordinal
+// loss this whole change exists to prevent.
+// It RETURNS ITS ERROR. An earlier revision of this helper swallowed the ReadDir
+// failure and returned nil, which turned an unreadable queues directory into "no
+// queues exist" with err == nil — every queue's write-once Ordinal invisible at
+// boot, a fresh one minted over each, and recovery discarding the confirmed
+// durable records already on disk. That is the exact silent-loss shape this file
+// exists to close, reintroduced by the fix for it. It was caught by
+// TestListQueues_FaultNamesAnAbsolutePath, which reported a SKIP rather than a
+// failure; see that test for the guard added so a skip can no longer hide it.
+func metadataSlotPaths(dir string) ([]string, error) {
+	var out []string
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), FileExtension) {
+			continue
+		}
+		out = append(out, filepath.Join(dir, e.Name()))
+	}
+	escapedDir := filepath.Join(dir, metadataEscapeDir)
+	escaped, err := os.ReadDir(escapedDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// No generated slots have ever been written here. Not an error.
+			return out, nil
+		}
+		return out, err
+	}
+	for _, e := range escaped {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), FileExtension) {
+			continue
+		}
+		out = append(out, filepath.Join(escapedDir, e.Name()))
+	}
+	return out, nil
+}
+
+// decodeQueueFile reads ONE queue record from an explicit path and takes the
+// queue's name from the record. It is the enumeration counterpart of
+// loadQueueFromDisk's identity check: a directory scan must never invent a name
+// from a filename, because a generated slot name is not a queue name.
+func (pm *PersistentMetadataStore) decodeQueueFile(path string) (*protocol.Queue, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var queue protocol.Queue
+	if err := cbor.Unmarshal(data, &queue); err != nil {
+		return nil, err
+	}
+	return &queue, nil
+}
+
+// decodeExchangeFile is decodeQueueFile for exchanges.
+func (pm *PersistentMetadataStore) decodeExchangeFile(path string) (*protocol.Exchange, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var exchange protocol.Exchange
+	if err := cbor.Unmarshal(data, &exchange); err != nil {
+		return nil, err
+	}
+	return &exchange, nil
+}
+
+// ErrMetadataSlotConflict is returned when the file a record would occupy
+// already holds a DIFFERENT record's data.
+//
+// It is reachable only for a name that cannot be a path element (so it needs a
+// generated slot) whose generated slot happens to be the LITERAL slot of a name
+// that can: queue "/" generates "%2f.cbor", which is queue "%2f"'s own file.
+// Refusing is the conservative answer in both directions — the queue that owns
+// its literal file is never disturbed (no behaviour any deployment relies on
+// changes), and the queue asking for a generated slot is one that could not be
+// persisted AT ALL before this change, so it loses nothing it had. Silently
+// sharing the file would destroy one of the two records' write-once Ordinal.
+var ErrMetadataSlotConflict = errors.New("metadata slot is already occupied by a different record; refusing to overwrite it")
+
+// metadataSlotIsFree reports whether path is unoccupied or already holds a
+// record whose own name is `name`. `nameOf` extracts the name from the decoded
+// record. An unreadable occupant is treated as a conflict, never as free.
+func (pm *PersistentMetadataStore) metadataSlotIsFree(path, name string, nameOf func([]byte) (string, error)) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("%w: %s: %v", ErrMetadataSlotConflict, path, err)
+	}
+	got, derr := nameOf(data)
+	if derr != nil {
+		return fmt.Errorf("%w: %s: %v", ErrMetadataSlotConflict, path, derr)
+	}
+	if got != name {
+		return fmt.Errorf("%w: %s is owned by %q, not %q", ErrMetadataSlotConflict, path, got, name)
+	}
+	return nil
+}
+
+func decodeQueueName(data []byte) (string, error) {
+	var q protocol.Queue
+	if err := cbor.Unmarshal(data, &q); err != nil {
+		return "", err
+	}
+	return q.Name, nil
+}
+
+func decodeExchangeName(data []byte) (string, error) {
+	var e protocol.Exchange
+	if err := cbor.Unmarshal(data, &e); err != nil {
+		return "", err
+	}
+	return e.Name, nil
+}
+
 // ListExchanges returns all exchanges
 func (pm *PersistentMetadataStore) ListExchanges() ([]*protocol.Exchange, error) {
 	pm.mutex.RLock()
 	defer pm.mutex.RUnlock()
 
 	dir := filepath.Join(pm.baseDir, ExchangesDir)
-	files, err := os.ReadDir(dir)
+	paths, err := metadataSlotPaths(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return []*protocol.Exchange{}, nil
@@ -343,14 +468,10 @@ func (pm *PersistentMetadataStore) ListExchanges() ([]*protocol.Exchange, error)
 		return nil, fmt.Errorf("failed to read exchanges directory: %w", err)
 	}
 
-	exchanges := make([]*protocol.Exchange, 0, len(files))
-	for _, file := range files {
-		if file.IsDir() || !strings.HasSuffix(file.Name(), FileExtension) {
-			continue
-		}
-
-		name := strings.TrimSuffix(file.Name(), FileExtension)
-		exchange, err := pm.GetExchange(name)
+	// Content-authoritative, for the same reason as ListQueues.
+	exchanges := make([]*protocol.Exchange, 0, len(paths))
+	for _, path := range paths {
+		exchange, err := pm.decodeExchangeFile(path)
 		if err != nil {
 			continue // Skip corrupted files
 		}
@@ -384,7 +505,14 @@ func (pm *PersistentMetadataStore) StoreQueue(queue *protocol.Queue) error {
 	pm.mutex.Lock()
 	defer pm.mutex.Unlock()
 
-	if existingOrdinal := pm.existingOrdinalLocked(queue.Name); existingOrdinal != 0 {
+	existingOrdinal, oerr := pm.existingOrdinalLocked(queue.Name)
+	if oerr != nil {
+		// FAIL CLOSED. Treating an unreadable record as "no record" would write
+		// a fresh ordinal over it and retire the queue's entire delivery-tag
+		// band; see ErrQueueRecordUnreadable.
+		return oerr
+	}
+	if existingOrdinal != 0 {
 		queue.Ordinal = existingOrdinal
 	}
 
@@ -393,7 +521,12 @@ func (pm *PersistentMetadataStore) StoreQueue(queue *protocol.Queue) error {
 		return fmt.Errorf("failed to marshal queue: %w", err)
 	}
 
-	path := filepath.Join(pm.baseDir, QueuesDir, queue.Name+FileExtension)
+	path := filepath.Join(pm.baseDir, QueuesDir, metadataSlotName(queue.Name))
+	if metadataSlotIsEscaped(queue.Name) {
+		if cerr := pm.metadataSlotIsFree(path, queue.Name, decodeQueueName); cerr != nil {
+			return cerr
+		}
+	}
 	if err := pm.atomicWrite(path, data); err != nil {
 		return err
 	}
@@ -406,31 +539,52 @@ func (pm *PersistentMetadataStore) StoreQueue(queue *protocol.Queue) error {
 	return nil
 }
 
-// existingOrdinalLocked returns the Ordinal already persisted for name, or 0
-// if no record exists (or it has never had one assigned). Callers MUST
-// already hold pm.mutex (it reads the cache and, on a miss, the disk file
-// directly rather than through GetQueue/loadQueueFromDisk, which would
-// re-acquire pm.mutex and deadlock against StoreQueue's write lock — Go's
-// sync.RWMutex is not reentrant). Used solely to enforce StoreQueue's
+// existingOrdinalLocked returns the Ordinal already persisted for name, 0 if
+// no record exists (or it has never had one assigned), or
+// ErrQueueRecordUnreadable if a record IS present and cannot be read.
+//
+// The tri-state is the whole point. It used to return a bare uint64, and both
+// error paths returned 0 — indistinguishable from "no record". StoreQueue then
+// treated a present-but-unreadable record as absent and wrote a fresh ordinal
+// over it, after which every confirmed durable record already on disk under
+// the old ordinal took recovery's Case B "dead incarnation" branch and was
+// discarded with a Warn while the boot reported success. The durability
+// guarantee rode not on one flag but on (cacheEnabled) ∧ (the cache preload
+// succeeded for this name) ∧ (that name is still cached) — three conditions,
+// none of them written down. Only the third of those is still load-bearing and
+// it is now checked rather than assumed.
+//
+// Callers MUST already hold pm.mutex (it reads the cache and, on a miss, the
+// disk file directly rather than through GetQueue/loadQueueFromDisk, which
+// would re-acquire pm.mutex and deadlock against StoreQueue's write lock —
+// Go's sync.RWMutex is not reentrant). Used solely to enforce StoreQueue's
 // write-once-ordinal invariant.
-func (pm *PersistentMetadataStore) existingOrdinalLocked(name string) uint64 {
+//
+// COLD PATH. The sole caller is StoreQueue, which runs at declare, never per
+// publish. Deliberately NOT changed: the cacheEnabled fast path stays exactly
+// as it was. Decoupling the ordinal guard from the cache flag would mean a
+// disk read next to GetQueue, which is on the publish path.
+func (pm *PersistentMetadataStore) existingOrdinalLocked(name string) (uint64, error) {
 	if pm.cacheEnabled {
 		if cached, ok := pm.queueCache.Load(name); ok {
-			return cached.(*protocol.Queue).Ordinal
+			return cached.(*protocol.Queue).Ordinal, nil
 		}
 	}
 
-	path := filepath.Join(pm.baseDir, QueuesDir, name+FileExtension)
+	path := filepath.Join(pm.baseDir, QueuesDir, metadataSlotName(name))
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return 0
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("%w: %s: %v", ErrQueueRecordUnreadable, path, err)
 	}
 
 	var existing protocol.Queue
 	if err := cbor.Unmarshal(data, &existing); err != nil {
-		return 0
+		return 0, fmt.Errorf("%w: %s: %v", ErrQueueRecordUnreadable, path, err)
 	}
-	return existing.Ordinal
+	return existing.Ordinal, nil
 }
 
 // GetQueue loads a queue from cache or disk
@@ -451,7 +605,7 @@ func (pm *PersistentMetadataStore) loadQueueFromDisk(name string) (*protocol.Que
 	pm.mutex.RLock()
 	defer pm.mutex.RUnlock()
 
-	path := filepath.Join(pm.baseDir, QueuesDir, name+FileExtension)
+	path := filepath.Join(pm.baseDir, QueuesDir, metadataSlotName(name))
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -463,6 +617,15 @@ func (pm *PersistentMetadataStore) loadQueueFromDisk(name string) (*protocol.Que
 	var queue protocol.Queue
 	if err := cbor.Unmarshal(data, &queue); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal queue: %w", err)
+	}
+
+	// IDENTITY CHECK. A generated slot can, in principle, be the LITERAL slot of
+	// a different name (queue "/" generates "%2f.cbor", which is also queue
+	// "%2f"'s own file). The record says who it belongs to, so a mismatch is
+	// "not this queue" rather than "close enough" — the alternative is returning
+	// another queue's Ordinal, which is the silent-loss shape this closes.
+	if queue.Name != name {
+		return nil, interfaces.ErrQueueNotFound
 	}
 
 	// Update cache on load (Phase 6D)
@@ -478,7 +641,7 @@ func (pm *PersistentMetadataStore) DeleteQueue(name string) error {
 	pm.mutex.Lock()
 	defer pm.mutex.Unlock()
 
-	path := filepath.Join(pm.baseDir, QueuesDir, name+FileExtension)
+	path := filepath.Join(pm.baseDir, QueuesDir, metadataSlotName(name))
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to delete queue file: %w", err)
 	}
@@ -497,7 +660,7 @@ func (pm *PersistentMetadataStore) ListQueues() ([]*protocol.Queue, error) {
 	defer pm.mutex.RUnlock()
 
 	dir := filepath.Join(pm.baseDir, QueuesDir)
-	files, err := os.ReadDir(dir)
+	paths, err := metadataSlotPaths(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return []*protocol.Queue{}, nil
@@ -505,14 +668,14 @@ func (pm *PersistentMetadataStore) ListQueues() ([]*protocol.Queue, error) {
 		return nil, fmt.Errorf("failed to read queues directory: %w", err)
 	}
 
-	queues := make([]*protocol.Queue, 0, len(files))
-	for _, file := range files {
-		if file.IsDir() || !strings.HasSuffix(file.Name(), FileExtension) {
-			continue
-		}
-
-		name := strings.TrimSuffix(file.Name(), FileExtension)
-		queue, err := pm.GetQueue(name)
+	// The record names its own queue. Deriving the name from the filename would
+	// strand every record in a generated slot — and a stranded record means its
+	// write-once Ordinal is invisible at boot, after which a fresh one is minted
+	// and recovery discards the confirmed durable records already on disk under
+	// the old one (review-4 N-1).
+	queues := make([]*protocol.Queue, 0, len(paths))
+	for _, path := range paths {
+		queue, err := pm.decodeQueueFile(path)
 		if err != nil {
 			continue // Skip corrupted files
 		}
@@ -522,26 +685,168 @@ func (pm *PersistentMetadataStore) ListQueues() ([]*protocol.Queue, error) {
 	return queues, nil
 }
 
-// makeBindingFilename creates a unique filename for a binding
+// makeBindingFilename maps a binding's (queue, exchange, routing key) triple to
+// the file that holds it.
+//
+// The mapping this replaced was NOT INJECTIVE, and the collision needed no
+// adversarial input: it mapped each component's unsafe bytes onto "_" while
+// using a bare "_" as the JOIN separator, and never escaped a "_" already
+// inside a component. So ("orders_us", "east", "orders.created") and
+// ("orders", "us_east", "orders.created") both named
+// orders_us_east_orders.created.cbor. StoreBinding writes with no occupancy
+// check, so the second declare silently overwrote the first, and ListBindings —
+// which LoadAllMetadata calls at boot — then saw only the survivor. One binding
+// was lost permanently at the next restart, with no error anywhere.
+//
+// filenameComponent makes the join unambiguous (see its own comment for the
+// argument), and bounds each component so that three legal 255-byte AMQP
+// shortstrs cannot exceed NAME_MAX. Names the old build spelled literally keep
+// their file: a component that is literal and contains no "_" is returned
+// unchanged, and those are exactly the components the old join was already
+// unambiguous for.
 func makeBindingFilename(queueName, exchangeName, routingKey string) string {
-	// Replace special characters to make it filesystem-safe
-	safe := func(s string) string {
-		s = strings.ReplaceAll(s, "/", "_")
-		s = strings.ReplaceAll(s, "\\", "_")
-		s = strings.ReplaceAll(s, ":", "_")
-		s = strings.ReplaceAll(s, "*", "_")
-		s = strings.ReplaceAll(s, "?", "_")
-		s = strings.ReplaceAll(s, "<", "_")
-		s = strings.ReplaceAll(s, ">", "_")
-		s = strings.ReplaceAll(s, "|", "_")
-		return s
-	}
-
 	return fmt.Sprintf("%s_%s_%s%s",
-		safe(queueName),
-		safe(exchangeName),
-		safe(routingKey),
+		filenameComponent(queueName, bindingComponentMaxLen),
+		filenameComponent(exchangeName, bindingComponentMaxLen),
+		filenameComponent(routingKey, bindingComponentMaxLen),
 		FileExtension)
+}
+
+// legacyBindingComponents folds the bytes the pre-injective-join builds treated
+// as unsafe. It is the exact set that build replaced, kept as data rather than
+// prose because removeLegacySlot has to reproduce that spelling byte for byte
+// to find the file it wrote.
+var legacyBindingComponents = strings.NewReplacer(
+	"/", "_", "\\", "_", ":", "_", "*", "_", "?", "_", "<", "_", ">", "_", "|", "_")
+
+// legacyBindingFilename spells a binding triple the way every build before the
+// injective join did: unsafe bytes folded onto "_", no bound on the result, and
+// no escape for a "_" already inside a component.
+//
+// It serves BOTH tiers because the exchange-to-exchange encoder carried a
+// byte-for-byte copy of the queue-binding one, so there is one legacy spelling,
+// not two. Nothing writes this spelling; it exists only so a store can find and
+// remove what an older build left behind.
+func legacyBindingFilename(a, b, c string) string {
+	return fmt.Sprintf("%s_%s_%s%s",
+		legacyBindingComponents.Replace(a),
+		legacyBindingComponents.Replace(b),
+		legacyBindingComponents.Replace(c),
+		FileExtension)
+}
+
+// removeLegacySlot deletes the file an older build would have written for this
+// triple, once the record has been rewritten under the current spelling — but
+// ONLY after reading that file and confirming the record inside it names this
+// triple.
+//
+// Without any cleanup, a re-declare after upgrade leaves TWO files decoding to
+// one triple, because ListBindings does not dedupe by identity — it appends
+// every file that decodes. That is not a double delivery: the routing path
+// dedupes by queue name before enqueuing. It is worse. DeleteBinding removes
+// the CURRENT filename first and only falls back to the identity scan on
+// IsNotExist, so with both files present the legacy twin is never looked for:
+// unbind reports success and ListBindings keeps returning the binding, on this
+// run and every restart after it.
+//
+// THE VERIFICATION IS NOT BELT-AND-BRACES; WITHOUT IT THIS FUNCTION DESTROYS
+// LIVE DATA. The legacy spelling of one triple can equal the CURRENT spelling
+// of a DIFFERENT one, because both encoders emit "_" into the same namespace
+// for different reasons: filenameComponent("") is "_" (empty is not literal and
+// hex("") is empty), while the legacy fold maps eight characters onto "_". So
+//
+//	legacyBindingFilename("orders","amq.topic","*") == makeBindingFilename("orders","amq.topic","")
+//
+// and unlinking on the strength of the name alone deletes the live
+// ("orders","amq.topic","") binding when ("orders","amq.topic","*") is
+// declared. Fresh install, no upgrade, two ordinary AMQP bindings. The class is
+// wider than the empty component: legacyBindingFilename(":615f62",…) collides
+// with makeBindingFilename("a_b",…) with no empty string anywhere, because the
+// fold can synthesise the "_"+hex shape the current encoder uses for escapes.
+//
+// The record names its owner; the filename is only a slot. That is the same
+// invariant removeBindingByIdentity applies on the delete side, and this is it
+// applied on the store side — one file read rather than a directory scan, so
+// declare stays O(1) instead of O(n) (and building a topology O(n) instead of
+// O(n²)). For an ordinary name the two spellings are equal and this returns
+// before touching the disk at all.
+//
+// THE READ IS LOAD-BEARING AND THE OVERLAP IT DEFENDS AGAINST STILL EXISTS.
+// Nothing here narrowed the encoders; the collision is exactly as reachable as
+// it was. A binding is attackable whenever its current filename carries three
+// or more "_" — the legacy fold is the identity on any string free of its eight
+// bytes — and a component is generated (hence "_"-prefixed) when it is empty,
+// ".", "..", over-length, or contains "/", NUL, OR AN UNDERSCORE. Measured on
+// this tree: 27 distinct attacking triples for each of ("orders","events",
+// "order_created"), ("user_events","amq.topic","signup"),
+// ("orders","billing_ex","invoice.paid") and ("orders","amq.fanout","") —
+// C(k,2)·9^(k-2) for k underscores, exact rather than sampled. So it is not the
+// empty routing key that is at risk; it is ANY binding with an underscore
+// anywhere in its triple. Only the ATTRIBUTION changed. Simplify this read away
+// — "we already know the name, why re-read the file" — and the entire class
+// reopens silently. The real fix is structural and is not here: the metadata
+// tier next door makes the namespaces disjoint by construction with a
+// %escaped/ subdirectory (see metadataEscapeDir), and this tier never adopted
+// it.
+//
+// IT CANNOT FAIL THE CALLER, AND THE SIGNATURE ENFORCES THAT. By the time this
+// runs, atomicWrite has already returned nil and the binding IS persisted. An
+// errno here would report failure for an operation that succeeded: the client
+// would see queue.bind fail, believe no binding exists, and routing would use
+// it anyway — and a retry would rewrite the same record and fail identically,
+// forever. Leaving a duplicate is bounded and the next declare clears it, so
+// the unlink is best-effort housekeeping, not part of the caller's contract.
+// (Compare DeleteBinding swallowing IsNotExist, which WAS the caller's own
+// operation reporting success while doing nothing. Swallow housekeeping, never
+// the contract.)
+//
+// WHY THE DISCARDED ERROR ON THE UNLINK IS NOT THE DEFECT THIS CHANGE IS ABOUT.
+// A bare `_ = os.Remove` inside a change whose whole theme was silent no-ops
+// deserves the suspicion, so: the difference is that this site has ALREADY
+// ATTRIBUTED the file. The record was read, decoded and matched, so a failed
+// unlink cannot destroy anyone's data and cannot hide a mistake about WHOSE
+// file this is — the worst case is the bounded duplicate above, on a contract
+// that was already met. The no-op defects this change fixes were the opposite
+// shape: they swallowed an error on a path that could not tell "nothing to do"
+// from "what I tried to do failed". This one can, and did, one line earlier.
+//
+// THE ORDER IS LOAD-BEARING: callers must write the new record FIRST and call
+// this second. The two files are not updated atomically, so a crash in between
+// leaves one of two states, and only one of them is survivable:
+//
+//	write, then remove -> both files present. No binding is lost, but this is
+//	                      NOT a benign state: it IS the defect this function
+//	                      exists to prevent. While both files sit there unbind
+//	                      silently fails — DeleteBinding removes the current
+//	                      filename, err == nil, the identity fallback is never
+//	                      reached, and the binding survives every restart. A
+//	                      later declare of the triple clears it, and NOTHING
+//	                      GUARANTEES ONE EVER COMES. The bound is "no worse
+//	                      than every build before this one", not "harmless".
+//	remove, then write -> neither file present. The binding is GONE, with the
+//	                      client's original declare confirmed long ago.
+//
+// So the tidier-looking order trades a cleanup lag for silent data loss. Do not
+// swap these.
+func removeLegacySlot(dir, current, legacy string, ownsRecord func(data []byte) bool) {
+	if legacy == current {
+		return
+	}
+	path := filepath.Join(dir, legacy)
+
+	// A read failure is not an error to report: the file is absent, or the
+	// legacy spelling is one no build could ever have written — the old join
+	// bounded nothing and did not fold NUL, so it spells 776-byte names
+	// (ENAMETOOLONG) and NUL-bearing paths (EINVAL) for entirely legal AMQP
+	// input. In every case there is nothing of ours here to remove.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	if !ownsRecord(data) {
+		return // another triple's live record sitting in this slot
+	}
+	_ = os.Remove(path) // best-effort; see the signature note above
 }
 
 // StoreBinding persists a binding to disk and updates cache
@@ -561,11 +866,26 @@ func (pm *PersistentMetadataStore) StoreBinding(queueName, exchangeName, routing
 		return fmt.Errorf("failed to marshal binding: %w", err)
 	}
 
+	dir := filepath.Join(pm.baseDir, BindingsDir)
 	filename := makeBindingFilename(queueName, exchangeName, routingKey)
-	path := filepath.Join(pm.baseDir, BindingsDir, filename)
-	if err := pm.atomicWrite(path, data); err != nil {
+	if err := pm.atomicWrite(filepath.Join(dir, filename), data); err != nil {
 		return err
 	}
+	// AFTER the write, never before, and inside the lock above so a concurrent
+	// declare of this triple cannot land between the two. See removeLegacySlot
+	// on why swapping these two statements loses bindings, and why the slot's
+	// record must be read before it is unlinked.
+	removeLegacySlot(dir, filename,
+		legacyBindingFilename(queueName, exchangeName, routingKey),
+		func(data []byte) bool {
+			var b interfaces.QueueBinding
+			if cbor.Unmarshal(data, &b) != nil {
+				return false // undecodable: cannot claim it, so leave it alone
+			}
+			return b.QueueName == queueName &&
+				b.ExchangeName == exchangeName &&
+				b.RoutingKey == routingKey
+		})
 
 	// Update cache (Phase 6H)
 	if pm.cacheEnabled {
@@ -624,10 +944,26 @@ func (pm *PersistentMetadataStore) DeleteBinding(queueName, exchangeName, routin
 	pm.mutex.Lock()
 	defer pm.mutex.Unlock()
 
+	dir := filepath.Join(pm.baseDir, BindingsDir)
 	filename := makeBindingFilename(queueName, exchangeName, routingKey)
-	path := filepath.Join(pm.baseDir, BindingsDir, filename)
 
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+	switch err := os.Remove(filepath.Join(dir, filename)); {
+	case err == nil:
+	case os.IsNotExist(err):
+		// The record may predate this build's filename encoding, so fall back to
+		// identity: find the file whose RECORD names this triple and remove that.
+		//
+		// Without this, changing the encoding turns unbind into a silent no-op
+		// for every binding the old build spelled differently — os.Remove misses,
+		// IsNotExist is swallowed, DeleteBinding reports success, and ListBindings
+		// keeps returning the binding across restarts. The filename is a slot; the
+		// record names its owner (the same invariant loadCacheFromDisk states).
+		if rerr := pm.removeBindingByIdentity(dir, func(b *interfaces.QueueBinding) bool {
+			return b.QueueName == queueName && b.ExchangeName == exchangeName && b.RoutingKey == routingKey
+		}); rerr != nil {
+			return rerr
+		}
+	default:
 		return fmt.Errorf("failed to delete binding file: %w", err)
 	}
 
@@ -639,6 +975,54 @@ func (pm *PersistentMetadataStore) DeleteBinding(queueName, exchangeName, routin
 		// Invalidate queue and exchange binding caches to force rebuild
 		pm.queueBindingsCache.Delete(queueName)
 		pm.exchangeBindingsCache.Delete(exchangeName)
+	}
+
+	return nil
+}
+
+// removeBindingByIdentity deletes every binding file under dir whose decoded
+// record satisfies match. It is the upgrade path for a filename-encoding change:
+// a record written under an older spelling is still found, because the record —
+// not the filename — carries the identity.
+//
+// It removes ALL matches rather than the first, because a directory really can
+// hold more than one file decoding to one identity: a record written under an
+// older spelling, plus one written under the current spelling for the same
+// triple. Leaving either behind resurrects the binding at the next boot.
+//
+// Note the old non-injective join is NOT what produces that state — two triples
+// sharing one file leaves one file holding one identity, the survivor. The
+// duplicate comes from the encoding change itself, and removeLegacySlot is what
+// stops a re-declare creating one. This fallback is the reader for whatever a
+// build without that removal already left on disk.
+func (pm *PersistentMetadataStore) removeBindingByIdentity(dir string, match func(*interfaces.QueueBinding) bool) error {
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to read bindings directory: %w", err)
+	}
+
+	for _, file := range files {
+		if file.IsDir() || !strings.HasSuffix(file.Name(), FileExtension) {
+			continue
+		}
+		path := filepath.Join(dir, file.Name())
+		data, rerr := os.ReadFile(path)
+		if rerr != nil {
+			continue // Skip unreadable files, as every other reader here does.
+		}
+		var binding interfaces.QueueBinding
+		if cbor.Unmarshal(data, &binding) != nil {
+			continue // Skip corrupted files.
+		}
+		if !match(&binding) {
+			continue
+		}
+		if rerr := os.Remove(path); rerr != nil && !os.IsNotExist(rerr) {
+			return fmt.Errorf("failed to delete binding file %s: %w", path, rerr)
+		}
 	}
 
 	return nil
@@ -741,29 +1125,16 @@ func (pm *PersistentMetadataStore) GetExchangeBindings(exchangeName string) ([]*
 	return result, nil
 }
 
-// makeExchangeBindingCacheKey creates a unique cache key for an exchange-to-exchange binding
-func makeExchangeBindingCacheKey(source, destination, routingKey string) string {
-	return fmt.Sprintf("%s:%s:%s", source, destination, routingKey)
-}
-
-// makeExchangeBindingFilename creates a unique filename for an exchange-to-exchange binding
+// makeExchangeBindingFilename maps an exchange-to-exchange binding's (source,
+// destination, routing key) triple to the file that holds it. It carried a
+// byte-for-byte copy of makeBindingFilename's non-injective join, with the same
+// absent occupancy check, feeding loadExchangeBindingsFromDisk on the boot path.
+// See makeBindingFilename for the argument; the fix is the same.
 func makeExchangeBindingFilename(source, destination, routingKey string) string {
-	safe := func(s string) string {
-		s = strings.ReplaceAll(s, "/", "_")
-		s = strings.ReplaceAll(s, "\\", "_")
-		s = strings.ReplaceAll(s, ":", "_")
-		s = strings.ReplaceAll(s, "*", "_")
-		s = strings.ReplaceAll(s, "?", "_")
-		s = strings.ReplaceAll(s, "<", "_")
-		s = strings.ReplaceAll(s, ">", "_")
-		s = strings.ReplaceAll(s, "|", "_")
-		return s
-	}
-
 	return fmt.Sprintf("%s_%s_%s%s",
-		safe(source),
-		safe(destination),
-		safe(routingKey),
+		filenameComponent(source, bindingComponentMaxLen),
+		filenameComponent(destination, bindingComponentMaxLen),
+		filenameComponent(routingKey, bindingComponentMaxLen),
 		FileExtension)
 }
 
@@ -818,15 +1189,29 @@ func (pm *PersistentMetadataStore) StoreExchangeBinding(source, destination, rou
 		return fmt.Errorf("failed to marshal exchange binding: %w", err)
 	}
 
+	dir := filepath.Join(pm.baseDir, ExchangeBindingsDir)
 	filename := makeExchangeBindingFilename(source, destination, routingKey)
-	path := filepath.Join(pm.baseDir, ExchangeBindingsDir, filename)
-	if err := pm.atomicWrite(path, data); err != nil {
+	if err := pm.atomicWrite(filepath.Join(dir, filename), data); err != nil {
 		return err
 	}
+	// Same upgrade path as StoreBinding, same ordering constraint, same lock,
+	// same cross-triple collision — see removeLegacySlot. The fallback that gets
+	// bypassed on this tier is DeleteExchangeBinding's own IsNotExist arm, and
+	// the record decodes as an ExchangeBinding rather than a QueueBinding, which
+	// is the only reason ownership is a closure instead of one shared helper.
+	removeLegacySlot(dir, filename,
+		legacyBindingFilename(source, destination, routingKey),
+		func(data []byte) bool {
+			var b interfaces.ExchangeBinding
+			if cbor.Unmarshal(data, &b) != nil {
+				return false
+			}
+			return b.Source == source &&
+				b.Destination == destination &&
+				b.RoutingKey == routingKey
+		})
 
 	if pm.cacheEnabled {
-		cacheKey := makeExchangeBindingCacheKey(source, destination, routingKey)
-		pm.exchBindingCache.Store(cacheKey, binding)
 		pm.exchBindingsFromCache.Delete(source)
 	}
 
@@ -838,17 +1223,60 @@ func (pm *PersistentMetadataStore) DeleteExchangeBinding(source, destination, ro
 	pm.mutex.Lock()
 	defer pm.mutex.Unlock()
 
+	dir := filepath.Join(pm.baseDir, ExchangeBindingsDir)
 	filename := makeExchangeBindingFilename(source, destination, routingKey)
-	path := filepath.Join(pm.baseDir, ExchangeBindingsDir, filename)
 
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+	switch err := os.Remove(filepath.Join(dir, filename)); {
+	case err == nil:
+	case os.IsNotExist(err):
+		// Same upgrade path as DeleteBinding — see removeBindingByIdentity.
+		if rerr := pm.removeExchangeBindingByIdentity(dir, func(b *interfaces.ExchangeBinding) bool {
+			return b.Source == source && b.Destination == destination && b.RoutingKey == routingKey
+		}); rerr != nil {
+			return rerr
+		}
+	default:
 		return fmt.Errorf("failed to delete exchange binding file: %w", err)
 	}
 
 	if pm.cacheEnabled {
-		cacheKey := makeExchangeBindingCacheKey(source, destination, routingKey)
-		pm.exchBindingCache.Delete(cacheKey)
 		pm.exchBindingsFromCache.Delete(source)
+	}
+
+	return nil
+}
+
+// removeExchangeBindingByIdentity is removeBindingByIdentity's twin for
+// exchange-to-exchange bindings. See that function for why identity, not
+// filename, drives the fallback.
+func (pm *PersistentMetadataStore) removeExchangeBindingByIdentity(dir string, match func(*interfaces.ExchangeBinding) bool) error {
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to read exchange bindings directory: %w", err)
+	}
+
+	for _, file := range files {
+		if file.IsDir() || !strings.HasSuffix(file.Name(), FileExtension) {
+			continue
+		}
+		path := filepath.Join(dir, file.Name())
+		data, rerr := os.ReadFile(path)
+		if rerr != nil {
+			continue
+		}
+		var binding interfaces.ExchangeBinding
+		if cbor.Unmarshal(data, &binding) != nil {
+			continue
+		}
+		if !match(&binding) {
+			continue
+		}
+		if rerr := os.Remove(path); rerr != nil && !os.IsNotExist(rerr) {
+			return fmt.Errorf("failed to delete exchange binding file %s: %w", path, rerr)
+		}
 	}
 
 	return nil
@@ -895,7 +1323,7 @@ func (pm *PersistentMetadataStore) GetConsumer(queueName, consumerTag string) (*
 	pm.mutex.RLock()
 	defer pm.mutex.RUnlock()
 
-	path := filepath.Join(pm.baseDir, ConsumersDir, queueName, consumerTag+FileExtension)
+	path := filepath.Join(pm.baseDir, ConsumersDir, metadataPathComponent(queueName), metadataSlotName(consumerTag))
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -917,7 +1345,7 @@ func (pm *PersistentMetadataStore) DeleteConsumer(queueName, consumerTag string)
 	pm.mutex.Lock()
 	defer pm.mutex.Unlock()
 
-	path := filepath.Join(pm.baseDir, ConsumersDir, queueName, consumerTag+FileExtension)
+	path := filepath.Join(pm.baseDir, ConsumersDir, metadataPathComponent(queueName), metadataSlotName(consumerTag))
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to delete consumer file: %w", err)
 	}
@@ -930,7 +1358,7 @@ func (pm *PersistentMetadataStore) GetQueueConsumers(queueName string) ([]*proto
 	pm.mutex.RLock()
 	defer pm.mutex.RUnlock()
 
-	queueDir := filepath.Join(pm.baseDir, ConsumersDir, queueName)
+	queueDir := filepath.Join(pm.baseDir, ConsumersDir, metadataPathComponent(queueName))
 	files, err := os.ReadDir(queueDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -945,12 +1373,17 @@ func (pm *PersistentMetadataStore) GetQueueConsumers(queueName string) ([]*proto
 			continue
 		}
 
-		consumerTag := strings.TrimSuffix(file.Name(), FileExtension)
-		consumer, err := pm.GetConsumer(queueName, consumerTag)
-		if err != nil {
+		// Content-authoritative: the record carries its own tag, so a
+		// generated slot name never has to be decoded.
+		data, rerr := os.ReadFile(filepath.Join(queueDir, file.Name()))
+		if rerr != nil {
+			continue
+		}
+		var consumer protocol.Consumer
+		if uerr := cbor.Unmarshal(data, &consumer); uerr != nil {
 			continue // Skip corrupted files
 		}
-		consumers = append(consumers, consumer)
+		consumers = append(consumers, &consumer)
 	}
 
 	return consumers, nil

@@ -382,9 +382,9 @@ func (s *Server) handleQueueDelete(conn *protocol.Connection, channelID uint16, 
 		}
 	}
 
-	var consumerTags []string
+	var consumerIDs []string
 	if sb, ok := s.Broker.(*StorageBrokerAdapter); ok {
-		consumerTags = sb.broker.GetQueueConsumerTags(queueName)
+		consumerIDs = sb.broker.GetQueueConsumerIDs(queueName)
 	}
 
 	count, err := s.Broker.DeleteQueue(queueName, deleteMethod.IfUnused, deleteMethod.IfEmpty)
@@ -395,8 +395,8 @@ func (s *Server) handleQueueDelete(conn *protocol.Connection, channelID uint16, 
 		return err
 	}
 
-	if len(consumerTags) > 0 {
-		s.notifyConsumersCancelled(consumerTags)
+	if len(consumerIDs) > 0 {
+		s.notifyConsumersCancelled(consumerIDs)
 	}
 
 	if val, exists := conn.Channels.Load(channelID); exists {
@@ -419,7 +419,17 @@ func (s *Server) handleQueueDelete(conn *protocol.Connection, channelID uint16, 
 	return s.sendQueueDeleteOK(conn, channelID, uint32(count))
 }
 
-func (s *Server) notifyConsumersCancelled(consumerTags []string) {
+// notifyConsumersCancelled sends a server-initiated basic.cancel to every
+// consumer that was attached to a just-deleted queue.
+//
+// The consumers are addressed by broker-internal identity, and the scan
+// compares Consumer.ID — NOT the map key. A bare wire tag does not identify a
+// consumer across the server: AMQP 0-9-1 scopes it per channel, so a tag-keyed
+// scan cancels whichever channel it reaches first and can close a live consumer
+// belonging to an unrelated connection. Once the identity is matched, the
+// basic.cancel carries that consumer's own wire tag, which is the only name its
+// client knows it by.
+func (s *Server) notifyConsumersCancelled(consumerIDs []string) {
 	s.Mutex.RLock()
 	connections := make([]*protocol.Connection, 0, len(s.Connections))
 	for _, conn := range s.Connections {
@@ -427,28 +437,35 @@ func (s *Server) notifyConsumersCancelled(consumerTags []string) {
 	}
 	s.Mutex.RUnlock()
 
-	for _, tag := range consumerTags {
+	for _, consumerID := range consumerIDs {
 		for _, conn := range connections {
 			if conn.Closed.Load() {
 				continue
 			}
 			var foundChannel *protocol.Channel
+			var foundTag string
 			conn.Channels.Range(func(key, value interface{}) bool {
 				ch := value.(*protocol.Channel)
 				ch.Mutex.Lock()
-				if consumer, exists := ch.Consumers[tag]; exists {
+				for tag, consumer := range ch.Consumers {
+					if consumer.ID != consumerID {
+						continue
+					}
 					foundChannel = ch
+					foundTag = tag
 					close(consumer.Cancel)
 					delete(ch.Consumers, tag)
+					break
 				}
 				ch.Mutex.Unlock()
 				return foundChannel == nil
 			})
 			if foundChannel != nil {
 				conn.ConsumersDirty.Store(true)
-				if err := s.sendBasicCancel(conn, foundChannel.ID, tag); err != nil {
+				if err := s.sendBasicCancel(conn, foundChannel.ID, foundTag); err != nil {
 					s.Log.Warn("Failed to send basic.cancel to consumer",
-						zap.String("consumer_tag", tag),
+						zap.String("consumer_tag", foundTag),
+						zap.String("consumer_id", consumerID),
 						zap.String("connection_id", conn.ID),
 						zap.Error(err))
 				}

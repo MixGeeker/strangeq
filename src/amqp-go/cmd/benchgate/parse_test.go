@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -159,6 +160,66 @@ geomean,9.999999999999994e-08,,3.1606961258558185e-07,,+0.00%,
 	}
 	if results[1].name != "C-8" || results[1].status != statusMissingFromBaseline {
 		t.Errorf("C-8: got %+v, want statusMissingFromBaseline", results[1])
+	}
+}
+
+// singleConfigCSV is captured verbatim (shortened to two benchmarks per
+// table) from a real pinned-benchstat run of the committed M4 Max baseline
+// against an M3 Pro run of the broker package — the exact input that produced
+// 41 fabricated regressions.
+//
+// When the two inputs share no benchstat *configuration*, benchstat does not
+// emit a comparison at all: it emits one degenerate single-file table per
+// configuration. Note the shape — the filenames header names ONE file, and
+// the unit header is `,B/op,CI` with no "vs base"/"P" columns. There is no
+// delta anywhere in this table because nothing was compared.
+const singleConfigCSV = `cpu: Apple M3 Pro
+goos: darwin
+goarch: arm64
+pkg: github.com/maxpert/amqp-go/broker
+,/tmp/split/broker-new.txt,
+,B/op,CI
+QueueDispatch_Claim-12,248,0%
+QueueDispatch_Publish-12,0,0%
+geomean,,
+
+cpu: Apple M4 Max
+,/tmp/split/broker-baseline.txt,
+,B/op,CI
+QueueDispatch_Claim-16,248,0%
+QueueDispatch_Publish-16,0,0%
+geomean,,
+`
+
+// TestParseBenchstatCSV_SingleConfigTableIsHardError is the regression test
+// for the fabricated-regression bug.
+//
+// The old parser took fullWidth from whatever unit header it saw, so a
+// degenerate 3-field header set fullWidth=3; the one-sided-row guard
+// (len(fields) < fullWidth) could then never fire, every row was classified
+// statusCompared, and fields[len-2] — the RAW METRIC VALUE — was parsed as a
+// percentage. B/op 248 on both sides was reported as "regressed +248.00%".
+//
+// A gate that cannot compare must say so and stop, never emit a number. The
+// contract asserted here is: no results, and an error naming the reason.
+func TestParseBenchstatCSV_SingleConfigTableIsHardError(t *testing.T) {
+	results, err := parseBenchstatCSV([]byte(singleConfigCSV))
+	if err == nil {
+		t.Fatalf("parseBenchstatCSV accepted a table with nothing to compare and returned %d results: %+v", len(results), results)
+	}
+	if len(results) != 0 {
+		t.Errorf("got %d results alongside the error, want 0 — a non-comparison must yield no numbers: %+v", len(results), results)
+	}
+	msg := err.Error()
+	for _, want := range []string{"B/op", "vs base"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error message does not mention %q, so it does not name the reason: %s", want, msg)
+		}
+	}
+	// The fabricated value must not appear anywhere: 248 is the raw B/op,
+	// identical on both sides, that the old parser printed as +248.00%.
+	if strings.Contains(msg, "248") {
+		t.Errorf("error message contains the raw metric value 248 as if it were a delta: %s", msg)
 	}
 }
 

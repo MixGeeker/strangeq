@@ -59,6 +59,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	// Comparability is checked for EVERY package before ANY package is
+	// compared. A gate that prints "pkg/a: PASS" and only then discovers it
+	// cannot compare pkg/b has already published a number it has no basis
+	// for; and a reader who sees one PASS line reasonably assumes the run
+	// was a run. Bail before emitting anything.
+	if !checkComparable(baselineByPkg, newByPkg, newOrder, stderr) {
+		return 2
+	}
+
 	var allRegressions []regression
 	anyCompared := false
 	for _, pkg := range newOrder {
@@ -122,6 +131,69 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	fmt.Fprintln(stdout, "benchgate: PASS — no regression exceeding the gate")
 	return 0
+}
+
+// checkComparable verifies that, for every package present on both sides,
+// the baseline and the new run were produced under the same benchstat
+// configuration (goos/goarch/cpu). It reports true when the whole run is
+// comparable, and otherwise writes a hard error to stderr naming every
+// mismatching key.
+//
+// This exists because a hardware-mismatched baseline has TWO distinct failure
+// modes, both of which the gate previously exhibited on real data:
+//
+//   - When the benchmark names also differ (GOMAXPROCS is part of a
+//     benchmark's name, so an M4 Max/16-CPU baseline yields "-16" suffixes
+//     and a 12-CPU run yields "-12"), benchstat emits degenerate
+//     single-configuration tables and the parser turned raw metric values
+//     into percentages: 41 fabricated regressions in one run.
+//   - When the benchmark names happen to MATCH — same GOMAXPROCS, different
+//     silicon — the gate compared two machines against each other and
+//     reported the result as an ordinary verdict, with nothing in the output
+//     to indicate it.
+//
+// The second is the more dangerous of the two, and it is the reason this
+// check is not "detect the degenerate table shape": that shape is a symptom,
+// visible only in the first case.
+//
+// The CPU count and model are deliberately NOT normalised away. They are part
+// of what makes two benchmark runs comparable, so a mismatch is a fact about
+// the measurement, not noise in the naming. The resolution is to refresh the
+// baseline on the machine doing the gating (make bench-baseline-refresh) and
+// review the diff, or to run the gate where the baseline was captured.
+func checkComparable(baselineByPkg, newByPkg map[string][]byte, newOrder []string, stderr io.Writer) bool {
+	type pkgDiff struct {
+		pkg   string
+		diffs []string
+	}
+	var bad []pkgDiff
+	for _, pkg := range newOrder {
+		baselineBody, ok := baselineByPkg[pkg]
+		if !ok {
+			continue // reported separately as a not-yet-baselined package
+		}
+		diffs := configMismatch(sectionConfig(baselineBody), sectionConfig(newByPkg[pkg]))
+		if len(diffs) > 0 {
+			bad = append(bad, pkgDiff{pkg: pkg, diffs: diffs})
+		}
+	}
+	if len(bad) == 0 {
+		return true
+	}
+
+	fmt.Fprintln(stderr, "benchgate: CANNOT COMPARE — the baseline and this run were not produced under the same")
+	fmt.Fprintln(stderr, "  benchstat configuration, so no delta between them would mean anything. No verdict is")
+	fmt.Fprintln(stderr, "  reported below, and none should be inferred from the absence of one.")
+	for _, b := range bad {
+		fmt.Fprintf(stderr, "  %s:\n", b.pkg)
+		for _, d := range b.diffs {
+			fmt.Fprintf(stderr, "    %s\n", d)
+		}
+	}
+	fmt.Fprintln(stderr, "  Fix: re-capture the baseline on this machine with `make bench-baseline-refresh` and")
+	fmt.Fprintln(stderr, "  review the diff, or run the gate on the machine the baseline came from. The CPU model")
+	fmt.Fprintln(stderr, "  and count are part of what makes two runs comparable; the gate will not normalise them away.")
+	return false
 }
 
 // runBenchstat writes baselineBody/newBody to pkg-scoped scratch files and

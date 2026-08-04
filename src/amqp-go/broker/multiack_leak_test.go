@@ -94,7 +94,7 @@ func TestMultiAckFullWindowReleasesExactly(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, prefetch),
 		PrefetchCount: prefetch,
 	}
-	if err := broker.RegisterConsumer("mafull", "mafull-consumer", consumer); err != nil {
+	if err := registerConsumer(broker, "mafull", "mafull-consumer", consumer); err != nil {
 		t.Fatalf("RegisterConsumer: %v", err)
 	}
 
@@ -157,7 +157,7 @@ func TestMultiAckBatchedNoPhantomLeak(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, total), // never block on send; only the gate bounds delivery
 		PrefetchCount: prefetch,
 	}
-	if err := broker.RegisterConsumer("maleak", "maleak-consumer", consumer); err != nil {
+	if err := registerConsumer(broker, "maleak", "maleak-consumer", consumer); err != nil {
 		t.Fatalf("RegisterConsumer: %v", err)
 	}
 
@@ -212,9 +212,10 @@ func TestMultiAckBatchedNoPhantomLeak(t *testing.T) {
 //
 // Delivery tags in this broker are globally unique and every ack is routed by
 // GetConsumerForDelivery to the single owner of the acked tag: a push consumer
-// (non-empty tag) via AcknowledgeMessage, a basic.get delivery (empty tag) via
+// (non-empty consumer identity) via AcknowledgeMessage, a basic.get delivery
+// (empty identity) via
 // AcknowledgeGetDelivery. A push-consumer multi-ack therefore enumerates only
-// that consumer's unacked cursor set; basic.get deliveries (consumer tag "")
+// that consumer's unacked cursor set; basic.get deliveries (consumer identity "")
 // are never in it, so they are neither double-freed nor swept, and they remain
 // independently ackable. This test pins that separation: the get delivery
 // survives a consumer multi-ack that covers a higher tag, the consumer window
@@ -250,7 +251,7 @@ func TestMultiAckDoesNotDisturbBasicGetDelivery(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, prefetch),
 		PrefetchCount: prefetch,
 	}
-	if err := broker.RegisterConsumer("mixed", "mixed-consumer", consumer); err != nil {
+	if err := registerConsumer(broker, "mixed", "mixed-consumer", consumer); err != nil {
 		t.Fatalf("RegisterConsumer: %v", err)
 	}
 

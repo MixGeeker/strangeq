@@ -43,16 +43,7 @@ func f1AggServer(t *testing.T, fsync bool, ringSize int, walChanBuf int) (string
 	if err != nil {
 		t.Fatalf("Build failed: %v", err)
 	}
-	go func() { _ = srv.Start() }()
-	for i := 0; i < brokerStartupPolls; i++ {
-		if srv.IsListening() {
-			break
-		}
-		time.Sleep(brokerStartupPollInterval)
-	}
-	if !srv.IsListening() {
-		t.Fatal("server listener not ready")
-	}
+	waitForListening(t, srv)
 	return fmt.Sprintf("amqp://guest:guest@%s/", addr), func() { _ = srv.Stop() }
 }
 

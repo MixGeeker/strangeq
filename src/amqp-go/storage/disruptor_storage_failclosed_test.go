@@ -3,7 +3,6 @@ package storage
 import (
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 
 	"github.com/maxpert/amqp-go/interfaces"
@@ -24,7 +23,7 @@ func TestNewDisruptorStorage_FailsWhenWALDirUnwritable(t *testing.T) {
 	walDir := filepath.Join(tmpDir, "wal")
 	require.NoError(t, os.WriteFile(walDir, []byte("blocker"), 0644))
 
-	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, 0, interfaces.EngineConfig{})
+	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, interfaces.EngineConfig{})
 	require.Error(t, err, "constructor must fail when WAL dir cannot be created")
 	assert.Nil(t, ds, "no storage should be returned on construction failure")
 	assert.Contains(t, err.Error(), "WAL")
@@ -39,7 +38,7 @@ func TestNewDisruptorStorage_FailsWhenMetadataDirUnwritable(t *testing.T) {
 	metaDir := filepath.Join(tmpDir, "metadata")
 	require.NoError(t, os.WriteFile(metaDir, []byte("blocker"), 0644))
 
-	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, 0, interfaces.EngineConfig{})
+	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, interfaces.EngineConfig{})
 	require.Error(t, err)
 	assert.Nil(t, ds)
 	assert.Contains(t, err.Error(), "metadata")
@@ -49,7 +48,7 @@ func TestNewDisruptorStorage_FailsWhenMetadataDirUnwritable(t *testing.T) {
 func TestNewDisruptorStorage_SucceedsOnValidDir(t *testing.T) {
 	tmpDir := t.TempDir()
 
-	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, 0, interfaces.EngineConfig{})
+	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, interfaces.EngineConfig{})
 	require.NoError(t, err)
 	require.NotNil(t, ds)
 	assert.NotNil(t, ds.wal, "WAL should be initialized on valid dir")
@@ -104,26 +103,4 @@ func TestStoreMessage_TransientWithoutWAL_StillWorks(t *testing.T) {
 	retrieved, err := ds.GetMessage("test-queue", 1)
 	require.NoError(t, err)
 	assert.Equal(t, "transient payload", string(retrieved.Body))
-}
-
-// TestNewDisruptorStorage_OffsetStoreFailureTolerated verifies that offset store
-// construction failure is non-fatal (offset checkpointing is a best-effort optimization).
-func TestNewDisruptorStorage_OffsetStoreFailureTolerated(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("file permission tests are unreliable on Windows")
-	}
-
-	tmpDir := t.TempDir()
-
-	// Block the offset checkpoint directory
-	offsetDir := filepath.Join(tmpDir, "offsets")
-	require.NoError(t, os.WriteFile(offsetDir, []byte("blocker"), 0644))
-
-	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, 0, interfaces.EngineConfig{})
-	// Offset store failure should NOT be fatal — the storage should still be usable.
-	require.NoError(t, err, "offset store failure should be non-fatal")
-	require.NotNil(t, ds)
-	assert.Nil(t, ds.offsetStore, "offset store should be nil on failure")
-	assert.NotNil(t, ds.wal, "WAL should still be initialized")
-	_ = ds.Close()
 }

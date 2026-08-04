@@ -39,6 +39,14 @@ type MetricsCollector interface {
 	// Server metrics
 	UpdateServerUptime(seconds float64)
 
+	// SetUnsafeRecoveryArtifacts pins, for the lifetime of the process, how
+	// many artifacts this broker DISCARDED at boot because --unsafe-recovery
+	// was set. Zero on a clean boot. It is a gauge rather than a counter
+	// deliberately: the fact an operator needs is "this process is running on
+	// data it could not fully recover", which is true for as long as the
+	// process lives, not an event that scrolls out of a log.
+	SetUnsafeRecoveryArtifacts(count int)
+
 	// Latency metrics
 	RecordPublishLatency(duration float64)
 	RecordDeliveryLatency(duration float64)
@@ -58,6 +66,7 @@ type MetricsCollector interface {
 	UpdateSegmentMetrics(queueName string, count, sizeBytes float64)
 	DeleteSegmentMetrics(queueName string)
 	RecordSegmentCompaction()
+	RecordSegmentCompactionFailure()
 	RecordSegmentReadError()
 
 	// Ring buffer metrics
@@ -103,6 +112,7 @@ func (n *NoOpMetricsCollector) RecordTransactionStarted()                  {}
 func (n *NoOpMetricsCollector) RecordTransactionCommitted()                {}
 func (n *NoOpMetricsCollector) RecordTransactionRolledback()               {}
 func (n *NoOpMetricsCollector) UpdateServerUptime(seconds float64)         {}
+func (n *NoOpMetricsCollector) SetUnsafeRecoveryArtifacts(count int)       {}
 
 // Latency metrics
 func (n *NoOpMetricsCollector) RecordPublishLatency(duration float64)                        {}
@@ -123,6 +133,7 @@ func (n *NoOpMetricsCollector) RecordWALWriteError()            {}
 func (n *NoOpMetricsCollector) UpdateSegmentMetrics(queueName string, count, sizeBytes float64) {}
 func (n *NoOpMetricsCollector) DeleteSegmentMetrics(queueName string)                           {}
 func (n *NoOpMetricsCollector) RecordSegmentCompaction()                                        {}
+func (n *NoOpMetricsCollector) RecordSegmentCompactionFailure()                                 {}
 func (n *NoOpMetricsCollector) RecordSegmentReadError()                                         {}
 
 // Ring buffer metrics

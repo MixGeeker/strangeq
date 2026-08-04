@@ -138,7 +138,17 @@ func (b *StorageBroker) reapSweep(name string, qs *QueueState) time.Duration {
 			if idle >= expiresMs {
 				// Idle long enough with no consumers: auto-delete and stop. The
 				// deletion closes stopCh, so reapLoop returns on its next select.
-				b.DeleteQueue(name, false, false)
+				//
+				// Deleted BY INCARNATION, not by name. The idle decision just
+				// made is about the `qs` this sweep was handed, but every input
+				// to it — LastActivityMilli, queueHasConsumers — was read before
+				// this line. A queue.declare landing in that gap would make a
+				// plain DeleteQueue(name) destroy the SUCCESSOR: its record, its
+				// ring and its bindings, annihilated on the strength of the
+				// predecessor's idle clock, after the broker had already
+				// confirmed the successor's durable publishes. Passing the
+				// captured ordinal makes that case a no-op instead.
+				b.deleteQueueIncarnation(name, qs.Ordinal(), false, false)
 				return reaperMaxInterval
 			}
 			if d := time.Duration(expiresMs-idle) * time.Millisecond; d < next {

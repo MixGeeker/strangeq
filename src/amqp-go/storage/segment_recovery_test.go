@@ -24,7 +24,7 @@ func TestSegmentResidentMessagesRecoveredAfterRestart(t *testing.T) {
 		WALChannelBuffer:  5000,
 	}
 
-	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, 5*time.Second, engineCfg)
+	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, engineCfg)
 	require.NoError(t, err)
 
 	queueName := "restart-test-queue"
@@ -59,7 +59,7 @@ func TestSegmentResidentMessagesRecoveredAfterRestart(t *testing.T) {
 
 	ds.Close()
 
-	ds2, err := NewDisruptorStorageWithEngineConfig(tmpDir, 5*time.Second, engineCfg)
+	ds2, err := NewDisruptorStorageWithEngineConfig(tmpDir, engineCfg)
 	require.NoError(t, err)
 	defer ds2.Close()
 
@@ -76,7 +76,13 @@ func TestSegmentResidentMessagesRecoveredAfterRestart(t *testing.T) {
 	}
 }
 
-func TestSegmentRecovery_TornTailTruncated(t *testing.T) {
+// Renamed in Step 4 (canon rule 1 record): the old name asserted a REMEDY
+// (truncation) rather than the property. Recovery no longer truncates — a
+// segment is the only copy of its data once performCheckpoint unlinks the
+// source WAL file, and nothing appends to a loaded segment — so the file is
+// left exactly as found. No assertion was removed or softened; two were added
+// (the file must not shrink, and the torn tail must not gate the boot).
+func TestSegmentRecovery_TornTailIsBenignAndDoesNotRewriteTheFile(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	sm, err := NewSegmentManager(tmpDir)
@@ -118,16 +124,24 @@ func TestSegmentRecovery_TornTailTruncated(t *testing.T) {
 	require.NoError(t, err)
 	f.Close()
 
+	sizeBefore, serr := os.Stat(segPath)
+	require.NoError(t, serr)
+
 	sm2, err := NewSegmentManager(tmpDir)
 	require.NoError(t, err)
 	defer sm2.Close()
 
 	recovered, err := sm2.RecoverFromSegments()
-	require.NoError(t, err)
+	require.NoError(t, err, "a torn tail was never fsynced, so it must not gate the boot")
 
 	queueMsgs, ok := recovered[queueName]
 	require.True(t, ok)
-	assert.Len(t, queueMsgs, 5, "torn tail should be truncated, 5 valid messages recovered")
+	assert.Len(t, queueMsgs, 5, "the 5 valid records before the torn tail must be recovered")
+
+	sizeAfter, serr := os.Stat(segPath)
+	require.NoError(t, serr)
+	assert.Equal(t, sizeBefore.Size(), sizeAfter.Size(),
+		"recovery must not rewrite a segment file: it is the only copy of its data")
 	for _, rm := range queueMsgs {
 		assert.Contains(t, string(rm.Message.Body), "torn-body-")
 	}

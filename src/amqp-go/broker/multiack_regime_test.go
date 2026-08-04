@@ -36,7 +36,7 @@ func TestMultiAckHighVolumeRegime(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 100), // server uses cap 100
 		PrefetchCount: 0,                                  // "unlimited" -> capped at 2000
 	}
-	if err := broker.RegisterConsumer("regime", "regime-consumer", consumer); err != nil {
+	if err := registerConsumer(broker, "regime", "regime-consumer", consumer); err != nil {
 		t.Fatalf("RegisterConsumer: %v", err)
 	}
 

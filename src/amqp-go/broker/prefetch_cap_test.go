@@ -52,7 +52,7 @@ func TestUnlimitedPrefetchCapHonorsConfig(t *testing.T) {
 				Messages:      make(chan *protocol.Delivery, 8),
 				PrefetchCount: 0, // "unlimited" per spec -> the finite cap applies
 			}
-			if err := broker.RegisterConsumer("q", "c", consumer); err != nil {
+			if err := registerConsumer(broker, "q", "c", consumer); err != nil {
 				t.Fatalf("RegisterConsumer: %v", err)
 			}
 			v, ok := broker.activeConsumers.Load("c")
@@ -92,7 +92,7 @@ func TestUnlimitedPrefetchCapBoundsOutstandingAllFlow(t *testing.T) {
 				Messages:      make(chan *protocol.Delivery, total),
 				PrefetchCount: 0,
 			}
-			if err := broker.RegisterConsumer(qname, "cap-consumer", consumer); err != nil {
+			if err := registerConsumer(broker, qname, "cap-consumer", consumer); err != nil {
 				t.Fatalf("RegisterConsumer: %v", err)
 			}
 

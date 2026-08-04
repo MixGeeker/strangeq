@@ -127,10 +127,18 @@ type StorageConfig struct {
 	// Example: 86400000 = 24 hours
 	RetentionMS int64
 
-	// CheckpointIntervalMS is how often to save consumer offset positions (milliseconds)
-	// Set to 0 to disable background checkpointing (manual checkpoint only)
-	// Example: 5000 = 5 seconds
-	CheckpointIntervalMS int64
+	// UnsafeRecovery (--unsafe-recovery) lets the broker START on a data
+	// directory whose recovery could not be completed safely, DISCARDING
+	// whatever could not be interpreted. Zero value (false) is the safe
+	// default: any recovery outcome worse than RecoveryBenign refuses the boot
+	// with a message naming the artifact, the cause, and this flag.
+	//
+	// This is a data-loss switch, not a tuning knob. With it set the broker
+	// boots, logs one ERROR line per discarded artifact naming it BY PATH,
+	// pins a process-lifetime metric, and keeps re-warning for as long as it
+	// runs. Never set it in a config file "just in case" — a directory that
+	// needs it is a directory whose durable contents are already forfeit.
+	UnsafeRecovery bool
 }
 
 // SecurityConfig holds security-related configuration
@@ -295,6 +303,17 @@ type EngineConfig struct {
 	// fdatasync is skipped (Storage.Fsync=false). It never disables the
 	// transaction fsync (WriteTxAtomic is always durable).
 	WALSyncDisabled bool `json:"wal_sync_disabled"`
+
+	// UnsafeRecovery is the internal transport for the user-facing
+	// StorageConfig.UnsafeRecovery flag (--unsafe-recovery). Zero value
+	// (false) = refuse to start on an unrecoverable data directory, which is
+	// the safe default for every zero-value EngineConfig{} used by
+	// constructors and tests. Only the config layer sets it, from GetEngine().
+	// It reaches storage construction because the first thing that can prove a
+	// directory unrecoverable — a WAL file whose framing version this build
+	// cannot parse — is detected in createSharedWAL, before any server object
+	// exists.
+	UnsafeRecovery bool `json:"unsafe_recovery"`
 
 	// SharedBodyThreshold (ITER5) is the minimum body size, in bytes, at which a
 	// DURABLE fan-out to >=2 queues writes the body ONCE as a shared WAL BodyBlock

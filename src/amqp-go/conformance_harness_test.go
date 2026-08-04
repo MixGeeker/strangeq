@@ -166,22 +166,14 @@ func newConfBrokerCfg(t *testing.T, mutate func(*config.AMQPConfig)) *confBroker
 
 func (b *confBroker) startEmbedded() {
 	t := b.t
-	checkpoint := time.Duration(b.cfg.Storage.CheckpointIntervalMS) * time.Millisecond
-	st, err := storage.NewDisruptorStorageWithEngineConfig(b.cfg.Storage.Path, checkpoint, b.cfg.GetEngine())
+	st, err := storage.NewDisruptorStorageWithEngineConfig(b.cfg.Storage.Path, b.cfg.GetEngine())
 	require.NoError(t, err, "open storage at %s", b.cfg.Storage.Path)
 	b.st = st
 
 	srv, err := server.NewServerBuilder().WithConfig(b.cfg).WithStorage(st).Build()
 	require.NoError(t, err, "build embedded server")
 	b.srv = srv
-	go func() { _ = srv.Start() }()
-	for i := 0; i < brokerStartupPolls; i++ {
-		if srv.IsListening() {
-			break
-		}
-		time.Sleep(brokerStartupPollInterval)
-	}
-	require.True(t, srv.IsListening(), "embedded server did not start listening")
+	waitForListening(t, srv)
 	b.uri = fmt.Sprintf("amqp://guest:guest@%s/", srv.Listener.Addr().String())
 }
 

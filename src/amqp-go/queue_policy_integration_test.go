@@ -2,9 +2,7 @@ package main
 
 import (
 	"testing"
-	"time"
 
-	"github.com/maxpert/amqp-go/server"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -17,13 +15,9 @@ import (
 //   - a malformed known x-argument closes the channel with 406
 //     PRECONDITION_FAILED while the connection stays usable.
 func TestQueuePolicyIntegration(t *testing.T) {
-	srv := server.NewServer(":5696")
-	go func() {
-		_ = srv.Start()
-	}()
+	srv := newIsolatedTestServer(t, isolatedTestConfig(t, ":5696"))
 	defer srv.Stop()
-
-	time.Sleep(200 * time.Millisecond)
+	waitForListening(t, srv)
 
 	conn, err := amqp.Dial("amqp://guest:guest@localhost:5696//")
 	require.NoError(t, err, "Should connect to server")

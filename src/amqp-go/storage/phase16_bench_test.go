@@ -294,7 +294,10 @@ func BenchmarkSegmentWriteReadWithMetadata(b *testing.B) {
 	}
 
 	// Get queue segments for reading
-	qs := sm.getOrCreateQueueSegments("bench_queue")
+	qs, qsErr := sm.getOrCreateQueueSegments("bench_queue")
+	if qsErr != nil {
+		b.Fatal(qsErr)
+	}
 
 	b.ResetTimer()
 	b.ReportAllocs()

@@ -86,7 +86,7 @@ func (s *Server) sendBatchedDeliveries(conn *protocol.Connection, channelID uint
 		if channel != nil {
 			wireTag = channel.NextWireTag()
 			if !delivery.NoAck {
-				channel.TrackDelivery(wireTag, delivery.DeliveryTag, delivery.ConsumerTag, false)
+				channel.TrackDelivery(wireTag, delivery.DeliveryTag, delivery.ConsumerID, false)
 			}
 		}
 		err := s.serializeDeliveryInto(
@@ -346,7 +346,7 @@ func (s *Server) sendBatchedDeliveriesVectored(conn *protocol.Connection, channe
 		if channel != nil {
 			wireTag = channel.NextWireTag()
 			if !delivery.NoAck {
-				channel.TrackDelivery(wireTag, delivery.DeliveryTag, delivery.ConsumerTag, false)
+				channel.TrackDelivery(wireTag, delivery.DeliveryTag, delivery.ConsumerID, false)
 			}
 		}
 		if err := s.serializeDeliveryIntoVec(

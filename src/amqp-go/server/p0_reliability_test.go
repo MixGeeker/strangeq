@@ -246,6 +246,7 @@ func TestP0_WriteErrorRequeuesDeliveries(t *testing.T) {
 	ch.Mutex.Lock()
 	ch.Consumers = make(map[string]*protocol.Consumer)
 	ch.Consumers["consumer-a"] = &protocol.Consumer{
+		ID:       "consumer-a",
 		Tag:      "consumer-a",
 		Queue:    "queue-a",
 		Messages: make(chan *protocol.Delivery, 10),
@@ -271,7 +272,7 @@ func TestP0_WriteErrorRequeuesDeliveries(t *testing.T) {
 			RoutingKey:  "queue-a",
 		},
 		DeliveryTag: 1,
-		ConsumerTag: "consumer-a",
+		ConsumerID:  "consumer-a",
 		Exchange:    "",
 		RoutingKey:  "queue-a",
 	}

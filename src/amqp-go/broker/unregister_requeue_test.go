@@ -79,7 +79,7 @@ func TestUnregisterRequeuesBufferedMessages(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 100),
 		PrefetchCount: 100,
 	}
-	if err := broker.RegisterConsumer("rq", "consumer-a", consumerA); err != nil {
+	if err := registerConsumer(broker, "rq", "consumer-a", consumerA); err != nil {
 		t.Fatalf("RegisterConsumer A: %v", err)
 	}
 
@@ -117,7 +117,7 @@ func TestUnregisterRequeuesBufferedMessages(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 100),
 		PrefetchCount: 100,
 	}
-	if err := broker.RegisterConsumer("rq", "consumer-b", consumerB); err != nil {
+	if err := registerConsumer(broker, "rq", "consumer-b", consumerB); err != nil {
 		t.Fatalf("RegisterConsumer B: %v", err)
 	}
 
@@ -153,7 +153,7 @@ func TestUnregisterRequeuesInflightOwners(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 100),
 		PrefetchCount: 100,
 	}
-	if err := broker.RegisterConsumer("rq2", "consumer-a", consumerA); err != nil {
+	if err := registerConsumer(broker, "rq2", "consumer-a", consumerA); err != nil {
 		t.Fatalf("RegisterConsumer A: %v", err)
 	}
 
@@ -186,7 +186,7 @@ func TestUnregisterRequeuesInflightOwners(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 100),
 		PrefetchCount: 100,
 	}
-	if err := broker.RegisterConsumer("rq2", "consumer-b", consumerB); err != nil {
+	if err := registerConsumer(broker, "rq2", "consumer-b", consumerB); err != nil {
 		t.Fatalf("RegisterConsumer B: %v", err)
 	}
 
@@ -225,7 +225,7 @@ func TestUnregisterInflightCounterConsistency(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 50),
 		PrefetchCount: 50,
 	}
-	if err := broker.RegisterConsumer("rq3", "consumer-a", consumerA); err != nil {
+	if err := registerConsumer(broker, "rq3", "consumer-a", consumerA); err != nil {
 		t.Fatalf("RegisterConsumer A: %v", err)
 	}
 
@@ -279,7 +279,7 @@ func TestUnregisterNoDoubleRequeue(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 1),
 		PrefetchCount: 1,
 	}
-	if err := broker.RegisterConsumer("rq4", "consumer-a", consumerA); err != nil {
+	if err := registerConsumer(broker, "rq4", "consumer-a", consumerA); err != nil {
 		t.Fatalf("RegisterConsumer A: %v", err)
 	}
 
@@ -301,7 +301,7 @@ func TestUnregisterNoDoubleRequeue(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 10),
 		PrefetchCount: 10,
 	}
-	if err := broker.RegisterConsumer("rq4", "consumer-b", consumerB); err != nil {
+	if err := registerConsumer(broker, "rq4", "consumer-b", consumerB); err != nil {
 		t.Fatalf("RegisterConsumer B: %v", err)
 	}
 
@@ -338,7 +338,7 @@ func TestUnregisterPollLoopExits(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 10),
 		PrefetchCount: 10,
 	}
-	if err := broker.RegisterConsumer("rq5", "consumer-x", consumer); err != nil {
+	if err := registerConsumer(broker, "rq5", "consumer-x", consumer); err != nil {
 		t.Fatalf("RegisterConsumer: %v", err)
 	}
 
@@ -390,7 +390,7 @@ func TestUnregisterConcurrentAckNoDoubleDecrement(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 50),
 		PrefetchCount: 50,
 	}
-	if err := broker.RegisterConsumer("rq6", "consumer-a", consumerA); err != nil {
+	if err := registerConsumer(broker, "rq6", "consumer-a", consumerA); err != nil {
 		t.Fatalf("RegisterConsumer A: %v", err)
 	}
 
@@ -409,7 +409,7 @@ func TestUnregisterConcurrentAckNoDoubleDecrement(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 50),
 		PrefetchCount: 50,
 	}
-	if err := broker.RegisterConsumer("rq6", "consumer-b", consumerB); err != nil {
+	if err := registerConsumer(broker, "rq6", "consumer-b", consumerB); err != nil {
 		t.Fatalf("RegisterConsumer B: %v", err)
 	}
 
@@ -469,7 +469,7 @@ func TestUnregisterMixedDrainAndInflight(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 100),
 		PrefetchCount: 100,
 	}
-	if err := broker.RegisterConsumer("rq7", "consumer-a", consumerA); err != nil {
+	if err := registerConsumer(broker, "rq7", "consumer-a", consumerA); err != nil {
 		t.Fatalf("RegisterConsumer A: %v", err)
 	}
 
@@ -499,7 +499,7 @@ func TestUnregisterMixedDrainAndInflight(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 100),
 		PrefetchCount: 100,
 	}
-	if err := broker.RegisterConsumer("rq7", "consumer-b", consumerB); err != nil {
+	if err := registerConsumer(broker, "rq7", "consumer-b", consumerB); err != nil {
 		t.Fatalf("RegisterConsumer B: %v", err)
 	}
 

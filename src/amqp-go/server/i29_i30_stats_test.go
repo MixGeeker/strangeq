@@ -163,7 +163,7 @@ func TestThroughputCountersIncrementedOnBatchDelivery(t *testing.T) {
 				Exchange:   "",
 				RoutingKey: "i30-batch-q",
 			},
-			ConsumerTag: "batch-consumer",
+			ConsumerID: "batch-consumer",
 		},
 	}
 

@@ -40,7 +40,7 @@ func TestNoAckConsumerBypassesPrefetchGate(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 256),
 		PrefetchCount: 0, // unlimited per spec when no-ack is set
 	}
-	if err := broker.RegisterConsumer("noack", "noack-consumer", consumer); err != nil {
+	if err := registerConsumer(broker, "noack", "noack-consumer", consumer); err != nil {
 		t.Fatalf("RegisterConsumer: %v", err)
 	}
 
@@ -119,7 +119,7 @@ func TestManualAckConsumerStillGated(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, total),
 		PrefetchCount: prefetch,
 	}
-	if err := broker.RegisterConsumer("manual", "manual-consumer", consumer); err != nil {
+	if err := registerConsumer(broker, "manual", "manual-consumer", consumer); err != nil {
 		t.Fatalf("RegisterConsumer: %v", err)
 	}
 

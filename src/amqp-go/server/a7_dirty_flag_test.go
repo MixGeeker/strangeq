@@ -45,6 +45,7 @@ func TestA7_DirtyFlagGatesRediscovery(t *testing.T) {
 	ch := protocol.NewChannel(1, conn)
 	ch.Mutex.Lock()
 	ch.Consumers["c1"] = &protocol.Consumer{
+		ID:       "c1",
 		Tag:      "c1",
 		Queue:    "q1",
 		Messages: make(chan *protocol.Delivery, 10),
@@ -68,6 +69,7 @@ func TestA7_DirtyFlagGatesRediscovery(t *testing.T) {
 
 	ch.Mutex.Lock()
 	ch.Consumers["c2"] = &protocol.Consumer{
+		ID:       "c2",
 		Tag:      "c2",
 		Queue:    "q2",
 		Messages: make(chan *protocol.Delivery, 10),
@@ -78,7 +80,7 @@ func TestA7_DirtyFlagGatesRediscovery(t *testing.T) {
 	ch.Consumers["c2"].Messages <- &protocol.Delivery{
 		Message:     &protocol.Message{DeliveryTag: 1, Body: []byte("c2-msg"), Exchange: "", RoutingKey: "q2"},
 		DeliveryTag: 1,
-		ConsumerTag: "c2",
+		ConsumerID:  "c2",
 		Exchange:    "",
 		RoutingKey:  "q2",
 	}
@@ -93,7 +95,7 @@ func TestA7_DirtyFlagGatesRediscovery(t *testing.T) {
 	ch.Consumers["c1"].Messages <- &protocol.Delivery{
 		Message:     &protocol.Message{DeliveryTag: 2, Body: []byte("c1-trigger"), Exchange: "", RoutingKey: "q1"},
 		DeliveryTag: 2,
-		ConsumerTag: "c1",
+		ConsumerID:  "c1",
 		Exchange:    "",
 		RoutingKey:  "q1",
 	}
@@ -189,6 +191,7 @@ func TestA7_TimeoutFallbackSelfHeals(t *testing.T) {
 	ch := protocol.NewChannel(1, conn)
 	ch.Mutex.Lock()
 	ch.Consumers["c1"] = &protocol.Consumer{
+		ID:       "c1",
 		Tag:      "c1",
 		Queue:    "q1",
 		Messages: make(chan *protocol.Delivery, 10),
@@ -212,6 +215,7 @@ func TestA7_TimeoutFallbackSelfHeals(t *testing.T) {
 
 	ch.Mutex.Lock()
 	ch.Consumers["c2"] = &protocol.Consumer{
+		ID:       "c2",
 		Tag:      "c2",
 		Queue:    "q2",
 		Messages: make(chan *protocol.Delivery, 10),
@@ -222,7 +226,7 @@ func TestA7_TimeoutFallbackSelfHeals(t *testing.T) {
 	ch.Consumers["c2"].Messages <- &protocol.Delivery{
 		Message:     &protocol.Message{DeliveryTag: 1, Body: []byte("c2-msg"), Exchange: "", RoutingKey: "q2"},
 		DeliveryTag: 1,
-		ConsumerTag: "c2",
+		ConsumerID:  "c2",
 		Exchange:    "",
 		RoutingKey:  "q2",
 	}
@@ -253,6 +257,7 @@ func TestA7_NoAllocationsInSteadyState(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		tag := string(rune('a' + i))
 		ch.Consumers[tag] = &protocol.Consumer{
+			ID:       tag,
 			Tag:      tag,
 			Queue:    "q-" + tag,
 			Messages: make(chan *protocol.Delivery, 10),

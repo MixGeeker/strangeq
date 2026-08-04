@@ -64,7 +64,7 @@ func TestDepthHighWMOverride_LatencyProportional(t *testing.T) {
 			WALBatchTimeoutMS:     5,
 		}
 		store, err := storage.NewDisruptorStorageWithEngineConfig(
-			tmpDir, storage.DefaultCheckpointInterval, ec)
+			tmpDir, ec)
 		require.NoError(t, err)
 		defer store.Close()
 

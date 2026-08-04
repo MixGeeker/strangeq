@@ -173,11 +173,14 @@ func (s *Server) teardownChannel(conn *protocol.Connection, channelID uint16) {
 		_ = channel.FlushAndCloseConfirms(func(uint64, bool) error { return nil })
 	}
 
-	// Cancel all consumers on this channel
+	// Cancel all consumers on this channel. Collected as broker-internal
+	// identities: unregistering by wire tag would tear down whichever
+	// same-tagged consumer registered last on the broker, which may belong to
+	// an entirely different connection.
 	channel.Mutex.Lock()
-	consumerTags := make([]string, 0, len(channel.Consumers))
-	for consumerTag := range channel.Consumers {
-		consumerTags = append(consumerTags, consumerTag)
+	consumerIDs := make([]string, 0, len(channel.Consumers))
+	for _, consumer := range channel.Consumers {
+		consumerIDs = append(consumerIDs, consumer.ID)
 	}
 	channel.Consumers = make(map[string]*protocol.Consumer) // Clear all consumers
 	channel.Closed = true
@@ -185,16 +188,16 @@ func (s *Server) teardownChannel(conn *protocol.Connection, channelID uint16) {
 	conn.ConsumersDirty.Store(true)
 
 	// Unregister consumers from broker (stops poll goroutines)
-	for _, consumerTag := range consumerTags {
-		err := s.Broker.UnregisterConsumer(consumerTag)
+	for _, consumerID := range consumerIDs {
+		err := s.Broker.UnregisterConsumer(consumerID)
 		if err != nil {
 			s.Log.Warn("Failed to unregister consumer on channel close",
-				zap.String("consumer_tag", consumerTag),
+				zap.String("consumer_id", consumerID),
 				zap.Uint16("channel_id", channelID),
 				zap.Error(err))
 		} else {
 			s.Log.Debug("Unregistered consumer on channel close",
-				zap.String("consumer_tag", consumerTag),
+				zap.String("consumer_id", consumerID),
 				zap.Uint16("channel_id", channelID))
 		}
 	}

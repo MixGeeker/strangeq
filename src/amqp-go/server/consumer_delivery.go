@@ -7,16 +7,25 @@ import (
 	"go.uber.org/zap"
 )
 
-// consumerInfo holds cached references for a consumer
+// consumerInfo holds cached references for a consumer, resolved from the
+// broker-internal consumer identity that every Delivery carries.
 type consumerInfo struct {
 	channel *protocol.Channel
+	// tag is the CLIENT-VISIBLE consumer tag to stamp on basic.deliver frames
+	// for this consumer. It is cached here, on the identity-keyed routing
+	// entry, rather than carried on every Delivery: Delivery already carries
+	// the identity it is routed by, so keeping the wire tag here costs one
+	// string per consumer instead of one per message, and the per-delivery
+	// struct is unchanged in size.
+	tag string
 }
 
 // forwardConsumerMessages runs in a per-consumer goroutine, forwarding
 // deliveries from the consumer's Messages channel to the shared fan-in
 // channel. Exits when the Messages channel is closed or stop is signaled.
 // Sends *protocol.Delivery directly (no wrapper) to avoid per-message
-// heap allocations — Delivery.ConsumerTag is used for routing.
+// heap allocations — Delivery.ConsumerID is what the fan-in loop routes by,
+// and the client-visible wire tag is read once per consumer off consumerInfo.tag.
 //
 // Flow control: before forwarding, a single atomic load of channel.FlowActive
 // gates the send. When flow is inactive the goroutine parks on FlowWake until
@@ -48,31 +57,38 @@ func forwardConsumerMessages(channel *protocol.Channel, msgChan chan *protocol.D
 
 // discoverConsumers scans all channels on the connection for consumers,
 // starting forwarder goroutines for new ones and stopping forwarders for
-// consumers that have been removed. The activeTags map is reused across
+// consumers that have been removed. The activeIDs map is reused across
 // calls (cleared in-place) to avoid per-iteration heap allocations.
+//
+// Keyed by the broker-internal consumer identity, NOT the wire tag: a
+// connection may hold two channels whose consumers legitimately present the
+// same tag (AMQP 0-9-1 scopes the tag per channel), and a tag-keyed table
+// collapses them into one entry — one forwarder never started, one consumer's
+// deliveries written to the other's channel.
 func (s *Server) discoverConsumers(
 	conn *protocol.Connection,
 	consumerInfos map[string]*consumerInfo,
 	forwarders map[string]chan struct{},
-	activeTags map[string]struct{},
+	activeIDs map[string]struct{},
 	fanIn chan<- *protocol.Delivery,
 ) {
-	for k := range activeTags {
-		delete(activeTags, k)
+	for k := range activeIDs {
+		delete(activeIDs, k)
 	}
 
 	conn.Channels.Range(func(key, value interface{}) bool {
 		channel := value.(*protocol.Channel)
 		channel.Mutex.RLock()
 		for _, consumer := range channel.Consumers {
-			activeTags[consumer.Tag] = struct{}{}
-			if _, exists := consumerInfos[consumer.Tag]; !exists {
-				consumerInfos[consumer.Tag] = &consumerInfo{channel: channel}
+			activeIDs[consumer.ID] = struct{}{}
+			if _, exists := consumerInfos[consumer.ID]; !exists {
+				consumerInfos[consumer.ID] = &consumerInfo{channel: channel, tag: consumer.Tag}
 				stop := make(chan struct{})
-				forwarders[consumer.Tag] = stop
+				forwarders[consumer.ID] = stop
 				go forwardConsumerMessages(channel, consumer.Messages, fanIn, stop)
 				s.Log.Debug("Started forwarder for consumer",
 					zap.String("consumer_tag", consumer.Tag),
+					zap.String("consumer_id", consumer.ID),
 					zap.String("queue", consumer.Queue))
 			}
 		}
@@ -80,13 +96,13 @@ func (s *Server) discoverConsumers(
 		return true
 	})
 
-	for tag := range consumerInfos {
-		if _, active := activeTags[tag]; !active {
-			close(forwarders[tag])
-			delete(forwarders, tag)
-			delete(consumerInfos, tag)
+	for id := range consumerInfos {
+		if _, active := activeIDs[id]; !active {
+			close(forwarders[id])
+			delete(forwarders, id)
+			delete(consumerInfos, id)
 			s.Log.Debug("Removed stale consumer from delivery loop",
-				zap.String("consumer_tag", tag))
+				zap.String("consumer_id", id))
 		}
 	}
 }
@@ -106,7 +122,7 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection, done chan struc
 
 	consumerInfos := make(map[string]*consumerInfo)
 	forwarders := make(map[string]chan struct{})
-	activeTags := make(map[string]struct{})
+	activeIDs := make(map[string]struct{})
 
 	const fanInBufferSize = 1000
 	fanIn := make(chan *protocol.Delivery, fanInBufferSize)
@@ -124,9 +140,9 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection, done chan struc
 	defer timeout.Stop()
 
 	stopAllForwarders := func() {
-		for tag, stop := range forwarders {
+		for id, stop := range forwarders {
 			close(stop)
-			delete(forwarders, tag)
+			delete(forwarders, id)
 		}
 	}
 	defer stopAllForwarders()
@@ -141,7 +157,7 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection, done chan struc
 		}
 
 		if conn.ConsumersDirty.Swap(false) {
-			s.discoverConsumers(conn, consumerInfos, forwarders, activeTags, fanIn)
+			s.discoverConsumers(conn, consumerInfos, forwarders, activeIDs, fanIn)
 		}
 
 		if len(consumerInfos) == 0 {
@@ -168,7 +184,7 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection, done chan struc
 				return
 			}
 
-			info, exists := consumerInfos[delivery.ConsumerTag]
+			info, exists := consumerInfos[delivery.ConsumerID]
 			if !exists {
 				// Consumer was removed after forwarding — drop the delivery
 				continue
@@ -186,7 +202,7 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection, done chan struc
 					if !ok {
 						break draining
 					}
-					if extra.ConsumerTag == delivery.ConsumerTag {
+					if extra.ConsumerID == delivery.ConsumerID {
 						batch = append(batch, extra)
 					} else {
 						extras = append(extras, extra)
@@ -196,12 +212,13 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection, done chan struc
 				}
 			}
 
-			// Send the batch
-			err := s.sendBatchedDeliveries(conn, info.channel.ID, delivery.ConsumerTag, batch)
+			// Send the batch. The wire tag comes from the routing entry, not
+			// from the delivery: the delivery carries the internal identity.
+			err := s.sendBatchedDeliveries(conn, info.channel.ID, info.tag, batch)
 			if err != nil {
 				s.Log.Error("Failed to send batched deliveries",
 					zap.Error(err),
-					zap.String("consumer_tag", delivery.ConsumerTag),
+					zap.String("consumer_tag", info.tag),
 					zap.Int("batch_size", len(batch)),
 					zap.Int("extras", len(extras)))
 				conn.Closed.Store(true)
@@ -211,15 +228,15 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection, done chan struc
 
 			// Process any extras from other consumers
 			for i, extra := range extras {
-				extraInfo, exists := consumerInfos[extra.ConsumerTag]
+				extraInfo, exists := consumerInfos[extra.ConsumerID]
 				if !exists {
 					continue
 				}
-				err := s.sendBatchedDeliveries(conn, extraInfo.channel.ID, extra.ConsumerTag, []*protocol.Delivery{extra})
+				err := s.sendBatchedDeliveries(conn, extraInfo.channel.ID, extraInfo.tag, []*protocol.Delivery{extra})
 				if err != nil {
 					s.Log.Error("Failed to send batched deliveries",
 						zap.Error(err),
-						zap.String("consumer_tag", extra.ConsumerTag),
+						zap.String("consumer_tag", extraInfo.tag),
 						zap.Int("remaining_extras", len(extras)-i))
 					conn.Closed.Store(true)
 					s.requeueFailedDeliveries(nil, extras[i:])
@@ -239,7 +256,7 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection, done chan struc
 }
 
 // requeueFailedDeliveries requeues batch and extra deliveries after a TCP
-// write error. Each delivery is requeued via RejectMessage(consumerTag,
+// write error. Each delivery is requeued via RejectMessage(consumerID,
 // deliveryTag, true). The deliveryIndex.LoadAndDelete guard in RejectMessage
 // ensures no double-requeue with the connection teardown's UnregisterConsumer
 // cleanup (step 7), which also uses LoadAndDelete on the same index.
@@ -256,14 +273,14 @@ func (s *Server) requeueSingleDelivery(d *protocol.Delivery) {
 	if d == nil {
 		return
 	}
-	consumerTag, ok := s.Broker.GetConsumerForDelivery(d.DeliveryTag)
+	consumerID, ok := s.Broker.GetConsumerForDelivery(d.DeliveryTag)
 	if !ok {
 		return
 	}
-	if err := s.Broker.RejectMessage(consumerTag, d.DeliveryTag, true); err != nil {
+	if err := s.Broker.RejectMessage(consumerID, d.DeliveryTag, true); err != nil {
 		s.Log.Warn("Failed to requeue delivery on write error",
 			zap.Uint64("delivery_tag", d.DeliveryTag),
-			zap.String("consumer_tag", consumerTag),
+			zap.String("consumer_id", consumerID),
 			zap.Error(err))
 	}
 }

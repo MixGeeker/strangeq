@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -299,20 +300,25 @@ func (c *Connection) HasPendingConfirmNacks() bool {
 
 // Channel represents an AMQP channel
 type Channel struct {
-	ID              uint16
-	Connection      *Connection
-	Closed          bool
-	Mutex           sync.RWMutex
-	Consumers       map[string]*Consumer // Consumer tag -> Consumer
-	DeliveryTag     uint64               // Used for delivery tags in acknowledgements
-	PrefetchCount   uint16               // Channel-level prefetch count
-	PrefetchSize    uint32               // Channel-level prefetch size (0 = unlimited)
-	GlobalPrefetch  bool                 // Apply prefetch settings globally
-	CurrentQueue    string               // Last declared queue name (for empty-name resolution per AMQP spec)
-	FlowActive      atomic.Bool          // channel.flow state: true = content frames may be sent
-	FlowWake        chan struct{}        // signaled to wake parked forwarders when flow resumes/closes
-	ConfirmMode     atomic.Bool          // confirm.select state: true = server sends basic.ack for each publish
-	ConfirmSequence atomic.Uint64        // channel-scoped delivery tag sequence for publisher confirms
+	ID         uint16
+	Connection *Connection
+	Closed     bool
+	Mutex      sync.RWMutex
+	// Consumers maps CLIENT-VISIBLE consumer tag -> Consumer, scoped to THIS
+	// channel — which is exactly the scope AMQP 0-9-1 gives the tag, so this
+	// map is the authority on tag uniqueness: a duplicate key here is the
+	// 530 not-allowed case, while the same key on another channel is legal.
+	// Guarded by Mutex.
+	Consumers       map[string]*Consumer
+	DeliveryTag     uint64        // Used for delivery tags in acknowledgements
+	PrefetchCount   uint16        // Channel-level prefetch count
+	PrefetchSize    uint32        // Channel-level prefetch size (0 = unlimited)
+	GlobalPrefetch  bool          // Apply prefetch settings globally
+	CurrentQueue    string        // Last declared queue name (for empty-name resolution per AMQP spec)
+	FlowActive      atomic.Bool   // channel.flow state: true = content frames may be sent
+	FlowWake        chan struct{} // signaled to wake parked forwarders when flow resumes/closes
+	ConfirmMode     atomic.Bool   // confirm.select state: true = server sends basic.ack for each publish
+	ConfirmSequence atomic.Uint64 // channel-scoped delivery tag sequence for publisher confirms
 
 	// SQ-5: publisher-confirm batching state. The per-publish hot path touches
 	// ONLY confirmDurable (a lock-free CAS-max watermark). confirmFlushMu is a
@@ -369,9 +375,14 @@ type Channel struct {
 // wire delivery tag so acknowledgements addressed by wire tag can be routed to
 // the correct msgID-keyed broker settle path.
 type WireDeliveryRef struct {
-	MsgID       uint64
-	ConsumerTag string // "" for a basic.get delivery
-	IsGet       bool
+	MsgID uint64
+	// ConsumerID is the broker-internal consumer identity (Consumer.ID) that
+	// owns the delivery, NOT the client-visible tag: acks are routed by it into
+	// the broker's consumer-keyed ledger, and the tag is only channel-scoped so
+	// it cannot serve as that key. "" for a basic.get delivery, which has no
+	// consumer.
+	ConsumerID string
+	IsGet      bool
 }
 
 // NewChannel creates a new AMQP channel
@@ -610,9 +621,9 @@ func (c *Channel) NextWireTag() uint64 {
 // TrackDelivery records the broker identity behind a wire tag so a later
 // acknowledgement addressed by that wire tag can be translated back to the
 // msgID-keyed broker ledger. Only manual-ack deliveries are tracked.
-func (c *Channel) TrackDelivery(wireTag, msgID uint64, consumerTag string, isGet bool) {
+func (c *Channel) TrackDelivery(wireTag, msgID uint64, consumerID string, isGet bool) {
 	c.wireTagMu.Lock()
-	c.wireTagTable[wireTag] = WireDeliveryRef{MsgID: msgID, ConsumerTag: consumerTag, IsGet: isGet}
+	c.wireTagTable[wireTag] = WireDeliveryRef{MsgID: msgID, ConsumerID: consumerID, IsGet: isGet}
 	c.wireTagMu.Unlock()
 }
 
@@ -664,17 +675,19 @@ type Exchange struct {
 	AutoDelete bool
 	Internal   bool
 	Arguments  map[string]interface{}
-	Bindings   []*Binding // List of bindings to queues
 	Mutex      sync.RWMutex
+	// NO Bindings FIELD. It was declared, copied by Copy(), and never appended
+	// to by anything; its last reader went with RecoveryManager.recoverBindings
+	// in Step 3-fix. Bindings live in the metadata store and are read from
+	// there by the routing path on every publish — see
+	// protocol/durability.go's DurableEntityMetadata for the mechanism. Old
+	// on-disk exchange records carrying a `Bindings` key still decode: cbor's
+	// default DecOptions ignore unknown fields.
 }
 
 // Copy returns a copy of the Exchange without the mutex.
 // This is safe to use when you need to pass Exchange by value.
 func (e *Exchange) Copy() Exchange {
-	// Copy bindings
-	bindingsCopy := make([]*Binding, len(e.Bindings))
-	copy(bindingsCopy, e.Bindings)
-
 	// Copy arguments
 	argsCopy := make(map[string]interface{}, len(e.Arguments))
 	for k, v := range e.Arguments {
@@ -688,17 +701,8 @@ func (e *Exchange) Copy() Exchange {
 		AutoDelete: e.AutoDelete,
 		Internal:   e.Internal,
 		Arguments:  argsCopy,
-		Bindings:   bindingsCopy,
 		// Mutex is intentionally not copied
 	}
-}
-
-// Binding represents a binding between an exchange and a queue
-type Binding struct {
-	Exchange   string
-	Queue      string
-	RoutingKey string
-	Arguments  map[string]interface{}
 }
 
 // Queue represents an AMQP queue using actor model (NO LOCKS!)
@@ -781,8 +785,14 @@ type Delivery struct {
 	Redelivered bool
 	Exchange    string
 	RoutingKey  string
-	ConsumerTag string
-	NoAck       bool // consumer is no-ack: settled at send time, never acked by the client
+	// ConsumerID is the broker-internal consumer identity (Consumer.ID), NOT
+	// the client-visible tag. It routes the delivery through the connection's
+	// fan-in loop to the owning channel, and it is what the wire-tag table
+	// records so a later ack resolves to the right consumer. The tag that goes
+	// on the wire is read from the routing table entry (consumerInfo.tag), so
+	// this struct carries exactly one identity and no extra bytes.
+	ConsumerID string
+	NoAck      bool // consumer is no-ack: settled at send time, never acked by the client
 }
 
 // PendingMessage represents a message in the process of being published
@@ -798,16 +808,34 @@ type PendingMessage struct {
 
 // Consumer represents a message consumer
 type Consumer struct {
-	Tag            string
-	Channel        *Channel
-	Queue          string
-	NoAck          bool
-	Exclusive      bool
-	Args           map[string]interface{}
-	Messages       chan *Delivery
-	Cancel         chan struct{}
-	PrefetchCount  uint16        // Maximum number of unacknowledged messages
-	CurrentUnacked atomic.Uint64 // Current count of unacknowledged messages (atomic for lock-free access)
+	// Tag is the CLIENT-VISIBLE consumer tag: the value the client sent in
+	// basic.consume (or the one the server generated for an empty tag), echoed
+	// in basic.consume-ok, stamped on every basic.deliver, and the only name
+	// basic.cancel may address. AMQP 0-9-1 scopes it PER CHANNEL, so it is NOT
+	// unique broker-wide — two channels may legitimately present the same Tag.
+	// Never use it as a broker map key; use ID.
+	Tag           string
+	Channel       *Channel
+	Queue         string
+	NoAck         bool
+	Exclusive     bool
+	Args          map[string]interface{}
+	Messages      chan *Delivery
+	Cancel        chan struct{}
+	PrefetchCount uint16 // Maximum number of unacknowledged messages
+
+	// ID is the broker-internal consumer identity: an opaque string minted at
+	// registration that is unique for the lifetime of the process. It is the
+	// key for every broker-side map (activeConsumers, the delivery index, the
+	// per-connection delivery-loop routing table, the storage ack cursors) and
+	// it never appears on the wire. It exists because Tag is only
+	// channel-scoped: keying those maps by Tag let a second registration with
+	// the same tag silently overwrite the first, which is how one client's
+	// acks landed on another client's queue.
+	//
+	// Placed LAST deliberately: every preceding field keeps the byte offset it
+	// had before this field existed (see TestConsumerLayout_HotFieldOffsets).
+	ID string
 }
 
 // generateID generates a random ID string
@@ -833,4 +861,42 @@ func GenerateQueueName() string {
 		return fallbackID("amq.gen")
 	}
 	return "amq.gen." + fmt.Sprintf("%x", b)
+}
+
+// GenerateConsumerTag generates a server-assigned, client-visible consumer tag.
+//
+// AMQP 0-9-1 basic.consume, field consumer-tag: "If this field is empty the
+// server will generate a unique tag." RabbitMQ uses the "amq.ctag-" prefix;
+// we follow it for client compatibility. The tag goes on the wire in
+// basic.consume-ok and on every basic.deliver, so it must be a legal shortstr
+// (it is: 9 + 32 ASCII characters).
+//
+// Uniqueness is 128 bits of crypto/rand, but this function does NOT know what
+// tags a channel already holds — the caller must still check for a collision
+// with a client-supplied tag on that channel and re-draw. See
+// (*Server).claimConsumerTag in the server package, which does the draw, the
+// collision check and the insert inside one channel-mutex critical section.
+func GenerateConsumerTag() string {
+	b := make([]byte, 16)
+	_, err := rand.Read(b)
+	if err != nil {
+		return fallbackID("amq.ctag")
+	}
+	return "amq.ctag-" + fmt.Sprintf("%x", b)
+}
+
+// consumerIDSeq backs NewConsumerID. A counter, not a random draw: the value
+// must be unique by construction, and a monotonic counter proves that without
+// relying on entropy quality or on any property of the consumer tag.
+var consumerIDSeq atomic.Uint64
+
+// NewConsumerID mints an opaque broker-internal consumer identity (see
+// Consumer.ID). Unique for the lifetime of the process by construction, and
+// deliberately independent of the client-visible tag, the channel number and
+// the connection ID: nothing may parse it, and no client-controlled bytes are
+// embedded in it, so no client-supplied tag can ever forge or collide with one.
+//
+// Never written to the wire and never persisted with meaning across a restart.
+func NewConsumerID() string {
+	return "cid-" + strconv.FormatUint(consumerIDSeq.Add(1), 36)
 }

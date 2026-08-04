@@ -33,7 +33,6 @@ storage:
   cachemb: 64                      # 64 MB metadata cache
   maxfiles: 100                    # Max open file handles
   retentionms: 86400000            # 24 hours
-  checkpointintervalms: 5000       # 5 seconds
 
 security:
   # Enable TLS in production

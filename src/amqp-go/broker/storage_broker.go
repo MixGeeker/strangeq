@@ -172,12 +172,14 @@ type StorageBroker struct {
 
 	// queueCreateMuByName holds one *sync.Mutex per queue name (LoadOrStore,
 	// same pattern as queueConsumersMu / getQueueConsumersMutex). It backs
-	// FOUR distinct per-name critical sections. The mutex is NOT reentrant and
+	// FIVE distinct per-name critical sections. The mutex is NOT reentrant and
 	// must never be held twice by the same goroutine; within a section, call
-	// createQueueStateLocked, never getOrCreateQueueState. Each section HOLDS
-	// the mutex across its QueueState work rather than unlocking first — see
+	// createQueueStateLocked, never getOrCreateQueueState. Sections 1-4 HOLD
+	// the mutex across their QueueState work rather than unlocking first — see
 	// getQueueCreateMutex's doc comment for why that is the load-bearing
-	// invariant and what breaks if any of them unlocks early:
+	// invariant and what breaks if any of them unlocks early. Section 5 holds
+	// no QueueState at all and takes the mutex only to serialize against
+	// section 4:
 	//
 	//  1. DeclareQueue's new-queue branch: serializes the whole
 	//     check-allocate-persist sequence for a queue's metadata record, so
@@ -208,16 +210,30 @@ type StorageBroker struct {
 	//     before SetOrdinal ran, minting with ordinalBase still at its zero
 	//     value — colliding with ordinal-0's tag space.
 	//
-	//  4. DeleteQueue's teardown span: held from before activeQueues.Delete
-	//     through storage.DeleteQueue (inclusive), so a concurrent
-	//     getOrCreateQueueState cold path cannot observe the metadata record
-	//     after the QueueState has been removed but before the record is
-	//     deleted — a window in which it would reuse the dying queue's
-	//     ordinal without persisting it. Blocking here instead forces that
-	//     concurrent create to wait until the record is genuinely gone and
-	//     allocate a FRESH ordinal. This is a SIBLING critical section to
+	//  4. DeleteQueue's teardown span: held from the incarnation revalidation
+	//     through storage.DeleteQueue (inclusive), so it covers the ring
+	//     purge, the binding sweep and the QueueState removal. Two properties
+	//     depend on that width. First, the revalidated ordinal cannot go stale
+	//     under the caller, because DeclareQueue — the only way a successor
+	//     comes into existence — holds this same mutex across its whole body.
+	//     Second, a concurrent getOrCreateQueueState cold path cannot observe
+	//     the metadata record after the QueueState has been removed but before
+	//     the record is deleted — a window in which it would reuse the dying
+	//     queue's ordinal without persisting it. Blocking here instead forces
+	//     that concurrent create to wait until the record is genuinely gone
+	//     and allocate a FRESH ordinal. This is a SIBLING critical section to
 	//     getQueueConsumersMutex — DeleteQueue releases that mutex before
 	//     acquiring this one — never nested inside it.
+	//
+	//  5. BindQueue's check→store pair: holds the mutex across the
+	//     queue-exists check and StoreBinding, and nothing else. A binding row
+	//     carries no identity to revalidate against, so mutual exclusion
+	//     against section 4's binding sweep is the only mechanism available;
+	//     see BindQueue for what a row that outlives its queue costs. This
+	//     section is the reason a queue.bind can now wait on a concurrent
+	//     first-ever queue.declare of the same name (~18ms, two fsyncs) instead
+	//     of proceeding lock-free. Only the pair is held —
+	//     updateDurableMetadata runs outside it.
 	//
 	// Locking per NAME rather than broker-wide means one queue's first-ever
 	// creation (StoreQueue's atomicWrite fsyncs twice, ~18ms on macOS) never
@@ -238,6 +254,10 @@ type StorageBroker struct {
 	// treated as "no logging" so callers that never wire one pay nothing; the
 	// server builder injects its interfaces.Logger via SetLogger.
 	logger interfaces.Logger
+
+	// initErr carries a construction failure NewStorageBroker's signature
+	// cannot return. See InitError.
+	initErr error
 
 	// ttlNow is the wall clock (Unix milliseconds) used by every SQ-9 TTL time
 	// read — publish stamping, the delivery head-check, the reaper, x-expires,
@@ -286,11 +306,27 @@ func NewStorageBroker(storage interfaces.Storage, engineConfig interfaces.Engine
 		ttlNow:       func() int64 { return time.Now().UnixMilli() },
 	}
 
-	broker.initOrdinalAllocator()
+	broker.initErr = broker.initOrdinalAllocator()
 	broker.initializeDefaultExchanges()
 
 	return broker
 }
+
+// InitError reports a failure that occurred while constructing the broker and
+// that the constructor's signature cannot return.
+//
+// It exists for exactly one fact: initOrdinalAllocator's delivery-tag ordinal
+// high-water mark. That mark is what stops a fresh declare being handed an
+// ordinal whose records are still physically present in the shared WAL, which
+// is a cross-queue delivery-tag collision in a store keyed by a bare uint64.
+// The function used to write `if recoverable, err := ...; err == nil` — so it
+// dropped the WAL-derived half of the mark EXACTLY when the WAL was unreadable,
+// which is precisely the collision its own doc comment exists to prevent.
+//
+// server/builder.go checks this immediately after NewStorageBroker, before
+// recovery runs. NewStorageBroker's own signature is not changed because it has
+// ~20 call sites, almost all of them tests with their own temp directories.
+func (b *StorageBroker) InitError() error { return b.initErr }
 
 // initOrdinalAllocator seeds ordinalAlloc from the highest queue ordinal
 // already persisted (via ListQueues), so a fresh process never reissues an
@@ -315,31 +351,77 @@ func NewStorageBroker(storage interfaces.Storage, engineConfig interfaces.Engine
 // bare-uint64-keyed offsetIndex/ackBitmap. So every recoverable record's own
 // composite-tag ordinal is folded into the high-water mark too, not just
 // live queues' persisted Ordinal fields.
-func (b *StorageBroker) initOrdinalAllocator() {
+//
+// BOUNDARY OF THAT GUARD, stated because it was nearly violated: it is keyed on
+// PHYSICAL PRESENCE of records. Once a dead incarnation's records are reclaimed
+// there is nothing left to fold, and the ordinal is legitimately handed to a
+// brand-new queue — which is correct only while no durable, tag-keyed state
+// survives the records. Today none does; the durable acknowledgement snapshot
+// that would have been the first such state was withdrawn, in part because this
+// fold only sees DeliveryMode==2 records, so a non-durable queue that spilled
+// and acked transient messages left no ordinal trace at all and its whole acked
+// tag band would have been inherited by whichever new queue got its ordinal.
+// Any future durable state keyed by delivery tag must be attributed to the
+// RECORD it refers to rather than to the tag value, or a reused ordinal
+// destroys the new queue's confirmed messages. See
+// .notes/loop-2/deferred-ack-durability.md.
+// STEP 3 — BOTH READS NOW PROPAGATE THEIR ERRORS. Each used to be wrapped in
+// `if ..., err := ...; err == nil`, which silently produced a high-water mark
+// of 0 in exactly the situations that make the mark matter: an unreadable
+// queue-metadata directory, or an unreadable WAL. The GetRecoverableMessages
+// case is the sharper one — it dropped the WAL-derived mark precisely when the
+// WAL could not be read, i.e. when nothing else could vouch for which ordinals
+// are in use. Whatever partial inventory came back is still folded in before
+// the error is returned, and the mark is stored even on the error path, so the
+// allocator is never LESS informed than it was.
+func (b *StorageBroker) initOrdinalAllocator() error {
 	var maxOrdinal uint64
+	var faults []error
 
-	if queues, err := b.storage.ListQueues(); err == nil {
-		for _, q := range queues {
-			if q.Ordinal > maxOrdinal {
-				maxOrdinal = q.Ordinal
-			}
+	queues, qerr := b.storage.ListQueues()
+	for _, q := range queues {
+		if q.Ordinal > maxOrdinal {
+			maxOrdinal = q.Ordinal
+		}
+	}
+	if qerr != nil {
+		// Pass a classified error straight through: the storage layer knows the
+		// absolute path of the directory it failed to read and this package
+		// does not. Only an UNCLASSIFIED error (a storage implementation that
+		// does not classify) is wrapped here, and it names no path rather than
+		// naming a relative one — review-3 H-3.
+		if len(interfaces.FaultsOf(qerr)) > 0 {
+			faults = append(faults, qerr)
+		} else {
+			faults = append(faults, interfaces.FatalFault("ordinal-allocator", "the queue metadata store",
+				"the queue metadata records could not be listed, so the delivery-tag ordinal high-water mark cannot be established",
+				"a newly declared queue may be handed an ordinal whose records are still on disk, colliding with them in a WAL keyed by a bare delivery tag",
+				qerr))
 		}
 	}
 
-	if recoverable, err := b.storage.GetRecoverableMessages(); err == nil {
-		for _, messages := range recoverable {
-			for _, m := range messages {
-				if m.DeliveryMode != 2 {
-					continue
-				}
-				if ord := TagOrdinal(m.DeliveryTag); ord > maxOrdinal {
-					maxOrdinal = ord
-				}
+	recoverable, rerr := b.storage.GetRecoverableMessages()
+	for _, messages := range recoverable {
+		for _, m := range messages {
+			if m.DeliveryMode != 2 {
+				continue
+			}
+			if ord := TagOrdinal(m.DeliveryTag); ord > maxOrdinal {
+				maxOrdinal = ord
 			}
 		}
 	}
+	if rerr != nil {
+		faults = append(faults, rerr)
+	}
 
+	// Store BEFORE returning: a partial mark is strictly safer than zero.
 	b.ordinalAlloc.Store(maxOrdinal)
+
+	if len(faults) == 0 {
+		return nil
+	}
+	return errors.Join(faults...)
 }
 
 // allocateOrdinal hands out the next composite-tag queue ordinal
@@ -374,34 +456,48 @@ func (b *StorageBroker) allocateOrdinal() (uint64, error) {
 // That caller holds getQueueCreateMutex for the queue name, so there is no
 // concurrent-allocation race for it.
 //
-// Persistence failure is tolerated (best-effort): a freshly allocated ordinal
-// is always new and unique, so a failed write here cannot cause a collision —
-// worst case the queue re-allocates a different, still-safe ordinal on next
-// restart — but it is logged loudly rather than silently swallowed, since a
-// lost ordinal write is exactly the shape of bug this mechanism prevents.
-func (b *StorageBroker) resolveQueueOrdinal(existing *protocol.Queue) uint64 {
+// PERSISTENCE FAILURE IS FATAL TO THE DECLARE, and the comment that used to
+// sit here saying otherwise was false. It read:
+//
+//	"Persistence failure is tolerated (best-effort): a freshly allocated
+//	 ordinal is always new and unique, so a failed write here cannot cause a
+//	 collision — worst case the queue re-allocates a different, still-safe
+//	 ordinal on next restart"
+//
+// The moment a message is CONFIRMED under the unpersisted ordinal, the next
+// restart reads the record back with Ordinal==0, recovery takes Case D, and
+// ErrLegacyDataDirectory makes the broker refuse to boot — permanently, until
+// an operator destroys the data directory. The tolerated failure was not
+// "re-allocate on next restart"; it was "brick the broker", written down as
+// reassurance. The behaviour is fixed here, not the comment.
+//
+// It also no longer panics on ordinal-space exhaustion. That was the only panic
+// reachable while a per-name create mutex was held with a bare Lock/Unlock, and
+// the OTHER allocation site (DeclareQueue) already returned a clean error for
+// the identical condition. The caller turns either error into a CLOSED queue
+// state, so publishes are refused rather than confirmed and then discarded.
+func (b *StorageBroker) resolveQueueOrdinal(existing *protocol.Queue) (uint64, error) {
 	if existing.Ordinal != 0 {
-		return existing.Ordinal
+		return existing.Ordinal, nil
 	}
 
 	ordinal, aerr := b.allocateOrdinal()
 	if aerr != nil {
-		// Unreachable in any real deployment (see tag_packing.go); a silent
-		// wrap here would be cross-queue delivery-tag collision, so fail as
-		// loudly as possible instead of returning a value the caller could
-		// mistake for a valid ordinal. NOTE: this is the only panic reachable
-		// while a per-name create mutex is held with a bare Lock/Unlock. It is
-		// safe today only because nothing in server/ or broker/ recovers from
-		// a panic, so the process dies rather than leaving that name wedged —
-		// adding per-connection panic recovery would make the wedge real.
-		panic(aerr)
+		return 0, aerr
 	}
 
 	// existing is storage's SHARED CACHED POINTER (see
-	// PersistentMetadataStore.GetQueue/loadQueueFromDisk) — every other
-	// concurrent GetQueue caller (DeclareQueue, DeleteQueue, BindQueue, none
-	// of which hold this lock) reads the same object, so it must never be
-	// mutated in place. Clone before setting the ordinal. Field-by-field (not
+	// PersistentMetadataStore.GetQueue/loadQueueFromDisk) — concurrent GetQueue
+	// callers read the SAME object, so it must never be mutated in place.
+	//
+	// Do not weaken this to "the callers are serialized now": DeclareQueue,
+	// deleteQueueIncarnation and BindQueue do all hold this queue's create
+	// mutex across their GetQueue, but eight other call sites do NOT — grep
+	// b.storage.GetQueue / metadata GetQueue — and one of them is in
+	// server/recovery_manager.go, a different package. Serialization of some
+	// readers is not a licence to mutate a pointer the rest still share.
+	//
+	// Clone before setting the ordinal. Field-by-field (not
 	// `cp := *existing`): protocol.Queue embeds an atomic.Uint64
 	// (MessageCount), which must not be copied by value (go vet: "assignment
 	// copies lock value") — round-trip its value through Load/Store instead.
@@ -416,14 +512,12 @@ func (b *StorageBroker) resolveQueueOrdinal(existing *protocol.Queue) uint64 {
 		Ordinal:     ordinal,
 	}
 	cp.MessageCount.Store(existing.MessageCount.Load())
-	if serr := b.storage.StoreQueue(&cp); serr != nil && b.logger != nil {
-		b.logger.Warn("failed to persist resolved queue ordinal; queue will re-resolve on next restart",
-			interfaces.LogField{Key: "queue", Value: existing.Name},
-			interfaces.LogField{Key: "ordinal", Value: ordinal},
-			interfaces.LogField{Key: "error", Value: serr})
+	if serr := b.storage.StoreQueue(&cp); serr != nil {
+		return 0, fmt.Errorf("failed to persist delivery-tag ordinal %d for queue %q: %w",
+			ordinal, existing.Name, serr)
 	}
 
-	return ordinal
+	return ordinal, nil
 }
 
 // ttlNowMillis returns the current wall clock in Unix milliseconds through the
@@ -588,8 +682,10 @@ func (b *StorageBroker) SetLogger(l interfaces.Logger) {
 	b.logger = l
 }
 
-func (b *StorageBroker) UpdateConsumerPrefetch(consumerTag string, prefetchCount uint16) {
-	val, ok := b.activeConsumers.Load(consumerTag)
+// UpdateConsumerPrefetch re-gates one consumer, addressed by its
+// broker-internal identity (Consumer.ID).
+func (b *StorageBroker) UpdateConsumerPrefetch(consumerID string, prefetchCount uint16) {
+	val, ok := b.activeConsumers.Load(consumerID)
 	if !ok {
 		return
 	}
@@ -675,9 +771,10 @@ func (b *StorageBroker) getQueueConsumersMutex(queueName string) *sync.Mutex {
 // one name. Same LoadOrStore-one-mutex-per-key pattern as
 // getQueueConsumersMutex above.
 //
-// FOUR acquirers, all of which HOLD IT ACROSS the QueueState work rather than
+// FIVE acquirers. The first four HOLD IT ACROSS the QueueState work rather than
 // unlocking first — that is the invariant, and it is the opposite of what this
-// comment said before the C1 fixes:
+// comment said before the C1 fixes. The fifth, BindQueue, holds no QueueState
+// and takes it purely to serialize against the fourth:
 //   - getOrCreateQueueState — cold-path creation; defer-unlocks, so it is held
 //     across createQueueStateLocked.
 //   - DeclareQueue, existing-queue branch — re-reads the record under the lock
@@ -687,8 +784,16 @@ func (b *StorageBroker) getQueueConsumersMutex(queueName string) *sync.Mutex {
 //   - DeclareQueue, new-queue branch — holds it across the
 //     ordinal-allocate-then-persist sequence AND the activeQueues.Store plus
 //     createQueueStateLocked pair, unlocking only after the state is published.
-//   - DeleteQueue's teardown — holds it from activeQueues.Delete through
-//     storage.DeleteQueue inclusive.
+//   - deleteQueueIncarnation's teardown — holds it from the incarnation
+//     revalidation (its first act under the lock) through storage.DeleteQueue
+//     inclusive, so every destructive step runs under the ordinal that was
+//     validated, and the validation cannot go stale beneath them. That span
+//     includes the binding sweep, which is what BindQueue below serializes
+//     against.
+//   - BindQueue — holds it across its queue-exists check and StoreBinding, so
+//     a binding cannot be written for a queue whose teardown has already swept
+//     its bindings. Held only across that pair, not across
+//     updateDurableMetadata.
 //
 // WHY they hold rather than unlock: a delete landing between "validate the
 // record" and "create the state" produced a live, publishable, record-less
@@ -853,8 +958,26 @@ func (b *StorageBroker) createQueueStateLocked(queueName string) *QueueState {
 	// The record read above is handed straight to resolveQueueOrdinal: it is
 	// the same record that decision needs, and re-reading it there would be
 	// both redundant and a second chance to observe a different value.
+	ordinal, oerr := b.resolveQueueOrdinal(record)
+	if oerr != nil {
+		// Same safe direction as the unreadable-record branch above, and for a
+		// stronger reason: a live QueueState whose ordinal was never persisted
+		// confirms durable publishes that the NEXT restart reads back with
+		// Ordinal==0, which is recovery Case D — a permanent refusal to boot.
+		// Refusing the publish now costs a retry; accepting it bricks the
+		// broker later.
+		if b.logger != nil {
+			b.logger.Error("could not resolve a delivery-tag ordinal for queue; refusing to create queue state (publishes will be refused)",
+				interfaces.LogField{Key: "queue", Value: queueName},
+				interfaces.LogField{Key: "error", Value: oerr})
+		}
+		dead := NewQueueState(b.computeDepthHighWM())
+		dead.Close()
+		return dead
+	}
+
 	newState := NewQueueState(b.computeDepthHighWM())
-	newState.SetOrdinal(b.resolveQueueOrdinal(record))
+	newState.SetOrdinal(ordinal)
 	b.queueStates.Store(queueName, newState)
 	return newState
 }
@@ -934,7 +1057,9 @@ func (b *StorageBroker) consumerPollLoop(state *ConsumerState, queueState *Queue
 //   - Stores the deliveryIndex ledger entry — the settle() key that every
 //     terminal transition claims via LoadAndDelete, the credit-exactness
 //     invariant's source of truth, AND the per-consumer ownership record that
-//     consumer-cancel cleanup scans (deliveryIndex maps tag -> consumer tag).
+//     consumer-cancel cleanup scans (deliveryIndex maps msgID -> Consumer.ID,
+//     the broker-internal consumer identity — NOT the client-visible tag,
+//     which is only channel-scoped and so cannot key a broker map).
 //   - Claims queue-depth inflight (waiting-1, inflight+1).
 //   - For manual-ack ONLY: marks the tag delivered on the AckCursor (OnDeliver,
 //     which multi-ack enumerates) and stores its pending ack. No-ack deliveries
@@ -945,14 +1070,14 @@ func (b *StorageBroker) consumerPollLoop(state *ConsumerState, queueState *Queue
 // does not touch it. It runs only after GetMessage has succeeded, so a gap tag
 // never reaches here (its reserved credit is released tagless in deliverMessage).
 func (b *StorageBroker) deliver(queueState *QueueState, state *ConsumerState, msgID uint64, redelivered bool) {
-	b.deliveryIndex.Store(msgID, state.consumer.Tag)
+	b.deliveryIndex.Store(msgID, state.consumer.ID)
 	queueState.ClaimInflight(msgID)
 	if !state.consumer.NoAck {
-		b.storage.DeliverToConsumer(state.queueName, state.consumer.Tag, msgID)
+		b.storage.DeliverToConsumer(state.queueName, state.consumer.ID, msgID)
 		b.storage.StorePendingAck(&protocol.PendingAck{
 			QueueName:   state.queueName,
 			DeliveryTag: msgID,
-			ConsumerTag: state.consumer.Tag,
+			ConsumerTag: state.consumer.ID,
 			Redelivered: redelivered,
 		})
 	}
@@ -996,7 +1121,7 @@ func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerSt
 		Redelivered: redelivered,
 		Exchange:    message.Exchange,
 		RoutingKey:  message.RoutingKey,
-		ConsumerTag: state.consumer.Tag,
+		ConsumerID:  state.consumer.ID,
 		NoAck:       noAck,
 	}
 
@@ -1044,7 +1169,7 @@ func (b *StorageBroker) deliverMessage(queueState *QueueState, state *ConsumerSt
 		// finishNack's manual-ack cursor / pending-ack cleanup is a harmless
 		// no-op for a no-ack delivery (which recorded neither).
 		if _, won := b.settle(msgID); won {
-			b.finishNack(queueState, state.queueName, state.consumer.Tag, msgID, true)
+			b.finishNack(queueState, state.queueName, state.consumer.ID, msgID, true)
 		}
 	}
 }
@@ -1112,8 +1237,8 @@ func (b *StorageBroker) dropExpiredOnGet(qs *QueueState, queueName string, msg *
 // releasing the prefetch gate (no-ack deliveries hold no gate credit). Shared
 // by the manual single-message ack path and the no-ack implicit-ack path so the
 // two stay in lockstep.
-func (b *StorageBroker) ackDelivered(queueState *QueueState, queueName, consumerTag string, deliveryTag uint64) {
-	b.finishAck(queueState, queueName, consumerTag, deliveryTag)
+func (b *StorageBroker) ackDelivered(queueState *QueueState, queueName, consumerID string, deliveryTag uint64) {
+	b.finishAck(queueState, queueName, consumerID, deliveryTag)
 	queueState.SetMinAckCursor(b.storage.GetMinAckCursor(queueName))
 }
 
@@ -1125,10 +1250,10 @@ func (b *StorageBroker) ackDelivered(queueState *QueueState, queueName, consumer
 // sync it once (per-ack for single ack via ackDelivered, once-after-the-loop for
 // multi-ack) to keep the O(consumers) recompute off the per-tag path. The tag
 // must already have been claimed via settle().
-func (b *StorageBroker) finishAck(queueState *QueueState, queueName, consumerTag string, deliveryTag uint64) {
+func (b *StorageBroker) finishAck(queueState *QueueState, queueName, consumerID string, deliveryTag uint64) {
 	b.storage.DeleteMessage(queueName, deliveryTag)
 	b.storage.DeletePendingAck(queueName, deliveryTag)
-	b.storage.AckFromConsumer(queueName, consumerTag, deliveryTag)
+	b.storage.AckFromConsumer(queueName, consumerID, deliveryTag)
 	queueState.AckAdvance(deliveryTag)
 }
 
@@ -1140,8 +1265,8 @@ func (b *StorageBroker) finishAck(queueState *QueueState, queueName, consumerTag
 // finishAck it does NOT release the prefetch gate (settle() owns that) and does
 // NOT sync the min-ack cursor. The tag must already have been claimed via
 // settle().
-func (b *StorageBroker) finishNack(queueState *QueueState, queueName, consumerTag string, deliveryTag uint64, requeue bool) {
-	b.storage.NackFromConsumer(queueName, consumerTag, deliveryTag)
+func (b *StorageBroker) finishNack(queueState *QueueState, queueName, consumerID string, deliveryTag uint64, requeue bool) {
+	b.storage.NackFromConsumer(queueName, consumerID, deliveryTag)
 	b.storage.DeletePendingAck(queueName, deliveryTag)
 	if requeue {
 		// SQ-11: the message re-enters the ready set — restore its bytes when
@@ -1196,7 +1321,7 @@ func (b *StorageBroker) deadLetterOnDiscard(queueState *QueueState, queueName st
 // A single Policy() load is hoisted before the loop (the hot-path zero-cost
 // contract for multi-nack). The gate-credit release still funnels through
 // settle() exactly once per tag.
-func (b *StorageBroker) discardNackedBatch(queueState *QueueState, queueName, consumerTag string, tags []uint64, upTo uint64) {
+func (b *StorageBroker) discardNackedBatch(queueState *QueueState, queueName, consumerID string, tags []uint64, upTo uint64) {
 	p := queueState.Policy()
 	if p == nil || !p.HasDeadLetterExchange {
 		// No dead-lettering: discard inline in a single pass — no fan-out, no
@@ -1209,7 +1334,7 @@ func (b *StorageBroker) discardNackedBatch(queueState *QueueState, queueName, co
 			if _, won := b.settle(tag); !won {
 				continue
 			}
-			b.storage.NackFromConsumer(queueName, consumerTag, tag)
+			b.storage.NackFromConsumer(queueName, consumerID, tag)
 			b.storage.DeletePendingAck(queueName, tag)
 			b.storage.DeleteMessage(queueName, tag)
 			queueState.AckAdvance(tag)
@@ -1233,7 +1358,7 @@ func (b *StorageBroker) discardNackedBatch(queueState *QueueState, queueName, co
 		if _, won := b.settle(tag); !won {
 			continue
 		}
-		b.storage.NackFromConsumer(queueName, consumerTag, tag)
+		b.storage.NackFromConsumer(queueName, consumerID, tag)
 		b.storage.DeletePendingAck(queueName, tag)
 		if msg, err := b.storage.GetMessage(queueName, tag); err == nil && msg != nil {
 			wg.Add(1)
@@ -1561,16 +1686,51 @@ func (b *StorageBroker) declareExistingQueueLocked(existing *protocol.Queue, dur
 	return existing, nil
 }
 
-// DeleteQueue removes a queue
+// DeleteQueue removes a queue. It captures the identity (Ordinal) of the
+// incarnation that currently holds `name` and delegates to
+// deleteQueueIncarnation; see that function's doc comment for why the
+// teardown is scoped to an incarnation rather than to the bare name.
+//
+// Note for callers holding an identity captured EARLIER: calling THIS function
+// re-resolves the identity fresh, right here, which defeats exactly the
+// protection those callers need against acting on a stale name. They must call
+// deleteQueueIncarnation directly with their own previously-captured ordinal.
+// Two such callers were converted — the reaper's idle decision
+// (broker/queue_reaper.go) and the last-consumer-cancel auto-delete in this
+// file. That list is NOT exhaustive and must not be read as a closed set: at
+// least one more survives unconverted, server.handleConnectionClose's
+// exclusive-queue teardown (server/server.go), which captures a list of names
+// and then deletes them one at a time by name. It is pre-existing rather than
+// introduced here, and is on the Step 6 backlog.
+//
+// Client-visible semantic, since no other comment says it: because the capture
+// here is outside the create mutex and the revalidation is inside it, a
+// delete+redeclare landing in that gap makes this function a silent no-op —
+// it returns (0, nil) and the caller replies delete-ok while a queue of that
+// name still exists. That is the correct safety trade, but queue.delete is no
+// longer guaranteed to have deleted anything.
 func (b *StorageBroker) DeleteQueue(name string, ifUnused, ifEmpty bool) (int, error) {
-	_, err := b.storage.GetQueue(name)
+	record, err := b.storage.GetQueue(name)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrQueueNotFound) {
 			return 0, nil
 		}
 		return 0, err
 	}
+	return b.deleteQueueIncarnation(name, record.Ordinal, ifUnused, ifEmpty)
+}
 
+// deleteQueueIncarnation tears down the queue incarnation identified by
+// (name, wantOrdinal) — never just "whatever currently answers to name".
+// DeleteQueue destroys the metadata record, the ring and the bindings, so
+// acting on a successor incarnation (one that took the same name after a
+// delete+redeclare race) would annihilate a live queue whose durable
+// publishes were already confirmed. See H1/H2 in the Step 6 teardown-identity
+// design: Queue.Ordinal is a per-incarnation identity (monotone, never reused
+// within a run — allocateOrdinal), so pairing every destructive call with the
+// ordinal its caller actually intends to destroy is what makes a stale
+// caller's delete a safe no-op instead of a silent cross-incarnation strand.
+func (b *StorageBroker) deleteQueueIncarnation(name string, wantOrdinal uint64, ifUnused, ifEmpty bool) (int, error) {
 	if ifUnused {
 		consumers, err := b.storage.GetQueueConsumers(name)
 		if err != nil {
@@ -1591,6 +1751,24 @@ func (b *StorageBroker) DeleteQueue(name string, ifUnused, ifEmpty bool) (int, e
 		}
 	}
 
+	// The consumer sweep runs BEFORE the incarnation is revalidated, and is
+	// deliberately left that way.
+	//
+	// Stated precisely, because the accurate reason and the convenient one
+	// differ: the leaf rule FORBIDS nesting the consumers mutex under the
+	// create mutex (see getQueueCreateMutex), and that rule exists so the
+	// ordering stays trivially acyclic without anyone re-deriving it. It is not
+	// that a cycle exists today — no consumers-mutex holder currently acquires
+	// the create mutex, so the nesting would deadlock nothing right now. It is
+	// that re-deriving a lock order is exactly the kind of change that must not
+	// ride along inside a correctness fix. A second unsynchronized check ahead
+	// of the sweep was tried and removed instead: it narrows the window without
+	// closing it, and no test can attribute it.
+	//
+	// So a superseded caller still stops the successor's consumers on its way
+	// to being refused. That is disruption, not loss: the successor's confirmed
+	// messages and its dispatch cursors are untouched, and consumers reconnect.
+	// Unchanged from before this fix; logged as a follow-up.
 	mu := b.getQueueConsumersMutex(name)
 	mu.Lock()
 	if val, ok := b.queueConsumers.Load(name); ok {
@@ -1598,13 +1776,58 @@ func (b *StorageBroker) DeleteQueue(name string, ifUnused, ifEmpty bool) (int, e
 		for _, state := range consumers {
 			state.gate.stop()
 			state.stopOnce.Do(func() { close(state.stopCh) })
-			b.activeConsumers.Delete(state.consumer.Tag)
+			b.activeConsumers.Delete(state.consumer.ID)
 		}
 	}
 	b.queueConsumers.Delete(name)
 	mu.Unlock()
 
-	purgedCount, _ := b.storage.PurgeQueue(name)
+	// Hold the per-name create mutex across EVERY destructive step, and
+	// revalidate the incarnation as the first thing under it.
+	//
+	// The lock is what makes the check load-bearing rather than another TOCTOU:
+	// a successor can only come into existence through DeclareQueue, which
+	// holds this same mutex across its whole body, so no redeclare can
+	// interleave between the check and the last destructive step below. Without
+	// the lock, two concurrent deletes both capturing ordinal N would both
+	// validate N and both proceed, and the loser would run its teardown by name
+	// against the N+1 that a redeclare had meanwhile installed.
+	//
+	// It is also what closes the older, narrower window this span was
+	// originally opened for: a concurrent getOrCreateQueueState cold path
+	// observing the metadata record AFTER the QueueState has been removed but
+	// BEFORE the record is deleted would reuse the dying queue's ordinal
+	// without persisting it, leaving a live publishable queue with no metadata
+	// record — whose durable publishes are confirmed and then discarded at the
+	// next restart as a deleted queue.
+	cmu := b.getQueueCreateMutex(name)
+	cmu.Lock()
+	defer cmu.Unlock()
+
+	record, err := b.storage.GetQueue(name)
+	if err != nil {
+		if errors.Is(err, interfaces.ErrQueueNotFound) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if record.Ordinal != wantOrdinal {
+		return 0, nil
+	}
+
+	// The purge band comes from wantOrdinal, not from a name lookup: it is a
+	// total function of the identity this call was given, so it cannot resolve
+	// to a successor's ring even if every assumption above were wrong.
+	//
+	// Defence-in-depth, and no test attributes it HERE: storage.DeleteQueue
+	// four lines below drops the whole ring anyway, so widening this band to
+	// the entire tag space leaves the suite green (measured). What the M2
+	// mutation arm reddens on is a COUNT — DeleteQueue must return the number
+	// purged — which proves the band is a live function of wantOrdinal, not
+	// that band-scoping prevents anything at this call site. The band that
+	// carries the safety property is purgeIncarnation's, on the client-facing
+	// queue.purge path.
+	purgedCount, _ := b.storage.PurgeQueue(name, PackTag(wantOrdinal, 0), PackTag(wantOrdinal, SeqMask))
 
 	bindings, err := b.storage.GetQueueBindings(name)
 	if err == nil {
@@ -1613,31 +1836,31 @@ func (b *StorageBroker) DeleteQueue(name string, ifUnused, ifEmpty bool) (int, e
 		}
 	}
 
+	// Persisted-consumer sweep. The live consumers were already stopped and
+	// removed above; this covers records in the metadata store. Keyed by
+	// Consumer.ID, matching how RegisterConsumer stored them.
+	//
+	// NOTE, verified not assumed: with the current metadata store this loop
+	// never executes. PersistentMetadataStore.StoreConsumer is a documented
+	// no-op ("Consumer registration is ephemeral"), so nothing ever writes the
+	// consumers/<queue>/ directory that GetQueueConsumers reads, and it always
+	// returns an empty slice. The same fact silently disables the ifUnused
+	// check at the top of this function. That is a pre-existing defect wider
+	// than this change and is logged as a follow-up rather than fixed here.
 	consumers, err := b.storage.GetQueueConsumers(name)
 	if err == nil {
 		for _, consumer := range consumers {
-			b.storage.DeleteConsumer(name, consumer.Tag)
-			b.activeConsumers.Delete(consumer.Tag)
+			b.storage.DeleteConsumer(name, consumer.ID)
+			b.activeConsumers.Delete(consumer.ID)
 		}
 	}
 
-	// Hold the per-name create mutex across the teardown so a concurrent
-	// getOrCreateQueueState cold path cannot observe the metadata record
-	// AFTER the QueueState has been removed but BEFORE the record is
-	// deleted. In that window resolveQueueOrdinal would reuse the dying
-	// queue's ordinal without persisting it, leaving a live publishable
-	// queue with no metadata record — whose durable publishes are confirmed
-	// and then discarded at the next restart as a deleted queue.
-	cmu := b.getQueueCreateMutex(name)
-	cmu.Lock()
 	b.activeQueues.Delete(name)
 	b.queueOwners.Delete(name)
 	if qval, qok := b.queueStates.LoadAndDelete(name); qok {
 		qval.(*QueueState).Close()
 	}
-	err = b.storage.DeleteQueue(name)
-	cmu.Unlock()
-	if err != nil {
+	if err := b.storage.DeleteQueue(name); err != nil {
 		return purgedCount, err
 	}
 	return purgedCount, nil
@@ -1654,17 +1877,38 @@ func (b *StorageBroker) BindQueue(queueName, exchangeName, routingKey string, ar
 		return err
 	}
 
-	// Validate queue exists (lock-free)
-	_, err = b.storage.GetQueue(queueName)
-	if err != nil {
+	// Validate the queue exists and store the binding under the queue's create
+	// mutex, so the check and the store observe the same incarnation.
+	//
+	// A binding row carries no identity of its own to revalidate against — it
+	// is name-keyed by construction and dies with the queue — so mutual
+	// exclusion is the only available mechanism here. Lock-free, a delete
+	// landing between the two lines left a binding row addressed to a queue
+	// that no longer exists: deleteQueueIncarnation's binding sweep runs inside
+	// this same mutex, so it had already passed by the time StoreBinding wrote.
+	// No later delete of that name removes the row.
+	//
+	// That row is an availability defect, not accounting residue. A publish is
+	// all-or-nothing across its routed target set — PublishMessage returns
+	// ErrQueueClosed for the WHOLE publish as soon as any one routed target's
+	// QueueState is closed — so one ghost row permanently poisons its
+	// (exchange, routing key) for every healthy queue bound to it.
+	//
+	// Only the check→store pair is held. updateDurableMetadata below re-reads
+	// the whole queue and exchange lists and rewrites the metadata file; it
+	// needs no incarnation guarantee, and holding this mutex across it would
+	// serialize every declare of this name behind a full metadata rewrite.
+	cmu := b.getQueueCreateMutex(queueName)
+	cmu.Lock()
+	if _, err = b.storage.GetQueue(queueName); err != nil {
+		cmu.Unlock()
 		if errors.Is(err, interfaces.ErrQueueNotFound) {
 			return fmt.Errorf("queue '%s' not found", queueName)
 		}
 		return err
 	}
-
-	// Create binding
 	err = b.storage.StoreBinding(queueName, exchangeName, routingKey, arguments)
+	cmu.Unlock()
 	if err != nil {
 		return err
 	}
@@ -1785,8 +2029,34 @@ func (b *StorageBroker) reachableFrom(current, target string, visited map[string
 	return false
 }
 
-// RegisterConsumer registers a new consumer for a queue
-func (b *StorageBroker) RegisterConsumer(queueName, consumerTag string, consumer *protocol.Consumer) error {
+// RegisterConsumer registers a new consumer for a queue under the
+// broker-internal consumer identity consumerID (see protocol.Consumer.ID) —
+// NOT under the client-visible consumer tag, which AMQP 0-9-1 scopes per
+// channel and which two clients may therefore legitimately share.
+//
+// consumerID must equal consumer.ID: there is then exactly one identity in play
+// and every downstream map (activeConsumers, deliveryIndex, the storage ack
+// cursors, the connection's delivery-routing table) is keyed by the same string.
+// Disagreement is a programming error and is rejected rather than silently
+// registering under two names.
+//
+// This function NEVER WRITES to *consumer. By the time the server calls it the
+// consumer has already been published into channel.Consumers, where the
+// connection's delivery loop reads consumer.ID under the channel mutex — a
+// mutating fallback here would be a write to a shared struct outside that
+// mutex. It was previously safe only because the branch happened to be dead on
+// the server path, which is safety by accident. Callers that used to rely on
+// the fallback (broker unit tests registering under a bare tag) set consumer.ID
+// themselves; see registerConsumer in this package's tests.
+func (b *StorageBroker) RegisterConsumer(queueName, consumerID string, consumer *protocol.Consumer) error {
+	if consumerID == "" {
+		return errors.New("consumer identity must not be empty")
+	}
+	if consumer.ID != consumerID {
+		return fmt.Errorf("consumer identity mismatch: registering as %q but consumer.ID is %q",
+			consumerID, consumer.ID)
+	}
+
 	_, err := b.storage.GetQueue(queueName)
 	if err != nil {
 		if errors.Is(err, interfaces.ErrQueueNotFound) {
@@ -1821,6 +2091,24 @@ func (b *StorageBroker) RegisterConsumer(queueName, consumerTag string, consumer
 	}
 	mu.Unlock()
 
+	// Persist BEFORE publishing any in-memory state. Everything below this
+	// point — the ConsumerState, activeConsumers, the ack cursor, the
+	// queueConsumers entry, the poll-loop goroutine — is unconditional and
+	// cannot fail, so this is the last place registration can go wrong, and
+	// failing here leaves nothing behind to clean up.
+	//
+	// The persist used to run LAST, after the goroutine was already spawned, so
+	// an error returned a partially registered consumer: a live poll loop, a
+	// ConsumerState in activeConsumers, a registered ack cursor and a
+	// queueConsumers entry, none of which any caller could see to undo. That
+	// was latent rather than live only because every StoreConsumer
+	// implementation is currently a documented no-op returning nil — a
+	// correctness bug held harmless by dead code. Ordering it write-ahead
+	// removes the failure window instead of compensating for it after the fact.
+	if err := b.storage.StoreConsumer(queueName, consumerID, consumer); err != nil {
+		return fmt.Errorf("failed to store consumer: %w", err)
+	}
+
 	queueState := b.getOrCreateQueueState(queueName)
 
 	// W4 SQ-9: registering a consumer is queue "use" — it resets the x-expires
@@ -1854,9 +2142,9 @@ func (b *StorageBroker) RegisterConsumer(queueName, consumerTag string, consumer
 	}
 	state.bypassGate.Store(consumer.NoAck)
 
-	b.activeConsumers.Store(consumerTag, state)
+	b.activeConsumers.Store(consumerID, state)
 
-	b.storage.RegisterConsumerCursor(queueName, consumerTag)
+	b.storage.RegisterConsumerCursor(queueName, consumerID)
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -1866,11 +2154,6 @@ func (b *StorageBroker) RegisterConsumer(queueName, consumerTag string, consumer
 	b.queueConsumers.Store(queueName, consumers)
 
 	go b.consumerPollLoop(state, queueState)
-
-	err = b.storage.StoreConsumer(queueName, consumerTag, consumer)
-	if err != nil {
-		return fmt.Errorf("failed to store consumer: %w", err)
-	}
 
 	return nil
 }
@@ -1882,9 +2165,13 @@ func (b *StorageBroker) RegisterConsumer(queueName, consumerTag string, consumer
 // orphaned: the deliveryIndex would still map their tags, the QueueState
 // inflight counter would still count them, and pendingAck records would
 // persist in storage — but no one would ever ACK or requeue them.
-func (b *StorageBroker) UnregisterConsumer(consumerTag string) error {
+// The consumer is addressed by its broker-internal identity (Consumer.ID), not
+// by its client-visible tag: the tag is channel-scoped, so cancelling by tag
+// would tear down whichever same-tagged consumer happened to be registered last
+// — one connection's basic.cancel killing another connection's consumer.
+func (b *StorageBroker) UnregisterConsumer(consumerID string) error {
 	// Load consumer state (lock-free)
-	val, ok := b.activeConsumers.Load(consumerTag)
+	val, ok := b.activeConsumers.Load(consumerID)
 	if !ok {
 		return errors.New("consumer not found")
 	}
@@ -1915,7 +2202,7 @@ func (b *StorageBroker) UnregisterConsumer(consumerTag string) error {
 	//    LoadAndDelete for the same reason). Only one side wins the
 	//    LoadAndDelete; the other sees !loaded and skips — no double
 	//    decrement of the inflight counter, no double requeue.
-	b.activeConsumers.Delete(consumerTag)
+	b.activeConsumers.Delete(consumerID)
 
 	// 6. Drain consumer.Messages — these are deliveries that were buffered
 	//    in the channel but not yet pulled by the server's forwarder
@@ -1945,13 +2232,13 @@ drainComplete:
 	//    (pulled by the server's forwarder goroutine, sitting in the fanIn
 	//    channel buffer, or already sent to the client over TCP) but were never
 	//    ACKed. Without this scan, they would be permanently orphaned. The
-	//    deliveryIndex maps tag -> consumer tag and is the single ownership
+	//    deliveryIndex maps msgID -> Consumer.ID and is the single ownership
 	//    record (step 5 deleted the duplicate QueueState.inflightOwners map).
 	//    Messages already claimed by deliverMessage's stopCh path, the drain
 	//    above, or a concurrent ack are gone from the ledger (LoadAndDelete), so
 	//    requeueInflightDelivery's own LoadAndDelete guard makes this a no-op for
 	//    them — no double-requeue. basic.get deliveries carry an empty consumer
-	//    tag and are correctly skipped by the consumer-tag filter. Tags are
+	//    identity and are correctly skipped by the identity filter. Tags are
 	//    collected first so the requeue's LoadAndDelete does not mutate the map
 	//    mid-Range.
 	//
@@ -1959,7 +2246,7 @@ drainComplete:
 	//    because consumer cancellation is a rare event.
 	var orphanedTags []uint64
 	b.deliveryIndex.Range(func(key, value interface{}) bool {
-		if value.(string) == consumerTag {
+		if value.(string) == consumerID {
 			orphanedTags = append(orphanedTags, key.(uint64))
 		}
 		return true
@@ -1973,7 +2260,7 @@ drainComplete:
 	//    this were done before the requeue, minAckCursor would jump forward
 	//    past the consumer's unacked tags, making the queue appear emptier
 	//    than it actually is and potentially failing to apply backpressure.
-	b.storage.UnregisterConsumerCursor(state.queueName, consumerTag)
+	b.storage.UnregisterConsumerCursor(state.queueName, consumerID)
 
 	mu := b.getQueueConsumersMutex(state.queueName)
 	mu.Lock()
@@ -1982,7 +2269,7 @@ drainComplete:
 		consumers := val.([]*ConsumerState)
 		newConsumers := make([]*ConsumerState, 0, len(consumers)-1)
 		for _, c := range consumers {
-			if c.consumer.Tag != consumerTag {
+			if c.consumer.ID != consumerID {
 				newConsumers = append(newConsumers, c)
 			}
 		}
@@ -1996,12 +2283,33 @@ drainComplete:
 	mu.Unlock()
 
 	if lastConsumer {
+		// Scoped to the incarnation whose AutoDelete flag was just read, for the
+		// same reason as the reaper's idle delete (broker/queue_reaper.go): the
+		// decision to delete is made from `q`, and a queue.declare landing
+		// between that read and the delete would otherwise destroy a successor
+		// that never lost a consumer, along with any durable publishes the
+		// broker had already confirmed on it.
+		//
+		// GATED, both ways. Passing the WRONG ordinal reddens
+		// TestAutoDeleteQueueDeletedWhenLastConsumerLeaves; reverting this line
+		// to DeleteQueue(name) reddens
+		// TestLastConsumerAutoDeleteCannotDeleteSuccessor
+		// (broker/autodelete_incarnation_test.go), 5 of 5 under -race.
+		//
+		// That fixture exists because the window here cannot be reached by
+		// racing: the capture and the act are two adjacent calls, so landing a
+		// delete+redeclare between them means completing ~4 metadata fsyncs
+		// inside a gap of microseconds — measured at 0 detections in 200
+		// iterations under -race and 200 without. It is reached by VALUE
+		// instead, poisoning the capture through a test-only storage
+		// decorator. Unreachable by timing is not the same as ungatable, and
+		// an earlier version of this comment conflated the two.
 		if q, err := b.storage.GetQueue(state.queueName); err == nil && q.AutoDelete {
-			b.DeleteQueue(state.queueName, false, false)
+			b.deleteQueueIncarnation(state.queueName, q.Ordinal, false, false)
 		}
 	}
 
-	err := b.storage.DeleteConsumer(state.queueName, consumerTag)
+	err := b.storage.DeleteConsumer(state.queueName, consumerID)
 	if err != nil && !errors.Is(err, interfaces.ErrConsumerNotFound) {
 		return err
 	}
@@ -3217,13 +3525,18 @@ func (b *StorageBroker) GetExchanges() map[string]*protocol.Exchange {
 	return result
 }
 
-// GetConsumers returns all active consumers (for management interface)
+// GetConsumers returns all active consumers (for management interface), keyed
+// by their broker-internal identity (Consumer.ID). It is keyed by identity and
+// not by consumer tag because tags are only channel-scoped: keying by tag would
+// silently collapse two legitimately-same-tagged consumers into one entry and
+// under-report the consumer count. Each value's Tag field carries the
+// client-visible tag for display.
 func (b *StorageBroker) GetConsumers() map[string]*protocol.Consumer {
 	result := make(map[string]*protocol.Consumer)
 	b.activeConsumers.Range(func(key, value interface{}) bool {
-		tag := key.(string)
+		consumerID := key.(string)
 		state := value.(*ConsumerState)
-		result[tag] = state.consumer
+		result[consumerID] = state.consumer
 		return true
 	})
 
@@ -3263,17 +3576,26 @@ func (b *StorageBroker) GetQueueReadyCount(queueName string) uint32 {
 	return uint32(ready)
 }
 
-func (b *StorageBroker) GetQueueConsumerTags(queueName string) []string {
+// GetQueueConsumerIDs returns the broker-internal identities (Consumer.ID) of
+// every consumer currently attached to a queue.
+//
+// Identities, not tags: the caller (queue.delete's consumer-cancel notification)
+// has to find each consumer's channel across every open connection, and a bare
+// tag does not identify one — the same tag may legitimately be in use on other
+// channels, so a tag-keyed search cancels whichever consumer it happens to find
+// first. The wire tag to put in the basic.cancel is read off the consumer that
+// the identity resolves to.
+func (b *StorageBroker) GetQueueConsumerIDs(queueName string) []string {
 	mu := b.getQueueConsumersMutex(queueName)
 	mu.Lock()
 	defer mu.Unlock()
 	if val, ok := b.queueConsumers.Load(queueName); ok {
 		consumers := val.([]*ConsumerState)
-		tags := make([]string, 0, len(consumers))
+		ids := make([]string, 0, len(consumers))
 		for _, state := range consumers {
-			tags = append(tags, state.consumer.Tag)
+			ids = append(ids, state.consumer.ID)
 		}
-		return tags
+		return ids
 	}
 	return nil
 }
@@ -3292,32 +3614,10 @@ func (b *StorageBroker) updateDurableMetadata() error {
 		return err
 	}
 
-	// Collect all bindings from storage
-	allBindings := []protocol.Binding{}
-	for _, exchange := range exchanges {
-		if exchange.Durable {
-			bindings, err := b.storage.GetExchangeBindings(exchange.Name)
-			if err != nil {
-				continue // Skip this exchange if we can't get its bindings
-			}
-			// Convert from QueueBinding to Binding
-			for _, queueBinding := range bindings {
-				binding := protocol.Binding{
-					Exchange:   queueBinding.ExchangeName,
-					Queue:      queueBinding.QueueName,
-					RoutingKey: queueBinding.RoutingKey,
-					Arguments:  queueBinding.Arguments,
-				}
-				allBindings = append(allBindings, binding)
-			}
-		}
-	}
-
 	// Create metadata structure
 	metadata := &protocol.DurableEntityMetadata{
 		Exchanges:   []*protocol.Exchange{},
 		Queues:      []*protocol.Queue{},
-		Bindings:    allBindings,
 		LastUpdated: time.Now(),
 	}
 
@@ -3342,9 +3642,13 @@ func (b *StorageBroker) updateDurableMetadata() error {
 
 // Compatibility methods matching the original broker interface
 
-// AcknowledgeMessage handles message acknowledgment (lock-free hot path)
-func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint64, multiple bool) error {
-	val, ok := b.activeConsumers.Load(consumerTag)
+// AcknowledgeMessage handles message acknowledgment (lock-free hot path).
+// consumerID is the broker-internal consumer identity (Consumer.ID) recorded
+// on the delivery when it was sent; the hot path is a single string-keyed
+// sync.Map load, exactly as it was when this map was (incorrectly) keyed by
+// the channel-scoped consumer tag.
+func (b *StorageBroker) AcknowledgeMessage(consumerID string, deliveryTag uint64, multiple bool) error {
+	val, ok := b.activeConsumers.Load(consumerID)
 	if !ok {
 		return nil
 	}
@@ -3365,7 +3669,7 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 		// runs before the channel send, and deliveries to one consumer are FIFO,
 		// so any tag the client could have received (and thus multi-acked) is
 		// present here.
-		tags, _ := b.storage.GetUnackedTags(state.queueName, consumerTag)
+		tags, _ := b.storage.GetUnackedTags(state.queueName, consumerID)
 		for _, tag := range tags {
 			if tag > deliveryTag {
 				continue
@@ -3373,7 +3677,7 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 			if _, won := b.settle(tag); !won {
 				continue
 			}
-			b.finishAck(queueState, state.queueName, consumerTag, tag)
+			b.finishAck(queueState, state.queueName, consumerID, tag)
 		}
 		queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
 	} else {
@@ -3387,16 +3691,17 @@ func (b *StorageBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint6
 		// Delete the message, clear its pending ack, notify the AckCursor,
 		// sync the min-ack cursor for backpressure, and advance the depth
 		// frontier (may jump minAckCursor to head if the queue drained).
-		b.ackDelivered(queueState, state.queueName, state.consumer.Tag, deliveryTag)
+		b.ackDelivered(queueState, state.queueName, state.consumer.ID, deliveryTag)
 	}
 
 	// Done - polling loop will acquire permit and pull next message
 	return nil
 }
 
-// RejectMessage handles message rejection (lock-free hot path)
-func (b *StorageBroker) RejectMessage(consumerTag string, deliveryTag uint64, requeue bool) error {
-	val, ok := b.activeConsumers.Load(consumerTag)
+// RejectMessage handles message rejection (lock-free hot path). consumerID is
+// the broker-internal consumer identity (Consumer.ID).
+func (b *StorageBroker) RejectMessage(consumerID string, deliveryTag uint64, requeue bool) error {
+	val, ok := b.activeConsumers.Load(consumerID)
 	if !ok {
 		return nil
 	}
@@ -3410,14 +3715,15 @@ func (b *StorageBroker) RejectMessage(consumerTag string, deliveryTag uint64, re
 	if _, won := b.settle(deliveryTag); !won {
 		return nil
 	}
-	b.finishNack(queueState, state.queueName, state.consumer.Tag, deliveryTag, requeue)
+	b.finishNack(queueState, state.queueName, state.consumer.ID, deliveryTag, requeue)
 
 	return nil
 }
 
-// NacknowledgeMessage handles negative acknowledgment (lock-free hot path)
-func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint64, multiple, requeue bool) error {
-	val, ok := b.activeConsumers.Load(consumerTag)
+// NacknowledgeMessage handles negative acknowledgment (lock-free hot path).
+// consumerID is the broker-internal consumer identity (Consumer.ID).
+func (b *StorageBroker) NacknowledgeMessage(consumerID string, deliveryTag uint64, multiple, requeue bool) error {
+	val, ok := b.activeConsumers.Load(consumerID)
 	if !ok {
 		return nil
 	}
@@ -3431,7 +3737,7 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 		// mirroring multi-ack (design §3): every tag <= deliveryTag is claimed
 		// via settle() (its LoadAndDelete win is the one gate-credit release),
 		// then requeued or discarded. No separately-computed release count.
-		tags, _ := b.storage.GetUnackedTags(state.queueName, consumerTag)
+		tags, _ := b.storage.GetUnackedTags(state.queueName, consumerID)
 		if requeue {
 			// Requeue is in-memory and DLX-free; the per-tag finishNack path is
 			// cheap. (Its requeue==false branch, and its Policy() load, are never
@@ -3443,13 +3749,13 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 				if _, won := b.settle(tag); !won {
 					continue
 				}
-				b.finishNack(queueState, state.queueName, consumerTag, tag, true)
+				b.finishNack(queueState, state.queueName, consumerID, tag, true)
 			}
 		} else {
 			// requeue==false discard: batch the DLX republishes so we do not
 			// serialize N synchronous WAL group-commit fsyncs on this frame
 			// goroutine (a real latency cliff). One Policy() load is hoisted.
-			b.discardNackedBatch(queueState, state.queueName, consumerTag, tags, deliveryTag)
+			b.discardNackedBatch(queueState, state.queueName, consumerID, tags, deliveryTag)
 		}
 		queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
 	} else {
@@ -3459,13 +3765,14 @@ func (b *StorageBroker) NacknowledgeMessage(consumerTag string, deliveryTag uint
 		if _, won := b.settle(deliveryTag); !won {
 			return nil
 		}
-		b.finishNack(queueState, state.queueName, state.consumer.Tag, deliveryTag, requeue)
+		b.finishNack(queueState, state.queueName, state.consumer.ID, deliveryTag, requeue)
 	}
 
 	return nil
 }
 
-// GetConsumerForDelivery returns the consumer tag for a given delivery tag
+// GetConsumerForDelivery returns the broker-internal consumer identity
+// (Consumer.ID) that owns a given delivery tag, or "" for a basic.get delivery.
 // This provides O(1) lookup for ACK routing using globally unique delivery tags.
 func (b *StorageBroker) GetConsumerForDelivery(deliveryTag uint64) (string, bool) {
 	val, ok := b.deliveryIndex.Load(deliveryTag)
@@ -3475,9 +3782,12 @@ func (b *StorageBroker) GetConsumerForDelivery(deliveryTag uint64) (string, bool
 	return val.(string), true
 }
 
-// RebuildDeliveryIndex rebuilds a single delivery index entry (used during crash recovery)
-func (b *StorageBroker) RebuildDeliveryIndex(deliveryTag uint64, consumerTag string) {
-	b.deliveryIndex.Store(deliveryTag, consumerTag)
+// RebuildDeliveryIndex rebuilds a single delivery index entry (used during crash
+// recovery). consumerID is the identity recorded on the pending-ack record; no
+// consumer by that identity exists after a restart, so the entry exists only so
+// the tag is claimable for requeue.
+func (b *StorageBroker) RebuildDeliveryIndex(deliveryTag uint64, consumerID string) {
+	b.deliveryIndex.Store(deliveryTag, consumerID)
 }
 
 // RecoverQueue initializes a queue's dispatch cursor from the recovered
@@ -3523,7 +3833,8 @@ func (b *StorageBroker) RecoverQueue(queueName string, minTag, maxTag, count uin
 // GetMessageForGet attempts to synchronously retrieve the next message from a
 // queue for a basic.get operation. If no message is available, returns
 // (nil, 0, 0, nil). When noAck is false, the delivery is tracked for
-// ack/nack/reject using an empty consumer tag ("") in the deliveryIndex.
+// ack/nack/reject using an empty consumer identity ("") in the deliveryIndex
+// — basic.get has no consumer, so it owns no Consumer.ID.
 // Returns the message, its delivery tag, the remaining message count, and any
 // error.
 func (b *StorageBroker) GetMessageForGet(queueName string, noAck bool) (*protocol.Message, uint64, uint32, error) {
@@ -3651,32 +3962,70 @@ func (b *StorageBroker) GetMessageForGet(queueName string, noAck bool) (*protoco
 
 // PurgeQueue removes all waiting messages from a queue while keeping the
 // queue itself and its bindings intact. Returns the number of messages purged.
+//
+// It resolves the queue name to an incarnation EXACTLY ONCE and hands that
+// incarnation to purgeIncarnation. HEAD resolved the name three times over
+// (storage ring lookup, then queueStates lookup) with nothing serializing them,
+// so a concurrent delete+redeclare could apply the ring purge to one
+// incarnation and the cursor reset to its successor — stranding the
+// successor's already-confirmed durable messages as undispatchable while they
+// sat intact on disk.
 func (b *StorageBroker) PurgeQueue(name string) (int, error) {
-	count, err := b.storage.PurgeQueue(name)
+	return b.purgeIncarnation(name, b.getOrCreateQueueState(name))
+}
+
+// purgeIncarnation applies a purge to the ONE incarnation it is handed. Every
+// effect below derives from qs; `name` survives only because the storage layer
+// is name-addressed, and it is paired with qs's tag band so that resolving to a
+// successor's ring removes nothing rather than the wrong thing.
+//
+// The closed check must precede TagBand: a dead QueueState (see
+// createQueueStateLocked) never had SetOrdinal called, so its band is ordinal
+// zero's — reserved, never allocated, and not this queue's.
+//
+// DELIBERATE BEHAVIOUR CHANGE, and it is a regression in one respect. The
+// replaced AtomicRing.Purge() wiped every slot; this clears only the live
+// incarnation's band. A ring resident whose tag lies OUTSIDE that band — see
+// TagBand's doc for how one gets there, via B-2's deferred republish race —
+// was already unclaimable before this change, but it used to be cleaned up by
+// any queue.purge. Now nothing removes it: no purge this queue can ever issue
+// covers that band, and GetQueueMessageCount keeps counting it, so
+// queue.delete(if-empty) on that queue is refused PERMANENTLY and its reported
+// message_count never returns to zero.
+//
+// Accepted rather than fixed here, because the alternatives are worse in scope:
+// widening the band back reopens exactly the cross-incarnation wipe this fix
+// exists to prevent, and the clean fix is to stop out-of-band tags being
+// stored at all — B-2's republish half, which is a dead-letter-path change
+// with its own step. Tracked on the Step 6 backlog. If it needs closing sooner
+// than that, the shape is E-2's: take getQueueCreateMutex(name), revalidate
+// the incarnation under it, and then wipe the whole ring — correct, and it
+// costs queue.purge a lock it does not currently take.
+func (b *StorageBroker) purgeIncarnation(name string, qs *QueueState) (int, error) {
+	if qs.closed.Load() {
+		return 0, interfaces.ErrQueueNotFound
+	}
+	minTag, maxTag := qs.TagBand()
+	count, err := b.storage.PurgeQueue(name, minTag, maxTag)
 	if err != nil {
 		return 0, err
 	}
-
-	if val, ok := b.queueStates.Load(name); ok {
-		qs := val.(*QueueState)
-		qs.tail.Store(qs.head.Load())
-		qs.waiting.Store(0)
-		qs.inflight.Store(0)
-		qs.readyBytes.Store(0) // SQ-11: purge clears the ready-bytes counter
-		qs.requeueMu.Lock()
-		qs.requeueBuf = make([]requeueEntry, requeueInitialCap)
-		qs.requeueHead = 0
-		qs.requeueLen = 0
-		qs.requeueCount.Store(0)
-		qs.requeueMu.Unlock()
-		qs.WakeAll()
-	}
-
+	qs.tail.Store(qs.head.Load())
+	qs.waiting.Store(0)
+	qs.inflight.Store(0)
+	qs.readyBytes.Store(0) // SQ-11: purge clears the ready-bytes counter
+	qs.requeueMu.Lock()
+	qs.requeueBuf = make([]requeueEntry, requeueInitialCap)
+	qs.requeueHead = 0
+	qs.requeueLen = 0
+	qs.requeueCount.Store(0)
+	qs.requeueMu.Unlock()
+	qs.WakeAll()
 	return count, nil
 }
 
 // AcknowledgeGetDelivery handles acknowledgment of a basic.get delivery
-// (identified by an empty consumer tag in the deliveryIndex).
+// (identified by an empty consumer identity in the deliveryIndex).
 func (b *StorageBroker) AcknowledgeGetDelivery(deliveryTag uint64) error {
 	if _, loaded := b.deliveryIndex.LoadAndDelete(deliveryTag); !loaded {
 		return nil
@@ -3737,8 +4086,9 @@ func (b *StorageBroker) NackGetDelivery(deliveryTag uint64, requeue bool) error 
 // for the given consumer. This is used by basic.recover to redeliver
 // unacked messages. The requeued messages become available for delivery
 // to any consumer on the same queue (including the original consumer).
-func (b *StorageBroker) RequeueAllForConsumer(consumerTag string) error {
-	val, ok := b.activeConsumers.Load(consumerTag)
+// consumerID is the broker-internal consumer identity (Consumer.ID).
+func (b *StorageBroker) RequeueAllForConsumer(consumerID string) error {
+	val, ok := b.activeConsumers.Load(consumerID)
 	if !ok {
 		return nil
 	}
@@ -3751,12 +4101,12 @@ func (b *StorageBroker) RequeueAllForConsumer(consumerTag string) error {
 	// LoadAndDelete guard and the one gate-credit release per tag; finishNack
 	// with requeue=true removes each tag from the AckCursor unacked set (so a
 	// later redelivery's OnDeliver re-adds it cleanly) before requeuing it.
-	tags, _ := b.storage.GetUnackedTags(state.queueName, consumerTag)
+	tags, _ := b.storage.GetUnackedTags(state.queueName, consumerID)
 	for _, tag := range tags {
 		if _, won := b.settle(tag); !won {
 			continue
 		}
-		b.finishNack(queueState, state.queueName, consumerTag, tag, true)
+		b.finishNack(queueState, state.queueName, consumerID, tag, true)
 	}
 
 	queueState.SetMinAckCursor(b.storage.GetMinAckCursor(state.queueName))
@@ -3765,7 +4115,7 @@ func (b *StorageBroker) RequeueAllForConsumer(consumerTag string) error {
 }
 
 // RequeueAllGetDeliveries requeues all in-flight basic.get deliveries
-// (identified by empty consumer tag). Called during connection close
+// (identified by an empty consumer identity). Called during connection close
 // to prevent messages from being permanently orphaned when a client
 // disconnects without acking basic.get deliveries.
 func (b *StorageBroker) RequeueAllGetDeliveries() {

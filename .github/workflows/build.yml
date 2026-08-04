@@ -41,8 +41,7 @@ jobs:
       - name: Run tests
         run: |
           cd src/amqp-go
-          # Exclude examples directory from tests (contains multiple main() functions)
-          go list ./... | grep -v '/examples' | xargs go test -v -race -coverprofile=coverage.out -covermode=atomic
+          go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4

@@ -24,7 +24,7 @@ func main() {
 	metricsCollector := metrics.NewCollector("amqp")
 
 	// Create metrics HTTP server (port 9419 - standard AMQP exporter port)
-	metricsServer := metrics.NewServer(9419)
+	metricsServer := metrics.NewServer(9419, false)
 
 	// Start metrics server in background
 	go func() {
@@ -35,10 +35,15 @@ func main() {
 		}
 	}()
 
-	// Create AMQP server
-	amqpServer := server.NewServer(cfg.Network.Address)
-	amqpServer.Config = cfg
-	amqpServer.MetricsCollector = metricsCollector
+	// Create AMQP server. Build() can REFUSE on an unrecoverable data
+	// directory; that error must reach the operator, not be swallowed.
+	amqpServer, err := server.NewServerBuilder().
+		WithConfig(cfg).
+		WithMetrics(metricsCollector).
+		Build()
+	if err != nil {
+		log.Fatal("Failed to build server:", err)
+	}
 
 	// Start background goroutine to update server uptime
 	ctx, cancel := context.WithCancel(context.Background())

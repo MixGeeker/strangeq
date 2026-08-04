@@ -71,7 +71,7 @@ func TestDepthPark_SkipsConnectionWithConsumer(t *testing.T) {
 
 	ch := protocol.NewChannel(1, conn)
 	ch.Mutex.Lock()
-	ch.Consumers["c-1"] = &protocol.Consumer{Tag: "c-1"}
+	ch.Consumers["c-1"] = &protocol.Consumer{ID: "c-1", Tag: "c-1"}
 	ch.Mutex.Unlock()
 	conn.Channels.Store(uint16(1), ch)
 
@@ -263,7 +263,7 @@ func TestDepthWiring_DoesNotArmForConnectionWithConsumer(t *testing.T) {
 	ch := sq5Setup(t, srv, conn, frameCh, "bp-consumer-q")
 
 	ch.Mutex.Lock()
-	ch.Consumers["cons-1"] = &protocol.Consumer{Tag: "cons-1"}
+	ch.Consumers["cons-1"] = &protocol.Consumer{ID: "cons-1", Tag: "cons-1"}
 	ch.Mutex.Unlock()
 	conn.Channels.Store(uint16(1), ch)
 

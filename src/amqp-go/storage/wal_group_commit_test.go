@@ -207,7 +207,7 @@ func TestDisruptorStorage_SpillPathNotBatchTimeoutBound(t *testing.T) {
 		WALBatchSize:          1000,
 		WALBatchTimeoutMS:     1000, // pre-fix: 1s per spilled message
 	}
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), DefaultCheckpointInterval, ec)
+	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), ec)
 	if err != nil {
 		t.Fatalf("NewDisruptorStorageWithEngineConfig: %v", err)
 	}

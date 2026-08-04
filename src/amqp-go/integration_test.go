@@ -2,9 +2,7 @@ package main
 
 import (
 	"testing"
-	"time"
 
-	"github.com/maxpert/amqp-go/server"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/stretchr/testify/assert"
 )
@@ -12,13 +10,8 @@ import (
 // TestConnectionAndChannel tests basic connection and channel functionality
 func TestConnectionAndChannel(t *testing.T) {
 	// Start a server in a goroutine
-	srv := server.NewServer(":5680") // Use a different port to avoid conflicts
-	go func() {
-		_ = srv.Start()
-	}()
-
-	// Give the server a moment to start
-	time.Sleep(200 * time.Millisecond)
+	srv := newIsolatedTestServer(t, isolatedTestConfig(t, ":5680")) // Use a different port to avoid conflicts
+	waitForListening(t, srv)
 
 	// Connect using the standard AMQP client
 	conn, err := amqp.Dial("amqp://guest:guest@localhost:5680//") // Note: vhost is specified as "/" after the double slash
@@ -42,13 +35,8 @@ func TestConnectionAndChannel(t *testing.T) {
 // TestExchangeOperations tests exchange operations using the standard AMQP client
 func TestExchangeOperations(t *testing.T) {
 	// Start a server in a goroutine
-	srv := server.NewServer(":5681") // Use a different port
-	go func() {
-		_ = srv.Start()
-	}()
-
-	// Give the server a moment to start
-	time.Sleep(200 * time.Millisecond)
+	srv := newIsolatedTestServer(t, isolatedTestConfig(t, ":5681")) // Use a different port
+	waitForListening(t, srv)
 
 	// Connect using the standard AMQP client
 	conn, err := amqp.Dial("amqp://guest:guest@localhost:5681//")
@@ -83,13 +71,8 @@ func TestExchangeOperations(t *testing.T) {
 // TestQueueOperations tests queue operations using the standard AMQP client
 func TestQueueOperations(t *testing.T) {
 	// Start a server in a goroutine
-	srv := server.NewServer(":5682") // Use a different port
-	go func() {
-		_ = srv.Start()
-	}()
-
-	// Give the server a moment to start
-	time.Sleep(200 * time.Millisecond)
+	srv := newIsolatedTestServer(t, isolatedTestConfig(t, ":5682")) // Use a different port
+	waitForListening(t, srv)
 
 	// Connect using the standard AMQP client
 	conn, err := amqp.Dial("amqp://guest:guest@localhost:5682//")
@@ -125,13 +108,8 @@ func TestQueueOperations(t *testing.T) {
 // TestQueueBinding tests queue binding operations
 func TestQueueBinding(t *testing.T) {
 	// Start a server in a goroutine
-	srv := server.NewServer(":5683") // Use a different port
-	go func() {
-		_ = srv.Start()
-	}()
-
-	// Give the server a moment to start
-	time.Sleep(200 * time.Millisecond)
+	srv := newIsolatedTestServer(t, isolatedTestConfig(t, ":5683")) // Use a different port
+	waitForListening(t, srv)
 
 	// Connect using the standard AMQP client
 	conn, err := amqp.Dial("amqp://guest:guest@localhost:5683//")

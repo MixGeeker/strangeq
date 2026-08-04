@@ -65,7 +65,7 @@ func TestFrontierFlip_TxSibling_NoStrand(t *testing.T) {
 		}
 	}()
 	cons := &protocol.Consumer{Tag: "c", Queue: qname, NoAck: true, Messages: msgs}
-	require.NoError(t, b.RegisterConsumer(qname, "c", cons))
+	require.NoError(t, registerConsumer(b, qname, "c", cons))
 
 	var deferred []func(bool)
 	txMsg := &protocol.Message{RoutingKey: qname, Body: []byte("t"), DeliveryMode: 1}
@@ -131,7 +131,7 @@ func TestFrontierFlip_TxAbort_ReleasesFrontierSlot(t *testing.T) {
 		}
 	}()
 	cons := &protocol.Consumer{Tag: "c", Queue: qname, NoAck: true, Messages: msgs}
-	require.NoError(t, b.RegisterConsumer(qname, "c", cons))
+	require.NoError(t, registerConsumer(b, qname, "c", cons))
 
 	var deferred []func(bool)
 	txMsg := &protocol.Message{RoutingKey: qname, Body: []byte("t"), DeliveryMode: 1}

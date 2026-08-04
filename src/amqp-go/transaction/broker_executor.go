@@ -22,9 +22,9 @@ type txPublishBroker interface {
 // UnifiedBrokerExecutorInterface defines interface for unified brokers that can act as transaction executors
 type UnifiedBrokerExecutorInterface interface {
 	PublishMessage(exchangeName, routingKey string, message *protocol.Message) error
-	AcknowledgeMessage(consumerTag string, deliveryTag uint64, multiple bool) error
-	RejectMessage(consumerTag string, deliveryTag uint64, requeue bool) error
-	NacknowledgeMessage(consumerTag string, deliveryTag uint64, multiple, requeue bool) error
+	AcknowledgeMessage(consumerID string, deliveryTag uint64, multiple bool) error
+	RejectMessage(consumerID string, deliveryTag uint64, requeue bool) error
+	NacknowledgeMessage(consumerID string, deliveryTag uint64, multiple, requeue bool) error
 	AcknowledgeGetDelivery(deliveryTag uint64) error
 	RejectGetDelivery(deliveryTag uint64, requeue bool) error
 	NackGetDelivery(deliveryTag uint64, requeue bool) error
@@ -68,37 +68,37 @@ func (ube *UnifiedBrokerExecutor) ExecutePublishStaged(txnStore interfaces.Stora
 }
 
 // ExecuteAck executes a message acknowledgment operation
-func (ube *UnifiedBrokerExecutor) ExecuteAck(consumerTag string, deliveryTag uint64, multiple bool) error {
+func (ube *UnifiedBrokerExecutor) ExecuteAck(consumerID string, deliveryTag uint64, multiple bool) error {
 	if ube.broker == nil {
 		return fmt.Errorf("no unified broker available for executing ack")
 	}
 
-	if consumerTag == "" {
+	if consumerID == "" {
 		return ube.broker.AcknowledgeGetDelivery(deliveryTag)
 	}
-	return ube.broker.AcknowledgeMessage(consumerTag, deliveryTag, multiple)
+	return ube.broker.AcknowledgeMessage(consumerID, deliveryTag, multiple)
 }
 
 // ExecuteNack executes a negative acknowledgment operation
-func (ube *UnifiedBrokerExecutor) ExecuteNack(consumerTag string, deliveryTag uint64, multiple, requeue bool) error {
+func (ube *UnifiedBrokerExecutor) ExecuteNack(consumerID string, deliveryTag uint64, multiple, requeue bool) error {
 	if ube.broker == nil {
 		return fmt.Errorf("no unified broker available for executing nack")
 	}
 
-	if consumerTag == "" {
+	if consumerID == "" {
 		return ube.broker.NackGetDelivery(deliveryTag, requeue)
 	}
-	return ube.broker.NacknowledgeMessage(consumerTag, deliveryTag, multiple, requeue)
+	return ube.broker.NacknowledgeMessage(consumerID, deliveryTag, multiple, requeue)
 }
 
 // ExecuteReject executes a message rejection operation
-func (ube *UnifiedBrokerExecutor) ExecuteReject(consumerTag string, deliveryTag uint64, requeue bool) error {
+func (ube *UnifiedBrokerExecutor) ExecuteReject(consumerID string, deliveryTag uint64, requeue bool) error {
 	if ube.broker == nil {
 		return fmt.Errorf("no unified broker available for executing reject")
 	}
 
-	if consumerTag == "" {
+	if consumerID == "" {
 		return ube.broker.RejectGetDelivery(deliveryTag, requeue)
 	}
-	return ube.broker.RejectMessage(consumerTag, deliveryTag, requeue)
+	return ube.broker.RejectMessage(consumerID, deliveryTag, requeue)
 }

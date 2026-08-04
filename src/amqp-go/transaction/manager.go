@@ -437,29 +437,29 @@ func NewPublishOperation(exchange, routingKey string, message *protocol.Message)
 	}
 }
 
-func NewAckOperation(consumerTag string, deliveryTag uint64, multiple bool) *interfaces.TransactionOperation {
+func NewAckOperation(consumerID string, deliveryTag uint64, multiple bool) *interfaces.TransactionOperation {
 	return &interfaces.TransactionOperation{
 		Type:        interfaces.OpAck,
-		ConsumerTag: consumerTag,
+		ConsumerTag: consumerID,
 		DeliveryTag: deliveryTag,
 		Multiple:    multiple,
 	}
 }
 
-func NewNackOperation(consumerTag string, deliveryTag uint64, multiple, requeue bool) *interfaces.TransactionOperation {
+func NewNackOperation(consumerID string, deliveryTag uint64, multiple, requeue bool) *interfaces.TransactionOperation {
 	return &interfaces.TransactionOperation{
 		Type:        interfaces.OpNack,
-		ConsumerTag: consumerTag,
+		ConsumerTag: consumerID,
 		DeliveryTag: deliveryTag,
 		Multiple:    multiple,
 		Requeue:     requeue,
 	}
 }
 
-func NewRejectOperation(consumerTag string, deliveryTag uint64, requeue bool) *interfaces.TransactionOperation {
+func NewRejectOperation(consumerID string, deliveryTag uint64, requeue bool) *interfaces.TransactionOperation {
 	return &interfaces.TransactionOperation{
 		Type:        interfaces.OpReject,
-		ConsumerTag: consumerTag,
+		ConsumerTag: consumerID,
 		DeliveryTag: deliveryTag,
 		Requeue:     requeue,
 	}

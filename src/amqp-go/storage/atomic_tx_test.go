@@ -3,7 +3,6 @@ package storage
 import (
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
@@ -21,7 +20,7 @@ func atomicTestStorage(t *testing.T) *DisruptorStorage {
 		WALFileSize:       1 << 20,
 		WALChannelBuffer:  1000,
 	}
-	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), 5*time.Second, engineCfg)
+	ds, err := NewDisruptorStorageWithEngineConfig(t.TempDir(), engineCfg)
 	require.NoError(t, err)
 	t.Cleanup(func() { ds.Close() })
 	return ds

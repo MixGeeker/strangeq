@@ -11,9 +11,10 @@ import (
 // TestCancelInflightScanExcludesBasicGet is the Step-5 cancel-with-inflight scan
 // test. After deleting QueueState.inflightOwners, UnregisterConsumer finds a
 // cancelled consumer's still-in-flight deliveries by scanning the deliveryIndex
-// ledger filtered by consumer tag. This pins the §5.1 correctness claim that the
+// ledger filtered by the consumer's broker-internal identity (Consumer.ID), not
+// by its wire tag. This pins the §5.1 correctness claim that the
 // filter is exact: a concurrent basic.get delivery (which lives in the same
-// deliveryIndex under the empty consumer tag "") is NOT swept by the scan, while
+// deliveryIndex under the empty consumer identity "") is NOT swept by the scan, while
 // every one of the push consumer's own in-flight tags IS requeued for
 // redelivery to another consumer.
 func TestCancelInflightScanExcludesBasicGet(t *testing.T) {
@@ -40,7 +41,7 @@ func TestCancelInflightScanExcludesBasicGet(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 100),
 		PrefetchCount: 100,
 	}
-	if err := broker.RegisterConsumer("cscan", "cscan-a", consumerA); err != nil {
+	if err := registerConsumer(broker, "cscan", "cscan-a", consumerA); err != nil {
 		t.Fatalf("RegisterConsumer A: %v", err)
 	}
 
@@ -69,7 +70,7 @@ func TestCancelInflightScanExcludesBasicGet(t *testing.T) {
 		Messages:      make(chan *protocol.Delivery, 100),
 		PrefetchCount: 100,
 	}
-	if err := broker.RegisterConsumer("cscan", "cscan-b", consumerB); err != nil {
+	if err := registerConsumer(broker, "cscan", "cscan-b", consumerB); err != nil {
 		t.Fatalf("RegisterConsumer B: %v", err)
 	}
 

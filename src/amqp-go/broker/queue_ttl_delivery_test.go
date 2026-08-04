@@ -261,7 +261,7 @@ func BenchmarkDeliver_NoTTL_ZeroCost(b *testing.B) {
 		Tag: "c", Queue: "z", NoAck: true,
 		Messages: make(chan *protocol.Delivery, 1),
 	}
-	if err := broker.RegisterConsumer("z", "c", c); err != nil {
+	if err := registerConsumer(broker, "z", "c", c); err != nil {
 		b.Fatal(err)
 	}
 

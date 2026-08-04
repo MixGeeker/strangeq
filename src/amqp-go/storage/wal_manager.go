@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/RoaringBitmap/roaring/roaring64"
+	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 )
 
@@ -181,6 +182,13 @@ type WALConfig struct {
 	// handles mixed files by verifying non-zero CRCs and skipping zero ones.
 	CRCDisabled bool
 
+	// UnsafeRecovery, when true (--unsafe-recovery), lets the shared WAL be
+	// constructed on a directory holding a file this build cannot parse,
+	// DISCARDING that file's contents, instead of refusing. Zero value (false)
+	// = refuse, which is the safe default for DefaultWALConfig() and every
+	// zero-value WALConfig{}. Set only via WALConfigFromEngine.
+	UnsafeRecovery bool
+
 	// SharedBodyMaxPinAge (ITER5 cold-tail hardening, §2) bounds how long a rolled
 	// WAL file that carries a shared BodyBlock may be kept out of checkpoint before
 	// it is force-re-inlined (N copies) and deleted. 0 disables the age backstop
@@ -238,9 +246,21 @@ type QueueWAL struct {
 	ackChan   chan *ackRequest   // Buffered channel for ACKs (queue+offset)
 
 	// ACK tracking
-	ackBitmap      *roaring64.Bitmap
-	bitmapMutex    sync.RWMutex
-	lastCheckpoint uint64 // Last offset checkpointed to segments
+	ackBitmap   *roaring64.Bitmap
+	bitmapMutex sync.RWMutex
+
+	// _walLayoutPad occupies the 8 bytes vacated by the dead `lastCheckpoint`
+	// field that was deleted from exactly this position. Deleting it shifted
+	// every field below by -8, which moved fileMutex out of the start of cache
+	// line 3 and into the tail of line 2, sharing that line with fileNum and
+	// fileOffset — all three touched on flushBatch's group-commit path. That is
+	// a hot-path layout change smuggled in by a cold-path deletion, and the
+	// zero-regression rule is measured against the layout at 60b2d21, so the
+	// layout is restored rather than re-measured. storage/wal_layout_test.go
+	// asserts the resulting offsets at runtime; if a field above this point is
+	// ever added or removed, that test fails and the change owes a single-hunk
+	// A/B rather than an assertion that it "cannot matter".
+	_walLayoutPad uint64
 
 	// Current active file
 	currentFile             *os.File
@@ -614,7 +634,7 @@ func WALRecordCountsForTest(dataDir string) (WALRecordCounts, error) {
 		return total, err
 	}
 	for _, e := range entries {
-		if filepath.Ext(e.Name()) != WALFileExtension {
+		if !isWALFileName(e) {
 			continue
 		}
 		c, cerr := scanWALFileRecordCounts(filepath.Join(sharedDir, e.Name()))
@@ -653,6 +673,9 @@ func scanWALFileRecordCounts(filePath string) (WALRecordCounts, error) {
 			break
 		}
 		dataLen := binary.BigEndian.Uint32(hdr[4:8])
+		if walBlankRecordHeader(binary.BigEndian.Uint32(hdr[0:4]), dataLen) {
+			break // zero-filled tail, not a run of zero-length records
+		}
 		data := make([]byte, dataLen)
 		if _, err := io.ReadFull(f, data); err != nil {
 			break
@@ -842,37 +865,72 @@ type RecoveryMessage struct {
 // RecoverFromWAL scans all WAL files and returns unacknowledged messages
 // This is called during broker startup to recover messages after a crash
 // Phase 3: Crash recovery implementation
+//
+// IT SCANS EVERY FILE AND ENUMERATES EVERY FAULT BEFORE RETURNING. A fatal
+// fault is confined to the file that produced it: that file is QUARANTINED —
+// named, counted, its records abandoned — and every other file in the
+// directory is still opened, scanned and recovered.
+//
+// This used to `return` from inside the file loop on the first fatal fault.
+// Measured consequence (review-3 B-1, against the real binary): a six-file
+// directory holding 271,080 confirmed durable messages recovered ZERO with
+// --unsafe-recovery, from a single flipped bit, because every file sorting
+// after the damaged one was never opened, never scanned and NEVER ENUMERATED
+// AS A FAULT — so the artifact list the refusal message printed was not the
+// set of artifacts that would be lost, and its cost statement understated the
+// loss by 271,080 messages. Two properties follow from scanning to the end and
+// they are the reason it is done this way:
+//
+//   - The cost statement is TRUE. What the message says was discarded is
+//     exactly what was discarded.
+//   - The refusal is ONE COMPLETE REPORT rather than a bisect-by-restart. Ra
+//     stops at the first bad record because its WAL is one file; a shared WAL
+//     directory can enumerate all of them, which ref-rabbitmq.md §1 names as
+//     the one improvement available over Ra here.
 func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 	if wm.sharedWAL == nil {
-		return nil, fmt.Errorf("shared WAL not initialized")
+		return nil, interfaces.FatalFault("wal-scan", filepath.Join(wm.dataDir, "shared"),
+			"the shared WAL was never initialized, so no durable record in this directory can be read",
+			"every durable message in the WAL directory is abandoned", nil)
 	}
 
 	var recoveredMessages []*RecoveryMessage
+	var faults []error
 
 	// Get list of all WAL files
 	sharedDir := filepath.Join(wm.dataDir, "shared")
 	files, err := os.ReadDir(sharedDir)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read WAL directory: %w", err)
+		return nil, interfaces.FatalFault("wal-scan", sharedDir,
+			"the shared WAL directory could not be enumerated, so recovery cannot know which files exist",
+			"every durable message in the WAL directory is abandoned", err)
 	}
 
-	// Scan each WAL file
+	// Scan each WAL file. isWALFileName is the SINGLE enumeration predicate for
+	// this directory (canon rule 12) — rebuildBootState used to accept only
+	// <digits>.wal while this loop accepted any *.wal, and the looser one was
+	// the fatal one, so a file the boot-state rebuild could not even see could
+	// still refuse the boot from here.
 	for _, file := range files {
-		if filepath.Ext(file.Name()) != WALFileExtension {
+		if !isWALFileName(file) {
 			continue
 		}
 
 		filePath := filepath.Join(sharedDir, file.Name())
-		messages, err := wm.sharedWAL.scanWALFile(filePath)
-		if err != nil {
-			// An unknown/unsupported file format version is a hard error: we
-			// must not silently skip a file that may hold durable messages.
-			if errors.Is(err, ErrUnsupportedWALVersion) {
-				return nil, fmt.Errorf("WAL recovery aborted for %s: %w", file.Name(), err)
+		messages, serr := wm.sharedWAL.scanWALFile(filePath)
+		if serr != nil {
+			fault := classifyWALScanError(filePath, serr)
+			faults = append(faults, fault)
+			if interfaces.OutcomeOf(fault) == interfaces.RecoveryFatal {
+				// QUARANTINE, not abort. This file cannot be interpreted, so
+				// nothing is taken from it — but every other file in the
+				// directory is still scanned, still enumerated, and still
+				// recovered. See the function doc.
+				continue
 			}
-			// Other errors (e.g. transient open/read failures, torn tail) are
-			// best-effort — log and continue with other files.
-			continue
+			if messages == nil {
+				continue
+			}
 		}
 
 		// Filter out acknowledged messages
@@ -888,16 +946,153 @@ func (wm *WALManager) RecoverFromWAL() ([]*RecoveryMessage, error) {
 		}
 	}
 
-	return recoveredMessages, nil
+	return recoveredMessages, joinFaults(faults)
 }
 
-// scanWALFile scans a single WAL file and returns all messages
+// classifyWALScanError turns a raw scan error into a classified fault. Errors
+// that scanWALFile already classified are passed through unchanged — the site
+// that knows the semantics keeps the decision.
+func classifyWALScanError(filePath string, err error) error {
+	if len(interfaces.FaultsOf(err)) > 0 {
+		return err
+	}
+	if errors.Is(err, ErrUnsupportedWALVersion) {
+		return interfaces.FatalFault("wal-scan", filePath,
+			"this WAL file's framing version is not one this build can parse, so not one byte of it can be interpreted",
+			"every durable message in this WAL file is abandoned; the file is left on disk untouched, and every OTHER WAL file in the directory is still recovered",
+			err)
+	}
+	// An open/read failure on a file that IS a WAL file. Skipping it silently
+	// (the previous behaviour) drops every durable message it holds while
+	// recovery still reports success.
+	return interfaces.DegradedFault("wal-scan", filePath,
+		"this WAL file could not be read and is quarantined for this boot",
+		"every durable message in this WAL file is abandoned for as long as it stays unreadable; the file is left on disk untouched, and every OTHER WAL file in the directory is still recovered",
+		err)
+}
+
+// joinFaults collapses accumulated faults into a single error, or nil when
+// none of them gates the boot. errors.Join's multi-error Unwrap is what
+// interfaces.FaultsOf walks, so every fault stays individually addressable by
+// an operator.
+//
+// BENIGN FAULTS ARE NOT RETURNED. "Benign" means "proceeds silently", and this
+// package's error returns are read by callers — performCheckpoint,
+// forceCheckpointFile, and every existing test of RecoverFromWAL — as "did
+// something go wrong". Handing them a non-nil error for a torn tail, which is
+// the ordinary state of a WAL after any unclean shutdown, would make the
+// normal case look like a failure. The benign classification still exists and
+// is still produced at the site that knows the semantics; it simply has no
+// consumer inside storage, which has no logger. Plumbing benign faults to one
+// is logged for Step 7.
+func joinFaults(faults []error) error {
+	gating := faults[:0:0]
+	for _, f := range faults {
+		if interfaces.OutcomeOf(f).GatesBoot() {
+			gating = append(gating, f)
+		}
+	}
+	if len(gating) == 0 {
+		return nil
+	}
+	return errors.Join(gating...)
+}
+
+// walBlankRecordHeader reports whether an 8-byte record header is all zeros.
+//
+// NO RECORD THIS BUILD WRITES CAN LOOK LIKE THIS: every record's payload
+// carries at least a one-byte type tag, so dataLen == 0 is unreachable from the
+// write path (asserted at runtime by
+// TestWALTail_TheWritePathNeverProducesAZeroLengthRecord). A zero header is
+// therefore not data — it is the start of a zero region, which is what a
+// kernel death leaves behind in blocks that never reached the platter.
+//
+// It exists so the FOUR walks over this grammar (scanWALFile, indexWALFile,
+// readMessageFromFile, scanWALFileRecordCounts) cannot disagree about where a
+// file's data ends (canon rule 12). Before it, a zero region that happened to
+// start on a record boundary parsed as a run of zero-length zero-CRC records
+// and was reported as NO FAULT AT ALL, while the same zero region starting one
+// byte later was FATAL — review-3 named that asymmetry as the tell.
+func walBlankRecordHeader(crc, dataLen uint32) bool { return crc == 0 && dataLen == 0 }
+
+// walNothingIntelligibleFollows is Ra's is_last_record/3 (ref-rabbitmq.md
+// §1.3), and it is a BYTE test, not an offset comparison.
+//
+// The predicate it replaces was `recStart < fileSize`, which is true whenever
+// ANYTHING follows — including the zero-filled tail a power loss leaves, which
+// is the shape it most needed to recognise. Measured (review-3 B-2): zeroing
+// the last 2 KB of a 59 MB WAL in place produced "failed its CRC32 check and is
+// NOT the last record in the file (1089 of 59041230 bytes follow it)" and
+// refused the boot, for damage entirely inside the last 2 KB of the file.
+//
+// Ra inspects the remaining bytes precisely because zeros are what a crash
+// leaves. So does this: everything from `from` to EOF must be zero. A read
+// failure reports false — we cannot PROVE nothing follows, and the safe
+// direction for an unprovable tail is to treat it as interior corruption.
+func walNothingIntelligibleFollows(f *os.File, from int64) bool {
+	buf := make([]byte, 64*1024)
+	pos := from
+	for {
+		n, err := f.ReadAt(buf, pos)
+		for i := 0; i < n; i++ {
+			if buf[i] != 0 {
+				return false
+			}
+		}
+		if err == io.EOF {
+			return true
+		}
+		if err != nil {
+			return false
+		}
+		if n == 0 {
+			return true
+		}
+		pos += int64(n)
+	}
+}
+
+// scanWALFile scans a single WAL file and returns all messages.
+//
+// CLASSIFICATION (Ra's three-way split, ref-rabbitmq.md §1.3 — RabbitMQ's own
+// answer for its own modern engine):
+//
+//   - unknown framing version           -> FATAL, nothing in the file is parsed
+//   - CRC failure with real data after it (walNothingIntelligibleFollows is
+//     false) -> FATAL, everything after it is unintelligible and silently
+//     dropping it loses a confirmed durable message
+//   - CRC failure with nothing intelligible after it -> BENIGN torn tail
+//   - a zero-filled region running to EOF                -> BENIGN torn tail
+//   - short read at the tail                             -> BENIGN torn tail
+//
+// WHY THE TORN TAIL IS BENIGN RATHER THAN DEGRADED (changed in Step 3-fix; it
+// was Degraded, which gated the boot). A partial trailing record was never
+// fsynced, therefore never confirmed, therefore no durability promise is
+// broken. No broker in the reference study asks for operator action on a torn
+// tail: Ra drops the last record and continues, Kafka truncates and warns,
+// NATS truncates and reports LostStreamData, Osiris/Artemis/CQv2 truncate
+// (ref-rabbitmq.md §1.6). Requiring --unsafe-recovery after a power loss makes
+// the safe path the annoying one, which is how operators end up running with
+// the flag permanently set. Degraded is reserved for the abandonment of data
+// that WAS confirmed — a quarantined unreadable file.
+//
+// It returns the messages it did parse ALONGSIDE any fault, so a degraded or
+// benign outcome keeps its partial data; only a fatal outcome discards it.
 func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return nil, err
 	}
 	defer file.Close()
+
+	// fileSize is what makes "is this the last record" a fact rather than a
+	// guess: a CRC failure is tolerable exactly when nothing follows it.
+	stat, serr := file.Stat()
+	if serr != nil {
+		return nil, serr
+	}
+	fileSize := stat.Size()
+	var scanFault error
 
 	// Detect the file-level header and start parsing records after it. ITER4 is a
 	// clean break: only v4 files are accepted; a non-v4 or headerless (pre-v4)
@@ -939,13 +1134,35 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 		// partial trailing record — CRC would reject it anyway.
 		hdr := make([]byte, 8)
 		if _, err := io.ReadFull(file, hdr); err != nil {
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				scanFault = interfaces.BenignFault("wal-scan", filePath,
+					fmt.Sprintf("truncated record header at byte offset %d; the trailing partial record was never fsynced, so no publisher was confirmed for it", recStart))
+			}
 			break
 		}
 		crc := binary.BigEndian.Uint32(hdr[0:4])
 		dataLen := binary.BigEndian.Uint32(hdr[4:8])
 
+		if walBlankRecordHeader(crc, dataLen) {
+			// A zero region starting exactly on a record boundary. See
+			// walBlankRecordHeader: the write path cannot produce this.
+			if walNothingIntelligibleFollows(file, recStart) {
+				scanFault = interfaces.BenignFault("wal-scan", filePath,
+					fmt.Sprintf("zero-filled tail from byte offset %d to end of file (%d bytes); those blocks never reached the platter, so nothing in them was ever fsynced or confirmed", recStart, fileSize-recStart))
+				break
+			}
+			return nil, interfaces.FatalFault("wal-scan", filePath,
+				fmt.Sprintf("a zero-filled region begins at byte offset %d and is FOLLOWED BY MORE DATA before end of file (%d bytes); this file cannot be interpreted", recStart, fileSize),
+				"every durable message in this WAL file is abandoned, including any that follow the zero-filled region and are themselves intact; every OTHER WAL file in the directory is still recovered",
+				nil)
+		}
+
 		data := make([]byte, dataLen)
 		if _, err := io.ReadFull(file, data); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				scanFault = interfaces.BenignFault("wal-scan", filePath,
+					fmt.Sprintf("truncated record body at byte offset %d; the trailing partial record was never fsynced, so no publisher was confirmed for it", recStart))
+			}
 			break
 		}
 
@@ -959,7 +1176,22 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 			h.Write(hdr[4:8])
 			h.Write(data)
 			if crc != h.Sum32() {
-				continue
+				if !walNothingIntelligibleFollows(file, recStart) {
+					// INTERIOR. Silently skipping it (what this line used to do,
+					// with no count and no log) drops a confirmed durable
+					// message and reports the boot successful.
+					return nil, interfaces.FatalFault("wal-scan", filePath,
+						fmt.Sprintf("the record at byte offset %d failed its CRC32 check and is NOT the last record in the file — real data follows it (%d of %d bytes); this file cannot be interpreted",
+							curRecStart, fileSize-recStart, fileSize),
+						"every durable message in this WAL file is abandoned, including any that follow the damaged record and are themselves intact; every OTHER WAL file in the directory is still recovered",
+						nil)
+					// unreachable
+				}
+				// TAIL. Drop this record only and stop; nothing intelligible
+				// follows it (Ra's is_last_record/3).
+				scanFault = interfaces.BenignFault("wal-scan", filePath,
+					fmt.Sprintf("the last intelligible record in this file (byte offset %d) failed its CRC32 check and nothing but zeros follows it — a torn write; it was never fsynced, so no publisher was confirmed for it", curRecStart))
+				break
 			}
 		}
 
@@ -1033,7 +1265,7 @@ func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
 
 	// EOF with a transaction still open: the Commit marker was never durable,
 	// so these operations are uncommitted and must not be applied.
-	return messages, nil
+	return messages, scanFault
 }
 
 // createSharedWAL creates the single shared WAL for all queues
@@ -1056,6 +1288,16 @@ func (wm *WALManager) createSharedWAL() (*QueueWAL, error) {
 		oldFileCache:       make(map[uint64]*os.File),
 		offsetIndex:        make(map[uint64]*offsetLocation), // Phase 6D: Offset index for O(1) reads
 		stopChan:           make(chan struct{}),
+	}
+
+	// Rebuild everything the write path would otherwise be the only producer of:
+	// fileNum, oldFiles (with each pre-existing file's COMPLETE offset
+	// inventory) and offsetIndex. See
+	// wal_boot_state.go for why this is the root cause of both C-1 and C-2.
+	// It must run BEFORE openNextFile so the first Add(1) lands past every
+	// pre-existing file instead of reopening one with O_APPEND.
+	if err := wal.rebuildBootState(); err != nil {
+		return nil, fmt.Errorf("failed to rebuild WAL boot state: %w", err)
 	}
 
 	// Open first WAL file
@@ -2031,9 +2273,20 @@ func (qw *QueueWAL) openNextFile() error {
 	// Write the file-level header (magic + version) only on a brand-new file
 	// (SQ-4). The header is flushed to disk together with the first record
 	// batch's fdatasync — one small write per file, never per record. Records
-	// therefore begin at WALHeaderSize. A pre-existing file keeps whatever
-	// header (or none, for legacy v0 files) it already has; we never write a
-	// second header, and records continue at the real end of file.
+	// therefore begin at WALHeaderSize.
+	//
+	// A PRE-EXISTING FILE MUST PROVE IT CARRIES A HEADER THIS BUILD CAN PARSE
+	// BEFORE WE APPEND A SINGLE BYTE TO IT. This branch used to say "a
+	// pre-existing file keeps whatever header (or none) it already has", which
+	// made the broker append v4 records after a foreign header FOREVER: the
+	// stale file is not empty, so no header was written, and every subsequent
+	// boot re-failed to parse it while adding more unreadable records. There is
+	// no self-healing and the only operator signal was one Error line. Two such
+	// contaminated directories sat unnoticed in this repository for three weeks.
+	//
+	// COLD PATH: once per WAL file, i.e. once per FileSize bytes written
+	// (512 MB by default). The probe handle is opened only when the file is
+	// non-empty, which for every file this process creates is never.
 	if size == 0 {
 		header := make([]byte, 0, WALHeaderSize)
 		header = append(header, WALMagic...)
@@ -2044,6 +2297,24 @@ func (qw *QueueWAL) openNextFile() error {
 			return fmt.Errorf("failed to write WAL file header: %w", werr)
 		}
 		size = int64(n)
+	} else {
+		if size < int64(WALHeaderSize) {
+			_ = file.Close()
+			return fmt.Errorf("refusing to append to WAL file %s: %w: file is %d bytes, too short to carry a %d-byte header",
+				filename, ErrUnsupportedWALVersion, size, WALHeaderSize)
+		}
+		// currentFile is O_WRONLY and cannot ReadAt; probe with its own handle.
+		probe, perr := os.Open(filename)
+		if perr != nil {
+			_ = file.Close()
+			return fmt.Errorf("failed to open WAL file %s for header validation: %w", filename, perr)
+		}
+		_, verr := walFileDataStart(probe)
+		_ = probe.Close()
+		if verr != nil {
+			_ = file.Close()
+			return fmt.Errorf("refusing to append to WAL file %s: %w", filename, verr)
+		}
 	}
 
 	// Open a read-only handle for ReadAt (currentFile is O_WRONLY, can't ReadAt)
@@ -2136,8 +2407,18 @@ func (qw *QueueWAL) tryDeleteOldFiles() {
 	defer qw.bitmapMutex.RUnlock()
 
 	for fileNum, info := range qw.oldFiles {
-		// Check if all actual message offsets in this file are ACKed
-		// Uses bitmap intersection: file offsets ⊆ ackBitmap iff |file ∩ ack| == |file|
+		// Check if all actual message offsets in this file are ACKed.
+		// Uses bitmap intersection: file offsets ⊆ ackBitmap iff |file ∩ ack| == |file|.
+		//
+		// What makes this sound, and did not hold before rebuildBootState:
+		// info.offsets is now the COMPLETE physical inventory of the file (for a
+		// pre-existing file it is rebuilt by scanning the file, and it is nil —
+		// hence never all-acked — when that scan failed). A file whose records
+		// this process merely never saw can no longer be judged fully
+		// acknowledged and destroyed. Acknowledgement itself is NOT durable
+		// (see wal_boot_state.go), so ackBitmap holds this incarnation's acks
+		// only and an inherited file is reclaimable only once this process has
+		// re-delivered and re-acked every record in it.
 		allAcked := info.offsets != nil &&
 			info.offsets.GetCardinality() > 0 &&
 			roaring64.And(info.offsets, qw.ackBitmap).GetCardinality() == info.offsets.GetCardinality()
@@ -2171,8 +2452,13 @@ func (qw *QueueWAL) forceCheckpointFile(info *walFileInfo) {
 		return
 	}
 
+	// A degraded or benign scan fault (torn tail, tail CRC failure) still
+	// yields every intact record before the damage, and those records must
+	// still be checkpointed — bailing on any non-nil error would pin the file
+	// forever. Only a fatal fault, which means the file cannot be interpreted
+	// at all, aborts.
 	messages, err := qw.scanWALFile(info.path)
-	if err != nil {
+	if err != nil && interfaces.OutcomeOf(err) == interfaces.RecoveryFatal {
 		return
 	}
 
@@ -2487,6 +2773,12 @@ func (qw *QueueWAL) readMessageFromFile(queueName string, filePath string, offse
 		crc := binary.BigEndian.Uint32(hdr[0:4])
 		dataLen := binary.BigEndian.Uint32(hdr[4:8])
 
+		if walBlankRecordHeader(crc, dataLen) {
+			// Zero-filled tail: this file's data ends here (see
+			// walBlankRecordHeader), so the offset is not in it.
+			return nil, fmt.Errorf("message not in WAL")
+		}
+
 		data := make([]byte, dataLen)
 		if _, err := io.ReadFull(file, data); err != nil {
 			return nil, err
@@ -2615,9 +2907,11 @@ func (qw *QueueWAL) performCheckpoint() {
 			continue
 		}
 
-		// Scan the WAL file
+		// Scan the WAL file. See forceCheckpointFile: only a FATAL scan fault
+		// aborts; a torn tail still has every earlier record intact and they
+		// must reach a segment or the file can never be reclaimed.
 		messages, err := qw.scanWALFile(info.path)
-		if err != nil {
+		if err != nil && interfaces.OutcomeOf(err) == interfaces.RecoveryFatal {
 			continue
 		}
 

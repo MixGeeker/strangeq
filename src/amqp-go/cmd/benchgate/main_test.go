@@ -28,7 +28,15 @@ func benchLines(name string, baseNs float64, deltasNs []float64) string {
 }
 
 func pkgBlock(pkg, benchBody string) string {
-	return "goos: darwin\ngoarch: arm64\npkg: " + pkg + "\ncpu: Test CPU\n" + benchBody + "PASS\nok  \t" + pkg + "\t0.01s\n"
+	return pkgBlockCPU(pkg, "Test CPU", benchBody)
+}
+
+// pkgBlockCPU is pkgBlock with an explicit cpu: line, for the tests that turn
+// on which machine a section was measured on. `go test` prints the header in
+// the order goos:, goarch:, pkg:, cpu: — cpu AFTER pkg — and that ordering is
+// load-bearing (see TestSplitByPackage_CPULineBelongsToItsOwnPackage).
+func pkgBlockCPU(pkg, cpu, benchBody string) string {
+	return "goos: darwin\ngoarch: arm64\npkg: " + pkg + "\ncpu: " + cpu + "\n" + benchBody + "PASS\nok  \t" + pkg + "\t0.01s\n"
 }
 
 // tenJitterSamples is a fixed, non-random ±1% jitter pattern with no true
@@ -212,6 +220,159 @@ func TestRun_BenchmarkDroppedFromExistingPackageIsHardFailure(t *testing.T) {
 	}
 	if strings.Contains(stderr.String(), "Kept-8") {
 		t.Errorf("the still-present benchmark was wrongly flagged:\n%s", stderr.String())
+	}
+}
+
+// TestRun_HardwareMismatchedBaselineIsHardError is the primary
+// fabricated-regression regression test, in its most dangerous form.
+//
+// Here the two runs have IDENTICAL benchmark names and identical numbers;
+// only the machine differs. Before the fix, splitByPackage dropped the first
+// (and only) package's cpu: line entirely, so both sections looked
+// same-hardware to benchstat and the gate reported a clean PASS — a
+// cross-hardware comparison presented as a valid result. Nothing about the
+// output would have told anyone.
+//
+// A gate that cannot compare must fail loudly and name the reason. It must
+// not pass, and it must not print a percentage.
+func TestRun_HardwareMismatchedBaselineIsHardError(t *testing.T) {
+	dir := t.TempDir()
+
+	body := benchLines("BenchmarkFoo", 100, tenJitterSamples(100))
+	baseline := pkgBlockCPU("pkg/x", "Apple M4 Max", body)
+	newRun := pkgBlockCPU("pkg/x", "Apple M3 Pro", body)
+
+	baselinePath := filepath.Join(dir, "baseline.txt")
+	newPath := filepath.Join(dir, "new.txt")
+	writeFileT(t, baselinePath, baseline)
+	writeFileT(t, newPath, newRun)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"-baseline", baselinePath,
+		"-new", newPath,
+		"-tools-dir", realToolsDir,
+		"-scratch-dir", filepath.Join(dir, "scratch"),
+	}, &stdout, &stderr)
+
+	if code != 2 {
+		t.Fatalf("got exit code %d, want 2 (a baseline from different hardware is uncomparable, not a verdict)\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+	all := stdout.String() + stderr.String()
+	for _, want := range []string{"cpu", "Apple M4 Max", "Apple M3 Pro", "pkg/x"} {
+		if !strings.Contains(all, want) {
+			t.Errorf("output does not name %q, so it does not name the reason:\n%s", want, all)
+		}
+	}
+	if strings.Contains(all, "regressed") || strings.Contains(all, "PASS") {
+		t.Errorf("output reports a verdict on a comparison that could not be made:\n%s", all)
+	}
+}
+
+// TestRun_ZeroNameOverlapAcrossMachinesEmitsNoPercentages reproduces the
+// observed incident shape end to end: an M4 Max baseline with -16 name
+// suffixes against an M3 Pro run with -12 suffixes, across TWO packages (the
+// arrangement in which the old cpu-line misattribution actually surfaced).
+//
+// The observed failure was 41 lines of the form "QueueDispatch_Claim-12 B/op
+// regressed +248.00%", where 248 is the raw B/op value — identical on both
+// sides. This test's real assertion is the negative one: no percentage may
+// appear anywhere in the output.
+func TestRun_ZeroNameOverlapAcrossMachinesEmitsNoPercentages(t *testing.T) {
+	dir := t.TempDir()
+
+	baseline := pkgBlockCPU("pkg/root", "Apple M4 Max", benchLines("BenchmarkVersus_AutoAck", 4000, tenJitterSamples(4000))) +
+		pkgBlockCPU("pkg/broker", "Apple M4 Max", benchLines("BenchmarkQueueDispatch_Claim", 102, tenJitterSamples(102)))
+	newRun := pkgBlockCPU("pkg/root", "Apple M3 Pro", benchLines("BenchmarkVersus_AutoAck", 3000, tenJitterSamples(3000))) +
+		pkgBlockCPU("pkg/broker", "Apple M3 Pro", benchLines("BenchmarkQueueDispatch_Claim", 89, tenJitterSamples(89)))
+
+	baselinePath := filepath.Join(dir, "baseline.txt")
+	newPath := filepath.Join(dir, "new.txt")
+	writeFileT(t, baselinePath, baseline)
+	writeFileT(t, newPath, newRun)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"-baseline", baselinePath,
+		"-new", newPath,
+		"-tools-dir", realToolsDir,
+		"-scratch-dir", filepath.Join(dir, "scratch"),
+	}, &stdout, &stderr)
+
+	if code != 2 {
+		t.Fatalf("got exit code %d, want 2\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+	all := stdout.String() + stderr.String()
+	if strings.Contains(all, "regressed") {
+		t.Errorf("the gate fabricated a regression from a comparison it could not make:\n%s", all)
+	}
+	if i := strings.Index(all, "%"); i >= 0 {
+		t.Errorf("the gate emitted a percentage (%q) for a comparison it could not make:\n%s", all[max(0, i-40):i+1], all)
+	}
+}
+
+// TestRun_SameHardwareZeroOverlapStillReportsMissing guards against
+// over-broadening the new hard error. Same machine on both sides, but every
+// benchmark was renamed: that is a real, comparable run in which the gated
+// benchmarks disappeared, and it must keep failing as
+// "missing from this run" (exit 1) rather than being reclassified as
+// "cannot compare" (exit 2).
+func TestRun_SameHardwareZeroOverlapStillReportsMissing(t *testing.T) {
+	dir := t.TempDir()
+
+	baseline := pkgBlockCPU("pkg/x", "Test CPU", benchLines("BenchmarkOldName", 100, tenJitterSamples(100)))
+	newRun := pkgBlockCPU("pkg/x", "Test CPU", benchLines("BenchmarkNewName", 100, tenJitterSamples(100)))
+
+	baselinePath := filepath.Join(dir, "baseline.txt")
+	newPath := filepath.Join(dir, "new.txt")
+	writeFileT(t, baselinePath, baseline)
+	writeFileT(t, newPath, newRun)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"-baseline", baselinePath,
+		"-new", newPath,
+		"-tools-dir", realToolsDir,
+		"-scratch-dir", filepath.Join(dir, "scratch"),
+	}, &stdout, &stderr)
+
+	if code != 1 {
+		t.Fatalf("got exit code %d, want 1 (comparable run, gated benchmark vanished)\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "missing from this run") {
+		t.Errorf("stderr does not report the renamed benchmark as missing:\n%s", stderr.String())
+	}
+}
+
+// TestRun_MatchingHardwarePasses is the explicit no-break check for the
+// working path: identical cpu on both sides must still compare and pass.
+func TestRun_MatchingHardwarePasses(t *testing.T) {
+	dir := t.TempDir()
+
+	body := benchLines("BenchmarkFoo", 100, tenJitterSamples(100))
+	baseline := pkgBlockCPU("pkg/x", "Apple M3 Pro", body) + pkgBlockCPU("pkg/y", "Apple M3 Pro", body)
+	newRun := pkgBlockCPU("pkg/x", "Apple M3 Pro", body) + pkgBlockCPU("pkg/y", "Apple M3 Pro", body)
+
+	baselinePath := filepath.Join(dir, "baseline.txt")
+	newPath := filepath.Join(dir, "new.txt")
+	writeFileT(t, baselinePath, baseline)
+	writeFileT(t, newPath, newRun)
+
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"-baseline", baselinePath,
+		"-new", newPath,
+		"-tools-dir", realToolsDir,
+		"-scratch-dir", filepath.Join(dir, "scratch"),
+	}, &stdout, &stderr)
+
+	if code != 0 {
+		t.Fatalf("got exit code %d, want 0 (same-machine comparison must still pass)\nstdout:\n%s\nstderr:\n%s", code, stdout.String(), stderr.String())
+	}
+	for _, want := range []string{"pkg/x", "pkg/y"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("stdout does not report %s as compared — a silently skipped package is not a pass:\n%s", want, stdout.String())
+		}
 	}
 }
 

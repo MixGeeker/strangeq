@@ -98,10 +98,6 @@ storage:
   # Example: 86400000 = 24 hours
   retentionms: 86400000
 
-  # Interval for checkpointing consumer offsets to disk (milliseconds)
-  # Set to 0 to disable background checkpointing (manual checkpoint only)
-  checkpointintervalms: 5000  # 5 seconds
-
 # ============================================================================
 # Security Configuration
 # ============================================================================

@@ -110,28 +110,6 @@ func (r *AtomicRing) Delete(deliveryTag uint64) bool {
 	return false
 }
 
-func (r *AtomicRing) Purge() int {
-	removed := 0
-	for i := range r.slots {
-		if r.slots[i].Swap(nil) != nil {
-			removed++
-		}
-	}
-	for {
-		cur := r.messageCount.Load()
-		if cur < uint64(removed) {
-			if r.messageCount.CompareAndSwap(cur, 0) {
-				break
-			}
-			continue
-		}
-		if r.messageCount.CompareAndSwap(cur, cur-uint64(removed)) {
-			break
-		}
-	}
-	return removed
-}
-
 func (r *AtomicRing) Count() uint64 {
 	return r.messageCount.Load()
 }

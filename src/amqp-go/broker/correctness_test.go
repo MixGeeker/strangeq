@@ -73,7 +73,7 @@ func TestQueueConsumersConcurrentRegister(t *testing.T) {
 				Queue:    "test-queue",
 				Messages: make(chan *protocol.Delivery, 1),
 			}
-			if err := broker.RegisterConsumer("test-queue", tag, consumer); err != nil {
+			if err := registerConsumer(broker, "test-queue", tag, consumer); err != nil {
 				t.Errorf("RegisterConsumer %d failed: %v", idx, err)
 			}
 		}(i)
@@ -124,7 +124,7 @@ func TestQueueConsumersConcurrentUnregister(t *testing.T) {
 			Queue:    "test-queue",
 			Messages: make(chan *protocol.Delivery, 1),
 		}
-		if err := broker.RegisterConsumer("test-queue", tag, consumer); err != nil {
+		if err := registerConsumer(broker, "test-queue", tag, consumer); err != nil {
 			t.Fatalf("RegisterConsumer %d failed: %v", i, err)
 		}
 	}
@@ -239,7 +239,7 @@ func TestStopChIdempotentClose(t *testing.T) {
 		Queue:    "test-queue",
 		Messages: make(chan *protocol.Delivery, 1),
 	}
-	if err := broker.RegisterConsumer("test-queue", "test-consumer", consumer); err != nil {
+	if err := registerConsumer(broker, "test-queue", "test-consumer", consumer); err != nil {
 		t.Fatalf("RegisterConsumer failed: %v", err)
 	}
 

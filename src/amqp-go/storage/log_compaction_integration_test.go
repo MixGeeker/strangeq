@@ -37,7 +37,7 @@ func TestLogCompaction_FullLifecycle(t *testing.T) {
 	totalMessages := messagesPerQueue * len(queues)
 
 	// === Step 1: Create DisruptorStorage with custom config ===
-	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, 5*time.Second, engineCfg)
+	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, engineCfg)
 	require.NoError(t, err)
 	require.NotNil(t, ds)
 	require.NotNil(t, ds.wal, "WAL manager should be initialized")
@@ -175,7 +175,7 @@ func TestLogCompaction_FullLifecycle(t *testing.T) {
 	ds.Close()
 
 	// Reopen with same config
-	ds2, err := NewDisruptorStorageWithEngineConfig(tmpDir, 5*time.Second, engineCfg)
+	ds2, err := NewDisruptorStorageWithEngineConfig(tmpDir, engineCfg)
 	require.NoError(t, err)
 	require.NotNil(t, ds2)
 	require.NotNil(t, ds2.wal)
@@ -366,7 +366,7 @@ func TestLogCompaction_TierFallback(t *testing.T) {
 		WALChannelBuffer:  5000,
 	}
 
-	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, 5*time.Second, engineCfg)
+	ds, err := NewDisruptorStorageWithEngineConfig(tmpDir, engineCfg)
 	require.NoError(t, err)
 	require.NotNil(t, ds)
 

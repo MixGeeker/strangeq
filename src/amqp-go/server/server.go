@@ -91,6 +91,102 @@ type Server struct {
 	// alarmCancel stops the alarm monitor goroutine on shutdown; nil when the
 	// monitor was never started.
 	alarmCancel context.CancelFunc
+
+	// unsafeRecovery holds the boot-gating recovery faults that
+	// --unsafe-recovery overrode, or nil on a clean boot. It is a PURE APPEND
+	// at the end of the struct so every field above — in particular the
+	// _alarmPad / alarmState cache-line isolation — keeps its byte offset.
+	// Written once during Build, read-only thereafter.
+	unsafeRecovery []*interfaces.RecoveryFault
+
+	// unsafeRecoveryCancel stops the degraded-boot nag goroutine; nil unless
+	// the broker actually booted degraded, so a clean boot spawns nothing.
+	unsafeRecoveryCancel context.CancelFunc
+
+	// generateConsumerTag overrides the source of server-generated consumer
+	// tags for THIS server. Nil in production, which is the whole contract:
+	// consumerTagGenerator() falls back to protocol.GenerateConsumerTag, so no
+	// construction site has to remember to set it. It exists for one reason —
+	// with a 128-bit random draw the re-draw branch in claimConsumerTag is
+	// unreachable, so "a generated tag cannot collide with a client-supplied
+	// tag on the same channel" would be a documented premise rather than an
+	// asserted one (canon rule 11). A test substitutes a colliding generator to
+	// drive that branch.
+	//
+	// It is a FIELD, not a package-level var, deliberately. As a process-global
+	// it was race-free only for as long as no test in this package called
+	// t.Parallel() — a load-bearing premise written down nowhere, inside the
+	// very seam that exists to stop premises being written down instead of
+	// checked. Per-server scoping removes the premise rather than documenting
+	// it. Appended at the end of the struct so no pre-existing field moves.
+	generateConsumerTag func() string
+}
+
+// markUnsafeRecovery records that this process booted with --unsafe-recovery
+// after discarding artifacts it could not recover. Called once from Build.
+func (s *Server) markUnsafeRecovery(faults []*interfaces.RecoveryFault) {
+	s.unsafeRecovery = faults
+}
+
+// UnsafeRecoveryFaults reports the artifacts this process discarded at boot.
+// Empty on a clean boot. This is the in-process form of the pinned metric.
+func (s *Server) UnsafeRecoveryFaults() []*interfaces.RecoveryFault { return s.unsafeRecovery }
+
+// unsafeRecoveryNagInterval is how often a degraded broker re-announces that it
+// is degraded.
+//
+// One startup line is precisely what let two contaminated data directories sit
+// unnoticed in this repository for three weeks: nobody reads a log line from
+// three weeks ago, and nothing on a dashboard changed. A degraded boot has to
+// stay loud for as long as the process runs.
+const unsafeRecoveryNagInterval = 5 * time.Minute
+
+// nagUnsafeRecovery re-announces the degraded boot for the lifetime of the
+// process. Spawned only when the broker actually booted degraded.
+func (s *Server) nagUnsafeRecovery(ctx context.Context) {
+	ticker := time.NewTicker(unsafeRecoveryNagInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for _, f := range s.unsafeRecovery {
+				s.Log.Error("THIS BROKER IS RUNNING DEGRADED: it started with "+interfaces.UnsafeRecoveryFlag+
+					" after discarding data it could not recover",
+					zap.String("outcome", f.Outcome.String()),
+					zap.String("stage", f.Stage),
+					zap.String("path", f.Artifact),
+					zap.String("cost", f.Cost),
+					zap.Duration("degraded_for", time.Since(s.StartTime)))
+			}
+		}
+	}
+}
+
+// startUnsafeRecoveryNag spawns the degraded-boot nag if and only if this
+// process booted degraded. Returns whether it started one.
+func (s *Server) startUnsafeRecoveryNag() bool {
+	if len(s.unsafeRecovery) == 0 {
+		return false
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.Mutex.Lock()
+	s.unsafeRecoveryCancel = cancel
+	s.Mutex.Unlock()
+	go s.nagUnsafeRecovery(ctx)
+	return true
+}
+
+// consumerTagGenerator returns the generator this server draws server-side
+// consumer tags from: the substituted one if a test installed it, otherwise the
+// production protocol.GenerateConsumerTag. Read once per basic.consume with an
+// empty consumer-tag, so it is off both the per-message and per-ack paths.
+func (s *Server) consumerTagGenerator() func() string {
+	if s.generateConsumerTag != nil {
+		return s.generateConsumerTag
+	}
+	return protocol.GenerateConsumerTag
 }
 
 // Resource-alarm bits stored in Server.alarmState (SQ-12). Part of the Wave 2
@@ -105,28 +201,6 @@ const (
 // path uses this to gate on active alarms (SQ-12).
 func (s *Server) AlarmState() uint32 {
 	return s.alarmState.Load()
-}
-
-// NewServer creates a new AMQP server with default storage
-func NewServer(addr string) *Server {
-	cfg := config.DefaultConfig()
-	cfg.Network.Address = addr
-	// Storage is always persistent - use default path from config
-
-	serverBuilder := NewServerBuilder().WithConfig(cfg)
-	srv, err := serverBuilder.Build()
-	if err != nil {
-		// Fallback to minimal configuration
-		logger, _ := zap.NewProduction()
-		return &Server{
-			Addr:             addr,
-			Connections:      make(map[string]*protocol.Connection),
-			Log:              logger,
-			MetricsCollector: &NoOpMetricsCollector{},
-			StartTime:        time.Now(),
-		}
-	}
-	return srv
 }
 
 // Start starts the AMQP server
@@ -161,6 +235,14 @@ func (s *Server) Start() error {
 	if s.startAlarmMonitor() {
 		s.Log.Info("Started resource-alarm monitor",
 			zap.Duration("interval", s.alarm.interval))
+	}
+
+	// A broker that booted with --unsafe-recovery stays loud for its whole
+	// lifetime. Not spawned on a clean boot.
+	if s.startUnsafeRecoveryNag() {
+		s.Log.Error("THIS BROKER IS RUNNING DEGRADED: it started with "+interfaces.UnsafeRecoveryFlag+
+			" after discarding data it could not recover",
+			zap.Int("discarded_artifacts", len(s.unsafeRecovery)))
 	}
 
 	return s.acceptLoop()
@@ -316,10 +398,13 @@ func (s *Server) cleanupConnection(connection *protocol.Connection) {
 	connection.Channels.Range(func(key, value interface{}) bool {
 		channel := value.(*protocol.Channel)
 		channel.Mutex.Lock()
-		// Collect consumer tags to unregister
-		consumerTags := make([]string, 0, len(channel.Consumers))
-		for consumerTag := range channel.Consumers {
-			consumerTags = append(consumerTags, consumerTag)
+		// Collect broker-internal consumer identities to unregister. NOT wire
+		// tags: those are only channel-scoped, so unregistering by tag would
+		// tear down whichever same-tagged consumer registered last — this
+		// connection's teardown killing another connection's consumer.
+		consumerIDs := make([]string, 0, len(channel.Consumers))
+		for _, consumer := range channel.Consumers {
+			consumerIDs = append(consumerIDs, consumer.ID)
 		}
 		channel.Consumers = make(map[string]*protocol.Consumer)
 		channel.Closed = true
@@ -336,16 +421,16 @@ func (s *Server) cleanupConnection(connection *protocol.Connection) {
 
 		// Unregister from broker (stops poll goroutines)
 		if s.Broker != nil {
-			for _, consumerTag := range consumerTags {
-				err := s.Broker.UnregisterConsumer(consumerTag)
+			for _, consumerID := range consumerIDs {
+				err := s.Broker.UnregisterConsumer(consumerID)
 				if err != nil {
 					s.Log.Warn("Failed to unregister consumer on connection close",
-						zap.String("consumer_tag", consumerTag),
+						zap.String("consumer_id", consumerID),
 						zap.String("connection_id", connection.ID),
 						zap.Error(err))
 				} else {
 					s.Log.Debug("Unregistered consumer on connection close",
-						zap.String("consumer_tag", consumerTag),
+						zap.String("consumer_id", consumerID),
 						zap.String("connection_id", connection.ID))
 				}
 			}
@@ -1340,6 +1425,7 @@ func (s *Server) Stop() error {
 	ln := s.Listener
 	cancel := s.metricsCancel
 	alarmCancel := s.alarmCancel
+	nagCancel := s.unsafeRecoveryCancel
 	s.Mutex.Unlock()
 
 	if cancel != nil {
@@ -1347,6 +1433,9 @@ func (s *Server) Stop() error {
 	}
 	if alarmCancel != nil {
 		alarmCancel()
+	}
+	if nagCancel != nil {
+		nagCancel()
 	}
 
 	if ln != nil {
@@ -1387,6 +1476,14 @@ func (s *Server) StartWithQuitChannel(quit <-chan struct{}) error {
 	if s.startAlarmMonitor() {
 		s.Log.Info("Started resource-alarm monitor",
 			zap.Duration("interval", s.alarm.interval))
+	}
+
+	// A broker that booted with --unsafe-recovery stays loud for its whole
+	// lifetime. Not spawned on a clean boot.
+	if s.startUnsafeRecoveryNag() {
+		s.Log.Error("THIS BROKER IS RUNNING DEGRADED: it started with "+interfaces.UnsafeRecoveryFlag+
+			" after discarding data it could not recover",
+			zap.Int("discarded_artifacts", len(s.unsafeRecovery)))
 	}
 
 	// Accept connections

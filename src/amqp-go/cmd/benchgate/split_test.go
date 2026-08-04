@@ -68,6 +68,53 @@ func TestSplitByPackage_MultiplePackagesAppended(t *testing.T) {
 	}
 }
 
+// TestSplitByPackage_CPULineBelongsToItsOwnPackage pins the metadata
+// attribution contract that the two tests above cannot see, because both use
+// the SAME cpu string for every package.
+//
+// `go test` emits its header in the order goos:, goarch:, pkg:, cpu: — the
+// cpu line comes AFTER the pkg line, unlike the other two. Classifying all
+// three as "preamble buffered until the next pkg: line" therefore attaches
+// each package's cpu line to the FOLLOWING package's section, leaves the
+// first package with no cpu line at all, and drops the last package's
+// entirely.
+//
+// This is not cosmetic. The cpu line is the only record of which machine a
+// section was measured on, and benchstat keys its configurations on it: a
+// section that has lost its cpu line silently compares as if it were
+// same-hardware. See TestRun_HardwareMismatchedBaselineIsHardError.
+func TestSplitByPackage_CPULineBelongsToItsOwnPackage(t *testing.T) {
+	input := "goos: darwin\ngoarch: arm64\npkg: pkg/a\ncpu: CPU Alpha\n" +
+		"BenchmarkX-8    	     200	        21.04 ns/op\n" +
+		"PASS\nok  	pkg/a	0.10s\n" +
+		"goos: darwin\ngoarch: arm64\npkg: pkg/b\ncpu: CPU Beta\n" +
+		"BenchmarkY-8    	     200	        22.04 ns/op\n" +
+		"PASS\nok  	pkg/b	0.10s\n"
+
+	sections := splitByPackage([]byte(input))
+	if len(sections) != 2 {
+		t.Fatalf("got %d sections, want 2", len(sections))
+	}
+
+	for i, want := range []struct{ pkg, cpu, notCPU string }{
+		{"pkg/a", "cpu: CPU Alpha", "cpu: CPU Beta"},
+		{"pkg/b", "cpu: CPU Beta", "cpu: CPU Alpha"},
+	} {
+		body := string(sections[i].body)
+		if sections[i].pkg != want.pkg {
+			t.Fatalf("section %d pkg = %q, want %q", i, sections[i].pkg, want.pkg)
+		}
+		if !strings.Contains(body, want.cpu) {
+			t.Errorf("section %d (%s) is missing its own %q — the machine it was measured on is unrecorded:\n%s",
+				i, want.pkg, want.cpu, body)
+		}
+		if strings.Contains(body, want.notCPU) {
+			t.Errorf("section %d (%s) carries %q, which belongs to the other package:\n%s",
+				i, want.pkg, want.notCPU, body)
+		}
+	}
+}
+
 func TestMergeSections_DuplicatePackageConcatenates(t *testing.T) {
 	sections := []pkgSection{
 		{pkg: "a", body: []byte("BenchmarkX-1  1  1 ns/op\n")},

@@ -57,8 +57,12 @@ type MessageStore interface {
 	// GetQueueMessageCount returns the number of messages in a queue
 	GetQueueMessageCount(queueName string) (int, error)
 
-	// PurgeQueue removes all messages from a queue
-	PurgeQueue(queueName string) (int, error)
+	// PurgeQueue removes every message of the named queue whose delivery tag
+	// lies in [minTag, maxTag]. The band identifies the CALLER'S queue
+	// incarnation: a purge issued against one incarnation must never be applied
+	// to a successor that took the same name, and the name alone cannot tell
+	// the two apart.
+	PurgeQueue(queueName string, minTag, maxTag uint64) (int, error)
 
 	// GetMessageRange retrieves messages in a specific delivery tag range (for pull-based delivery)
 	GetMessageRange(queueName string, startTag, endTag uint64) ([]*protocol.Message, error)
@@ -75,11 +79,8 @@ type MessageStore interface {
 	GetMinAckCursor(queueName string) uint64
 
 	// Unacked message tracking (for prefetch limit enforcement)
-	AddUnacked(queueName, consumerTag string, deliveryTag uint64) error
-	RemoveUnacked(queueName, consumerTag string, deliveryTag uint64) error
 	GetUnackedCount(queueName, consumerTag string) (int, error)
 	GetUnackedTags(queueName, consumerTag string) ([]uint64, error)
-	GetLowestUnackedAcrossConsumers(queueName string) (uint64, error)
 }
 
 // MetadataStore defines the interface for exchanges, queues, and bindings persistence

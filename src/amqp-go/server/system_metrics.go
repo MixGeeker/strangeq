@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"syscall"
 	"time"
+
+	"github.com/maxpert/amqp-go/storage"
 )
 
 // startSystemMetricsCollection starts a background goroutine to collect system metrics
@@ -186,8 +188,20 @@ func (s *Server) updateSegmentMetrics() {
 			continue
 		}
 
-		queueName := entry.Name()
-		queueDir := filepath.Join(segmentDir, queueName)
+		// The directory entry's name is NOT necessarily the queue name — a name
+		// that cannot be a path element gets a generated directory whose owner
+		// is recorded inside it (review-4 B-1). Labelling the metric with the
+		// entry name would show an operator a hex string.
+		//
+		// A directory that cannot be attributed is SKIPPED rather than labelled
+		// with a guess: a wrong label silently folds one queue's segment counts
+		// into another queue's series, which is worse than a missing series
+		// (review-5 MINOR-5).
+		queueName, attributed := storage.QueueNameForSegmentDir(segmentDir, entry.Name())
+		if !attributed {
+			continue
+		}
+		queueDir := filepath.Join(segmentDir, entry.Name())
 
 		segmentFiles, err := os.ReadDir(queueDir)
 		if err != nil {

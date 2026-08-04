@@ -44,6 +44,15 @@ func main() {
 		tlsCert   = flag.String("tls-cert", "", "Path to TLS certificate file (PEM)")
 		tlsKey    = flag.String("tls-key", "", "Path to TLS private key file (PEM)")
 		tlsCA     = flag.String("tls-ca", "", "Path to TLS CA file for mutual TLS client verification (PEM)")
+
+		// Recovery override. The broker refuses to start on a data directory
+		// whose recovery cannot be completed safely; this is the documented
+		// way past that refusal, and the refusal message names it.
+		unsafeRecovery = flag.Bool("unsafe-recovery", false,
+			"DATA-LOSS SWITCH. Start even when recovery cannot be completed safely, DISCARDING every artifact the broker could not recover. "+
+				"Each discarded artifact is logged by path at ERROR level, the amqp_unsafe_recovery_discarded_artifacts gauge is pinned above zero "+
+				"for the lifetime of the process, and the broker re-warns every 5 minutes. Confirmed durable messages in the discarded artifacts are "+
+				"NOT recovered. Prefer restoring from a backup, or moving the named files aside so you still have them, before using this.")
 	)
 
 	flag.Parse()
@@ -109,6 +118,9 @@ func main() {
 	}
 	if *tlsCA != "" {
 		cfg.Security.TLSCAFile = *tlsCA
+	}
+	if *unsafeRecovery {
+		cfg.Storage.UnsafeRecovery = true
 	}
 
 	// Re-validate after CLI overrides
@@ -201,6 +213,9 @@ func main() {
 		} else {
 			fmt.Printf("Starting AMQP server on %s\n", cfg.Network.Address)
 			fmt.Printf("Storage path: %s (persistent)\n", cfg.Storage.Path)
+			if cfg.Storage.UnsafeRecovery {
+				fmt.Println("*** --unsafe-recovery IS SET: this broker may have discarded unrecoverable data at boot. See the log lines above. ***")
+			}
 			if cfg.Security.TLSEnabled {
 				if cfg.Security.TLSCAFile != "" {
 					fmt.Println("TLS: Enabled (mutual TLS, client cert required)")

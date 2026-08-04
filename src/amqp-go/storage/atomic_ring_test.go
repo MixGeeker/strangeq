@@ -211,7 +211,9 @@ func TestAtomicRing_MessageCountAccurate(t *testing.T) {
 	require.Equal(t, uint64(N-M), r.Count())
 }
 
-func TestAtomicRing_PurgeClearsAll(t *testing.T) {
+// Named for the behaviour, not for the deleted AtomicRing.Purge() it used to
+// exercise: a full-tag-space DeleteRange is what a whole-ring wipe now is.
+func TestAtomicRing_DeleteRangeOverFullTagSpaceClearsAll(t *testing.T) {
 	r := NewAtomicRing(256)
 	for tag := uint64(1); tag <= 10; tag++ {
 		_, _, err := r.Store(tag, msgAt(tag))
@@ -219,7 +221,7 @@ func TestAtomicRing_PurgeClearsAll(t *testing.T) {
 	}
 	require.Equal(t, uint64(10), r.Count())
 
-	removed := r.Purge()
+	removed := r.DeleteRange(0, ^uint64(0))
 	require.Equal(t, 10, removed)
 	require.Equal(t, uint64(0), r.Count())
 	for i := range r.slots {
