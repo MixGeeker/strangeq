@@ -420,37 +420,84 @@ func (ds *DisruptorStorage) GetMessage(queueName string, deliveryTag uint64) (*p
 		return nil, interfaces.ErrQueueNotFound
 	}
 
+	// The RING is self-gating and is therefore read first, UNGATED: DeleteMessage
+	// and DeleteMessageIfPresent remove the tag from the ring BEFORE they
+	// acknowledge either durable tier, so a ring hit means no acknowledgement has
+	// been issued through this layer. Keeping the gate off the warm path is
+	// deliberate — the ring is the only tier a warm read touches.
 	if msg, ok := ring.ring.LoadByTag(deliveryTag); ok {
 		return msg, nil
 	}
 
+	// THE ACKNOWLEDGEMENT GATE, covering every COLD tier at once.
+	//
+	// Below this line the answer can come from the read-ahead buffer, the WAL's
+	// O(1) index, the WAL's sequential scan, or a segment. All four are gated
+	// here, once, because this is the only layer that sees all four and the only
+	// layer that holds NO tier lock while asking.
+	//
+	// Per-tier gating cannot do this job. The tiers disagree about what "acked"
+	// means: WALManager.Acknowledge records synchronously, while the segment
+	// tier's bitmap is written by batchAckLoop on a 10ms ticker, so a segment
+	// gate is blind for up to one tick after every ack — and queue_reaper's
+	// reapTTLSweep acknowledges a tag and re-probes it inside the same sweep,
+	// landing in that window by construction. Worse, a WAL gate that correctly
+	// refuses is precisely what ROUTES the probe on to the segment tier, because
+	// a tier error here means "try the next one". One gate above all four
+	// consults ONE set with ONE latency and never asks which tier is answering.
+	if ds.wal != nil && ds.wal.IsAcknowledged(deliveryTag) {
+		return nil, interfaces.ErrMessageNotFound
+	}
+
+	var msg *protocol.Message
+
 	if ring.readAhead != nil {
-		if msg, ok := ring.readAhead.get(deliveryTag); ok {
-			return msg, nil
+		if m, ok := ring.readAhead.get(deliveryTag); ok {
+			msg = m
 		}
 	}
 
-	if ds.wal != nil {
+	if msg == nil && ds.wal != nil {
 		if ring.readAhead != nil {
 			if batch, err := ds.wal.ReadBatch(queueName, deliveryTag); err == nil && len(batch) > 0 {
+				// Take our own answer BEFORE publishing the map. put() hands
+				// ownership of `batch` to the buffer, after which it may only be
+				// touched under the buffer's lock — remove() deletes from it on
+				// every acknowledgement. Reading batch[...] after put() is an
+				// unsynchronised access to a map another goroutine is mutating.
+				m, ok := batch[deliveryTag]
 				ring.readAhead.put(batch)
-				if msg, ok := batch[deliveryTag]; ok {
-					return msg, nil
+				if ok {
+					msg = m
 				}
 			}
 		}
-		if msg, err := ds.wal.Read(queueName, deliveryTag); err == nil {
-			return msg, nil
+		if msg == nil {
+			if m, err := ds.wal.Read(queueName, deliveryTag); err == nil {
+				msg = m
+			}
 		}
 	}
 
-	if ds.segments != nil {
-		if msg, err := ds.segments.Read(queueName, deliveryTag); err == nil {
-			return msg, nil
+	if msg == nil && ds.segments != nil {
+		if m, err := ds.segments.Read(queueName, deliveryTag); err == nil {
+			msg = m
 		}
 	}
 
-	return nil, interfaces.ErrMessageNotFound
+	if msg == nil {
+		return nil, interfaces.ErrMessageNotFound
+	}
+
+	// RE-VALIDATE. The gate above and the tier read below it are not atomic, so
+	// an acknowledgement landing while the cold read was in flight would
+	// otherwise be served. Re-asking narrows that window to the bitmap lookup
+	// itself, and costs one uncontended RLock on the cold path only.
+	if ds.wal != nil && ds.wal.IsAcknowledged(deliveryTag) {
+		return nil, interfaces.ErrMessageNotFound
+	}
+
+	return msg, nil
 }
 
 func (ds *DisruptorStorage) DeleteMessage(queueName string, deliveryTag uint64) error {
@@ -467,6 +514,13 @@ func (ds *DisruptorStorage) DeleteMessage(queueName string, deliveryTag uint64) 
 	isDurable := foundInRing && msg.DeliveryMode == 2
 
 	ring.ring.Delete(deliveryTag)
+
+	// Invalidate the read-ahead cache unconditionally. GetMessage consults it
+	// before the WAL, so leaving an acknowledged tag there keeps serving it no
+	// matter what the WAL decides.
+	if ring.readAhead != nil {
+		ring.readAhead.remove(deliveryTag)
+	}
 
 	if !foundInRing || isDurable {
 		if ds.wal != nil {
@@ -502,6 +556,12 @@ func (ds *DisruptorStorage) DeleteMessageIfPresent(queueName string, deliveryTag
 	isDurable := foundInRing && msg.DeliveryMode == 2
 
 	removed := ring.ring.Delete(deliveryTag)
+
+	// See DeleteMessage: the read-ahead cache sits in front of the WAL and must
+	// not outlive the acknowledgement. This is the path reapTTLSweep takes.
+	if ring.readAhead != nil {
+		ring.readAhead.remove(deliveryTag)
+	}
 
 	if !foundInRing || isDurable {
 		if ds.wal != nil {

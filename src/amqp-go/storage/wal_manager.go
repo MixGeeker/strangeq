@@ -820,6 +820,26 @@ func (wm *WALManager) Acknowledge(queueName string, offset uint64) {
 		return
 	}
 
+	// Record the acknowledgement SYNCHRONOUSLY, before handing the index cleanup
+	// to cleanupLoop.
+	//
+	// The cleanup is asynchronous, and it used to carry the bitmap update with it.
+	// That left a window — Acknowledge has returned, but cleanupLoop has not run —
+	// in which the ack was recorded NOWHERE: ackBitmap did not have it yet and
+	// offsetIndex still did, so readMessage's O(1) fast path served the
+	// acknowledged record and no gate could see it. The window widens exactly when
+	// the machine is busy and cleanupLoop is starved, which is when it matters.
+	// broker/queue_reaper.go reapTTLSweep acknowledges a tag and re-probes it
+	// within the same sweep, so it lands in that window by construction.
+	//
+	// Doing it here means that once Acknowledge returns, every read path observes
+	// the ack, whatever cleanupLoop has or has not done yet. Total bitmapMutex
+	// traffic is unchanged — one Lock per ack either way; this only moves it off
+	// the cleanup goroutine onto the caller.
+	sw.bitmapMutex.Lock()
+	sw.ackBitmap.Add(offset)
+	sw.bitmapMutex.Unlock()
+
 	// Send to ACK channel (blocking with stopChan to prevent silent drops)
 	select {
 	case sw.ackChan <- &ackRequest{
@@ -829,6 +849,32 @@ func (wm *WALManager) Acknowledge(queueName string, offset uint64) {
 	case <-sw.stopChan:
 		// WAL is shutting down, discard ACK
 	}
+}
+
+// IsAcknowledged reports whether THIS INCARNATION has acknowledged the offset.
+//
+// It is the single acknowledgement oracle for the storage layer's read path, and
+// it takes bitmapMutex WHILE HOLDING NOTHING ELSE — no file handle, no index, no
+// old-file lock. That is what keeps it out of every lock cycle in this package,
+// and it is the property to preserve if this ever moves: the value is what makes
+// it correct, the lock depth is what makes it safe.
+//
+// It answers only for THIS incarnation. ackBitmap starts empty at every boot
+// (see wal_boot_state.go), so a false here means "this process has not acked it",
+// never "nobody ever did". Callers must fail toward SERVING on false — a
+// redelivery is recoverable and AMQP models it, whereas refusing a live durable
+// record loses confirmed data silently.
+func (wm *WALManager) IsAcknowledged(offset uint64) bool {
+	wm.mu.RLock()
+	sw := wm.sharedWAL
+	wm.mu.RUnlock()
+	if sw == nil {
+		return false
+	}
+	sw.bitmapMutex.RLock()
+	acked := sw.ackBitmap.Contains(offset)
+	sw.bitmapMutex.RUnlock()
+	return acked
 }
 
 // Read reads a message from shared WAL by queue+offset
@@ -2377,13 +2423,23 @@ func (qw *QueueWAL) cleanupLoop() {
 	for {
 		select {
 		case ack := <-qw.ackChan:
-			qw.bitmapMutex.Lock()
-			qw.ackBitmap.Add(ack.offset)
-			qw.bitmapMutex.Unlock()
-
-			// Clean up offset index (Phase 6D)
-			// NOTE: In shared WAL, we still use offset alone as key
-			// because offsets are globally unique across queues
+			// Clean up offset index (Phase 6D).
+			//
+			// The ackBitmap update does NOT happen here — WALManager.Acknowledge
+			// does it synchronously before enqueuing, so that no window exists in
+			// which the ack has been issued but is visible to no read path. See the
+			// note there; moving it was the fix for a residual re-delivery that only
+			// appeared when this goroutine was starved.
+			//
+			// Keying by offset alone is sound ACROSS QUEUES — a delivery tag is
+			// (queueOrdinal << 44) | perQueueSeq, so no two queues mint the same
+			// value. It is NOT sound across INCARNATIONS: a non-durable queue that
+			// is redeclared after a restart reclaims its ordinal with perQueueSeq
+			// back at zero and re-mints a band of tags whose previous-incarnation
+			// records are still physically on disk. So one entry here can name two
+			// records, and this delete cannot tell which one it cancels — which is
+			// why the read path resolves the ambiguity positionally (current file
+			// before oldFiles) rather than trusting the key.
 			qw.offsetIndexMutex.Lock()
 			delete(qw.offsetIndex, ack.offset)
 			qw.offsetIndexMutex.Unlock()
@@ -2480,6 +2536,48 @@ func (qw *QueueWAL) forceCheckpointFile(info *walFileInfo) {
 // Phase 6D: Uses O(1) offset index instead of sequential scan
 // queueName is used for validation (entries include queue name in shared WAL)
 func (qw *QueueWAL) readMessage(queueName string, offset uint64) (*protocol.Message, error) {
+	// An offset this incarnation has ACKNOWLEDGED is not a live message, and the
+	// gate belongs HERE rather than in the sequential fallback alone: the ack
+	// deletes the offsetIndex entry asynchronously, so for as long as that entry
+	// survives the O(1) path below answers the probe and never reaches the scan.
+	//
+	// broker/queue_reaper.go reapTTLSweep probes acked tags on every sweep by
+	// design and documents the expectation that they read back empty. When they do
+	// not it re-expires and re-dead-letters the same record without bound, and its
+	// tail-advance loop, which breaks on any non-nil message, never moves past the
+	// tag.
+	//
+	// The gate suppresses only on POSITIVE evidence that the record is dead, and
+	// that direction is load-bearing. An unacked record is never refused: a
+	// redelivery is recoverable and AMQP 0-9-1 models it, whereas refusing to serve
+	// a live durable record loses confirmed data silently. RecoverFromWAL and
+	// performCheckpoint already filter against this same bitmap; the read path was
+	// the only consumer that did not.
+	//
+	// THE PREMISE THAT MAKES THAT SAFE, STATED BECAUSE IT IS SCHEDULED TO BECOME
+	// FALSE: ackBitmap is monotone WITHIN AN INCARNATION and starts EMPTY at every
+	// boot — acknowledgement is not persisted (wal_boot_state.go rebuildBootState:
+	// "It restores no acknowledgement state"; broker/queue_dispatch.go states the
+	// same as THE UNWRITTEN PREMISE). So an entry here can only have been put there
+	// by this process, for a record this process served, and the gate cannot
+	// suppress a record it never acked.
+	//
+	// WHAT FALSIFIES IT: durable acknowledgement (item 18). Once an ack set seeds
+	// this bitmap at boot, "monotone within an incarnation" silently becomes
+	// "monotone ACROSS incarnations", which is a strictly stronger claim that
+	// nobody has proved — and the error direction INVERTS. A redeclared queue
+	// re-mints a tag band (broker re-uses the ordinal with perQueueSeq at zero), so
+	// an inherited ack entry would match the LIVE record on a re-minted tag and this
+	// gate would refuse to serve it: silent loss of confirmed durable data, exactly
+	// the direction the paragraph above says it avoids. Whoever lands durable acks
+	// must make this gate incarnation-aware BEFORE seeding the bitmap at boot.
+	qw.bitmapMutex.RLock()
+	acked := qw.ackBitmap.Contains(offset)
+	qw.bitmapMutex.RUnlock()
+	if acked {
+		return nil, fmt.Errorf("message not in WAL")
+	}
+
 	// Check offset index first (Phase 6D: O(1) lookup!)
 	qw.offsetIndexMutex.RLock()
 	location, ok := qw.offsetIndex[offset]
@@ -2495,16 +2593,38 @@ func (qw *QueueWAL) readMessage(queueName string, offset uint64) (*protocol.Mess
 	return qw.readMessageSequential(queueName, offset)
 }
 
-// getOldFileHandle returns an open file handle for an old WAL file, using a cache
-// to avoid repeated open/close syscalls. Callers must call the returned unlock
-// function after done with the file (ReadAt calls) to prevent concurrent close.
-func (qw *QueueWAL) getOldFileHandle(fileNum uint64) (*os.File, func(), error) {
+// oldFileReadAttempts bounds the retry in withOldFileHandle. Two: one to
+// discover the cached handle was closed under us, and one against a freshly
+// opened replacement. There is no third state to recover from — a file that is
+// genuinely gone fails the re-open with a filesystem error, which is the honest
+// answer to give the caller.
+const oldFileReadAttempts = 2
+
+// getOldFileHandle returns an open file handle for an old WAL file, using a
+// cache to avoid repeated open/close syscalls.
+//
+// IT RETURNS NO UNLOCK FUNCTION, AND THAT IS A TYPE-LEVEL INVARIANT RATHER THAN
+// A CONVENTION. oldFileCacheMutex is a LEAF: it is released before this function
+// returns on every path, and with no return slot for a lock no future edit can
+// hand one to a caller. That is what removes the oldFileCacheMutex ->
+// bitmapMutex edge of the F1 cycle, at the compiler rather than at review.
+//
+// The consequence is that closeOldFileHandle may close the returned handle
+// between this return and the caller's ReadAt. That is SAFE, and it is asserted
+// rather than documented (TestClosedOldFileHandle_ReadAtYieldsTypedErrClosed):
+// os.File.ReadAt -> poll.FD.Pread takes an incref that fails once Close has
+// marked the descriptor closed, so the read returns a typed os.ErrClosed without
+// ever reaching Sysfd — it can neither read through a recycled descriptor nor
+// race Close's deferred destroy(). Callers go through withOldFileHandle, which
+// turns that error into a bounded retry.
+func (qw *QueueWAL) getOldFileHandle(fileNum uint64) (*os.File, error) {
 	// Fast path: cache hit (RLock allows concurrent readers)
 	qw.oldFileCacheMutex.RLock()
-	if file, ok := qw.oldFileCache[fileNum]; ok {
-		return file, qw.oldFileCacheMutex.RUnlock, nil
-	}
+	cached, hit := qw.oldFileCache[fileNum]
 	qw.oldFileCacheMutex.RUnlock()
+	if hit {
+		return cached, nil
+	}
 
 	// Cache miss: get file path first (separate lock to avoid lock order inversion)
 	qw.oldFilesMutex.RLock()
@@ -2515,13 +2635,13 @@ func (qw *QueueWAL) getOldFileHandle(fileNum uint64) (*os.File, func(), error) {
 	}
 	qw.oldFilesMutex.RUnlock()
 	if !ok {
-		return nil, func() {}, fmt.Errorf("WAL file not found for fileNum %d", fileNum)
+		return nil, fmt.Errorf("WAL file not found for fileNum %d", fileNum)
 	}
 
 	// Open file outside any locks
 	file, err := os.Open(filePath)
 	if err != nil {
-		return nil, func() {}, err
+		return nil, err
 	}
 
 	// Add to cache (write lock)
@@ -2531,14 +2651,43 @@ func (qw *QueueWAL) getOldFileHandle(fileNum uint64) (*os.File, func(), error) {
 	// Double-check: another goroutine may have opened and cached it
 	if existing, ok := qw.oldFileCache[fileNum]; ok {
 		_ = file.Close() // close our redundant handle
-		return existing, func() {}, nil
+		return existing, nil
 	}
 
 	if qw.oldFileCache == nil {
 		qw.oldFileCache = make(map[uint64]*os.File)
 	}
 	qw.oldFileCache[fileNum] = file
-	return file, func() {}, nil
+	return file, nil
+}
+
+// withOldFileHandle runs read against the cached handle for fileNum, retrying
+// once on os.ErrClosed.
+//
+// The retry is what makes the safe direction structural instead of dependent on
+// which goroutine happens to run first: a reader that meets a handle closed
+// under it re-acquires and reads again, rather than reporting a transient
+// reclaim to its caller as a read fault. It is bounded, so a file that is really
+// gone still fails, promptly.
+func (qw *QueueWAL) withOldFileHandle(fileNum uint64, read func(*os.File) error) error {
+	var err error
+	for attempt := 0; attempt < oldFileReadAttempts; attempt++ {
+		var file *os.File
+		file, err = qw.getOldFileHandle(fileNum)
+		if err != nil {
+			return err
+		}
+		err = read(file)
+		if !errors.Is(err, os.ErrClosed) {
+			return err
+		}
+		// Drop the handle we just read through before trying again. In the
+		// production race closeOldFileHandle has already removed it and this is
+		// a no-op; it matters when the closed entry is still installed, which is
+		// the only state a second attempt can actually repair.
+		qw.closeOldFileHandle(fileNum)
+	}
+	return err
 }
 
 // closeOldFileHandle closes and removes a cached file handle (called when old file is deleted)
@@ -2553,31 +2702,40 @@ func (qw *QueueWAL) closeOldFileHandle(fileNum uint64) {
 
 // readMessageAtPosition reads a message at a specific file position (O(1))
 // Uses ReadAt (pread) for positional I/O — no Seek needed, no file open/close per read.
-// Current file: uses the already-open handle. Old files: uses a file handle cache.
+// Current file: uses the already-open handle. Old files: uses a file handle cache,
+// through withOldFileHandle so a handle closed under the read is retried rather
+// than reported as a read fault.
 func (qw *QueueWAL) readMessageAtPosition(queueName string, fileNum uint64, filePosition int64, expectedOffset uint64) (*protocol.Message, error) {
-	var file *os.File
-
 	// Load currentFileNum inside fileMutex to prevent TOCTOU race with rollFile
 	qw.fileMutex.Lock()
 	currentFileNum := qw.fileNum.Load()
 	if fileNum == currentFileNum {
-		file = qw.currentReadFile
+		file := qw.currentReadFile
 		qw.fileMutex.Unlock()
 		if file == nil {
 			return nil, fmt.Errorf("WAL current read file not open for fileNum %d", fileNum)
 		}
-	} else {
-		qw.fileMutex.Unlock()
-		// Reading from old file — use file handle cache
-		var unlock func()
-		var cacheErr error
-		file, unlock, cacheErr = qw.getOldFileHandle(fileNum)
-		if cacheErr != nil {
-			return nil, cacheErr
-		}
-		defer unlock()
+		return qw.parseMessageAt(file, queueName, filePosition, expectedOffset)
 	}
+	qw.fileMutex.Unlock()
 
+	var msg *protocol.Message
+	err := qw.withOldFileHandle(fileNum, func(file *os.File) error {
+		var perr error
+		msg, perr = qw.parseMessageAt(file, queueName, filePosition, expectedOffset)
+		return perr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return msg, nil
+}
+
+// parseMessageAt reads and decodes the single record at filePosition in file. It
+// is split out of readMessageAtPosition so both the current-file arm and the
+// retrying old-file arm decode identically — a second copy of this parse is how
+// the two arms would drift.
+func (qw *QueueWAL) parseMessageAt(file *os.File, queueName string, filePosition int64, expectedOffset uint64) (*protocol.Message, error) {
 	// Read CRC + length in a single ReadAt (8 bytes at filePosition)
 	header := make([]byte, 8)
 	_, err := file.ReadAt(header, filePosition)
@@ -2630,11 +2788,16 @@ func (qw *QueueWAL) readMessageAtPosition(queueName string, fileNum uint64, file
 	}
 
 	// ITER5: a shared-body record carries a body REFERENCE. Resolve it with a
-	// SECOND ReadAt for the co-located BodyBlock on the SAME open handle, still
-	// under the handle-lifetime protection this function holds (current file: the
-	// held currentReadFile; old file: the cache RLock / kept handle), so a
-	// concurrent close cannot race the block read (§5.3). The block is in the same
-	// file as the reference by the co-location invariant, so `file` is correct.
+	// SECOND ReadAt for the co-located BodyBlock on the SAME open handle. The
+	// block is in the same file as the reference by the co-location invariant, so
+	// `file` is correct.
+	//
+	// This second read is NOT protected by any handle-lifetime lock on the
+	// old-file arm — nothing holds oldFileCacheMutex here, by design. A
+	// concurrent closeOldFileHandle makes this ReadAt return os.ErrClosed, which
+	// propagates out of this function and is retried by withOldFileHandle
+	// against a fresh handle. The %w below is load-bearing for that: errors.Is
+	// traverses it, so wrapping keeps the diagnostic without hiding the cause.
 	if len(rm.Message.BodyRef) == 8 {
 		blockOffset := int64(binary.BigEndian.Uint64(rm.Message.BodyRef))
 		body, berr := readBodyBlockAt(file, blockOffset)
@@ -2697,7 +2860,51 @@ func readBodyBlockAt(file *os.File, position int64) ([]byte, error) {
 
 // readMessageSequential does sequential scan fallback (slow, only for unindexed messages)
 func (qw *QueueWAL) readMessageSequential(queueName string, offset uint64) (*protocol.Message, error) {
-	// Try to read from old files first
+	// NOTE: the acknowledgement gate is NOT repeated here. readMessage is this
+	// function's only caller and applies it at the entry point, which strictly
+	// dominates: a gate here could not see a probe answered by the O(1) fast path.
+	// Duplicating it would be one observable written twice and no mutation could
+	// redden this copy independently.
+
+	// The CURRENT file is searched FIRST. currentFileOffsets is reset by rollFile
+	// and added to only by flushBatch for records written to the file open now, so
+	// an offset in it names a record THIS incarnation wrote to THIS file — by
+	// construction the newest record carrying that offset. Searching oldFiles ahead
+	// of it handed back a previous incarnation's payload for a live tag whenever
+	// both files carried the same offset, which this WAL permits: it is globally
+	// tag-keyed with no queue discriminator, and a redeclared queue re-mints a tag
+	// band whose records its predecessor still occupies on disk.
+	//
+	// Membership also gates out a record whose bytes reached the file but whose
+	// fsync FAILED, because flushBatch populates currentFileOffsets only AFTER a
+	// successful fsync. Such a record is in neither that set nor the index and must
+	// not be returned: the frontier advances head past its tag, so the cursor is
+	// claimed, and a raw scan would otherwise deliver a message that was nacked.
+	qw.currentFileOffsetsMutex.Lock()
+	durableInCurrent := qw.currentFileOffsets.Contains(offset)
+	qw.currentFileOffsetsMutex.Unlock()
+
+	if durableInCurrent {
+		qw.fileMutex.Lock()
+		currentPath := ""
+		if qw.currentFile != nil {
+			currentPath = qw.currentFile.Name()
+		}
+		qw.fileMutex.Unlock()
+
+		if currentPath != "" {
+			// Deliberately NOT falling back to oldFiles on failure. Membership in
+			// currentFileOffsets is a positive statement that this incarnation
+			// durably wrote this offset to the open file; if it cannot be read
+			// there, that is an integrity problem, and answering with a different
+			// record that happens to share the tag is the corruption this ordering
+			// exists to prevent.
+			return qw.readMessageFromFile(queueName, currentPath, offset)
+		}
+	}
+
+	// Not in the current file: fall back to the rolled and inherited files. This
+	// is the ordinary cold read of a record written before the last roll.
 	qw.oldFilesMutex.RLock()
 	defer qw.oldFilesMutex.RUnlock()
 
@@ -2706,36 +2913,6 @@ func (qw *QueueWAL) readMessageSequential(queueName string, offset uint64) (*pro
 			// Found the file containing this offset
 			return qw.readMessageFromFile(queueName, fileInfo.path, offset)
 		}
-	}
-
-	// Not in old files, try the current file — but ONLY for an offset that has
-	// been durably written (recorded in currentFileOffsets, which flushBatch
-	// populates only AFTER a successful fsync). This gates out a record whose
-	// bytes reached the file but whose fsync FAILED: its offset is not in
-	// currentFileOffsets and it is not indexed, so it must not be returned. That
-	// closes the async durable path's fsync-error exposure — the frontier
-	// advances head past such a tag, so its cursor is claimed, and without this
-	// gate a raw scan would find the un-fsynced bytes and deliver a message that
-	// was nacked (never durable). A successfully-written offset is always in the
-	// offset index by the time it is claimable, so it takes the O(1) fast path
-	// and never reaches this scan; the gate therefore only excludes the
-	// non-durable case.
-	qw.currentFileOffsetsMutex.Lock()
-	durableInCurrent := qw.currentFileOffsets.Contains(offset)
-	qw.currentFileOffsetsMutex.Unlock()
-	if !durableInCurrent {
-		return nil, fmt.Errorf("message not in WAL")
-	}
-
-	qw.fileMutex.Lock()
-	currentPath := ""
-	if qw.currentFile != nil {
-		currentPath = qw.currentFile.Name()
-	}
-	qw.fileMutex.Unlock()
-
-	if currentPath != "" {
-		return qw.readMessageFromFile(queueName, currentPath, offset)
 	}
 
 	return nil, fmt.Errorf("message not in WAL")
@@ -2947,13 +3124,25 @@ func (qw *QueueWAL) performCheckpoint() {
 		delete(qw.oldFiles, fileNum)
 		qw.oldFilesMutex.Unlock()
 
-		// Clean up offset index entries for this file's offsets
+		// Clean up offset index entries for this file's offsets.
+		//
+		// Delete ONLY entries that actually point at the file being reclaimed. The
+		// bare delete-by-offset-value this replaces could not tell two records
+		// apart when they shared an offset, and they can: the WAL is globally
+		// tag-keyed with no queue discriminator, and a non-durable queue that is
+		// redeclared after a restart reclaims its ordinal with perQueueSeq back at
+		// zero, re-minting a tag band whose previous-incarnation records are still
+		// on disk. Reclaiming the old file then evicted the LIVE record's entry,
+		// dropping a current, unacknowledged, confirmed durable message off the
+		// O(1) path and onto the sequential scan.
 		if info.offsets != nil {
 			qw.offsetIndexMutex.Lock()
 			it := info.offsets.Iterator()
 			for it.HasNext() {
 				offset := it.Next()
-				delete(qw.offsetIndex, offset)
+				if loc, ok := qw.offsetIndex[offset]; ok && loc.fileNum == fileNum {
+					delete(qw.offsetIndex, offset)
+				}
 			}
 			qw.offsetIndexMutex.Unlock()
 		}

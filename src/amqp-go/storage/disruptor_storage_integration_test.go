@@ -155,20 +155,41 @@ func TestDisruptorStorage_DurableMessageAcknowledge(t *testing.T) {
 		require.NoError(t, err, "Message %d should be in WAL", i)
 	}
 
-	// Acknowledge some messages
-	for i := 1; i <= 5; i++ {
+	// Acknowledge the first half only, so the second half is a live control.
+	const ackedThrough = 5
+	for i := 1; i <= ackedThrough; i++ {
 		err := storage.DeleteMessage("test_queue", uint64(i))
 		require.NoError(t, err)
 	}
+	require.Less(t, ackedThrough, numMessages,
+		"PREMISE BROKEN: every message was acknowledged, so this fixture has no unacked "+
+			"control and cannot tell a correct ack gate from a read path that is simply broken")
 
 	// Allow ACKs to propagate
 	time.Sleep(50 * time.Millisecond)
 
-	// Verify ACKed messages are still readable (WAL doesn't delete, just marks as ACKed)
-	// This is expected behavior - WAL compaction will clean them up later
-	for i := 1; i <= numMessages; i++ {
-		_, err := wal.Read("test_queue", uint64(i))
-		require.NoError(t, err, "Message %d should still be readable from WAL", i)
+	// Split at the acknowledgement boundary and assert BOTH directions.
+	//
+	// This replaces an undiscriminating "all 10 still readable". That assertion's
+	// own rationale was about PHYSICAL retention — "WAL doesn't delete, just marks
+	// as ACKed… compaction will clean them up later" — which remains true, because
+	// nothing here deletes a record. But it stated physical retention as LOGICAL
+	// readability, and the module already disagreed: RecoverFromWAL filters on
+	// ackBitmap.Contains, and broker/queue_reaper.go reapTTLSweep probes acked tags
+	// on every sweep documenting that they must read back empty.
+	for i := 1; i <= ackedThrough; i++ {
+		_, rerr := wal.Read("test_queue", uint64(i))
+		require.Error(t, rerr,
+			"ACKNOWLEDGED TAG STILL SERVED: message %d was acknowledged through "+
+				"DisruptorStorage.DeleteMessage, so the WAL must not return it as a live "+
+				"message. Serving it re-expires and re-dead-letters the same record without "+
+				"bound and stalls the queue tail", i)
+	}
+	for i := ackedThrough + 1; i <= numMessages; i++ {
+		_, rerr := wal.Read("test_queue", uint64(i))
+		require.NoError(t, rerr,
+			"UNACKNOWLEDGED TAG REFUSED: message %d was never acknowledged and must still be "+
+				"readable from the WAL. Refusing it loses confirmed durable data silently", i)
 	}
 }
 

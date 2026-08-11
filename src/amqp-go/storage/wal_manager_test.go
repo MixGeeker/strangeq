@@ -275,19 +275,46 @@ func TestSharedWAL_Acknowledge(t *testing.T) {
 
 	time.Sleep(20 * time.Millisecond)
 
-	// Acknowledge some messages
-	for i := 0; i < 25; i++ {
+	// Acknowledge the first half only, so the second half is a live control.
+	const ackedThrough = 25
+	for i := 0; i < ackedThrough; i++ {
 		wm.Acknowledge("test_queue", uint64(i+1))
 	}
+	require.Less(t, ackedThrough, numMessages,
+		"PREMISE BROKEN: every message was acknowledged, so this fixture has no unacked "+
+			"control and cannot tell a correct ack gate from a read path that is simply broken")
 
 	time.Sleep(20 * time.Millisecond)
 
-	// Verify acknowledged messages are marked in bitmap
-	// (Internal state - would need to expose for testing, or test via cleanup)
-	// For now, verify all messages still readable
-	for i := 0; i < numMessages; i++ {
-		msg, err := wm.Read("test_queue", uint64(i+1))
-		require.NoError(t, err)
+	// Split at the acknowledgement boundary and assert BOTH directions.
+	//
+	// This replaces an undiscriminating "all 50 still readable", which asserted
+	// the opposite of the WAL's actual contract. That assertion described
+	// PHYSICAL retention — the records really are still on disk until compaction,
+	// and this fix deletes nothing — but it stated it as LOGICAL readability, and
+	// the rest of the module already disagreed: RecoverFromWAL filters on
+	// ackBitmap.Contains, and broker/queue_reaper.go reapTTLSweep probes acked
+	// tags on every sweep documenting that they must read back empty. Serving them
+	// instead is what re-expires and re-dead-letters a message without bound.
+	//
+	// Both halves are load-bearing. The unacked half is the discriminator: without
+	// it a fix that broke reads outright would satisfy the acked half and pass.
+	for i := 0; i < ackedThrough; i++ {
+		tag := uint64(i + 1)
+		_, rerr := wm.Read("test_queue", tag)
+		require.Error(t, rerr,
+			"ACKNOWLEDGED TAG STILL SERVED: tag %d was acknowledged through "+
+				"WALManager.Acknowledge, so a read of it must not return a live message. "+
+				"reapTTLSweep probes acked tags every sweep and relies on getting nothing back; "+
+				"answering re-expires and re-dead-letters the same record without bound", tag)
+	}
+	for i := ackedThrough; i < numMessages; i++ {
+		tag := uint64(i + 1)
+		msg, rerr := wm.Read("test_queue", tag)
+		require.NoError(t, rerr,
+			"UNACKNOWLEDGED TAG REFUSED: tag %d was never acknowledged and must still be "+
+				"readable. Refusing it loses confirmed durable data silently, which is the "+
+				"error direction the ack gate exists to avoid", tag)
 		assert.NotNil(t, msg)
 	}
 }
