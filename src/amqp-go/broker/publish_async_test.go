@@ -473,95 +473,154 @@ func TestFrontier_PerQueueFrontiersIndependent(t *testing.T) {
 // own fsync completes (possibly in different batches), and the single confirm
 // fires ONLY after BOTH copies are durable — never after just one.
 func TestAsyncConfirm_FanoutConfirmOnlyAfterAllCopies(t *testing.T) {
-	// One release token per group-commit fsync call; the test paces them.
+	const (
+		expectedCopies      = 2
+		walBatchSize        = 1
+		maxConcurrentFsyncs = 1
+		neverHappenedBound  = 30 * time.Second
+	)
+
+	// The shared WAL has one batchWriterLoop, so at most one fsync hook can be
+	// active. A one-slot arrival buffer therefore cannot block that writer before
+	// the test receives the announcement; release remains the explicit gate.
+	arrived := make(chan struct{}, maxConcurrentFsyncs)
 	release := make(chan struct{})
+	overlapped := make(chan int32, 1)
+	var fsyncCalls atomic.Int32
+	var activeFsyncs atomic.Int32
 	restore := storage.SetWALGroupCommitFsyncForTest(func(f *os.File) error {
-		<-release
+		call := fsyncCalls.Add(1)
+		if active := activeFsyncs.Add(1); active != maxConcurrentFsyncs {
+			activeFsyncs.Add(-1)
+			select {
+			case overlapped <- call:
+			default:
+			}
+			return fmt.Errorf("fixture premise broken: WAL fsync call %d overlapped another call", call)
+		}
+		defer activeFsyncs.Add(-1)
+		arrived <- struct{}{} // announce before waiting: never strand the writer here
+		<-release             // gate only after arrival is observable
 		return nil
 	})
 	defer restore()
-	// Drain any stragglers so the WAL writer can shut down cleanly on Close.
-	defer func() {
-		go func() {
-			for {
-				select {
-				case release <- struct{}{}:
-				case <-time.After(time.Second):
-					return
-				}
-			}
-		}()
-	}()
 
-	b, cleanup := createTestBroker(t)
+	ec := interfaces.EngineConfig{
+		RingBufferSize:        65536,
+		SpillThresholdPercent: 80,
+		WALBatchSize:          walBatchSize,
+	}
+	walCfg := storage.WALConfigFromEngine(ec)
+	require.Equal(t, walBatchSize, walCfg.BatchSize,
+		"fixture premise broken: each fanout copy must occupy its own WAL batch")
+	require.False(t, walCfg.SyncDisabled,
+		"fixture premise broken: fsync must be enabled for the durability gate")
+
+	store, err := storage.NewDisruptorStorageWithEngineConfig(t.TempDir(), ec)
+	require.NoError(t, err)
+	b := NewStorageBroker(store, ec)
+	var cleanupOnce sync.Once
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			b.Close()
+			_ = store.Close()
+		})
+	}
 	defer cleanup()
+	var releaseOnce sync.Once
+	releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseAll()
+
+	queueNames := []string{"fa", "fb"}
+	require.Len(t, queueNames, expectedCopies,
+		"fixture premise broken: fanout copy count changed")
 	require.NoError(t, b.DeclareExchange("fx2", "fanout", true, false, false, nil))
-	for _, q := range []string{"fa", "fb"} {
+	for _, q := range queueNames {
 		_, err := b.DeclareQueue(q, true, false, false, nil)
 		require.NoError(t, err)
 		require.NoError(t, b.BindQueue(q, "fx2", "", nil))
 	}
 
 	var fired atomic.Int32
+	confirmResult := make(chan error, expectedCopies+1)
 	msg := &protocol.Message{Body: []byte("fan"), RoutingKey: "", DeliveryMode: 2}
-	durableInflight, _, perr := b.PublishMessageAsyncConfirm("fx2", "", msg, func(error) { fired.Add(1) })
+	require.Less(t, len(msg.Body), b.sharedBodyThreshold(),
+		"fixture premise broken: shared-body fanout would fuse the copies into one fsync")
+	durableInflight, _, perr := b.PublishMessageAsyncConfirm("fx2", "", msg, func(err error) {
+		fired.Add(1)
+		confirmResult <- err
+	})
 	require.NoError(t, perr)
 	require.True(t, durableInflight)
+
+	visibleCount := func() int {
+		n := 0
+		for _, q := range queueNames {
+			n += int(b.GetQueueReadyCount(q))
+		}
+		return n
+	}
 
 	// Both copies gated: no confirm, neither queue visible.
 	assert.Equal(t, int32(0), fired.Load())
 	assert.Equal(t, uint32(0), b.GetQueueReadyCount("fa"))
 	assert.Equal(t, uint32(0), b.GetQueueReadyCount("fb"))
 
-	// Release fsync calls one at a time until the confirm fires. Before the final
-	// release the confirm must NOT have fired (both copies not yet durable), and
-	// the number of visible queues must equal the number of copies made durable
-	// so far — proving per-copy independent visibility across batches.
-	visibleCount := func() int {
-		n := 0
-		if b.GetQueueReadyCount("fa") == 1 {
-			n++
-		}
-		if b.GetQueueReadyCount("fb") == 1 {
-			n++
-		}
-		return n
-	}
-	for released := 1; released <= 2; released++ {
+	for released := 1; released <= expectedCopies; released++ {
+		arrivalDeadline := time.NewTimer(neverHappenedBound)
 		select {
-		case release <- struct{}{}:
-		case <-time.After(2 * time.Second):
-			t.Fatalf("no fsync call pending for release %d", released)
+		case call := <-overlapped:
+			arrivalDeadline.Stop()
+			t.Fatalf("shared WAL premise violated: fsync call %d overlapped the active writer", call)
+		case <-arrived:
+			arrivalDeadline.Stop()
+		case <-arrivalDeadline.C:
+			t.Fatalf("WAL writer never announced fsync call %d", released)
 		}
-		// Let the completion propagate.
-		deadline := time.After(2 * time.Second)
-		for visibleCount() < released {
-			select {
-			case <-deadline:
-				t.Fatalf("expected >=%d queue(s) visible after %d fsync release(s), got %d", released, released, visibleCount())
-			case <-time.After(2 * time.Millisecond):
-			}
-			if visibleCount() >= released {
-				break
-			}
+		select {
+		case call := <-overlapped:
+			t.Fatalf("shared WAL premise violated: fsync call %d overlapped the active writer", call)
+		default:
 		}
-		if visibleCount() < 2 {
-			// Not all copies durable yet ⇒ the confirm MUST NOT have fired.
-			assert.Equal(t, int32(0), fired.Load(),
-				"confirm must not fire until ALL fanout copies are durable (only %d visible)", visibleCount())
-		}
-		if visibleCount() == 2 {
-			break
-		}
+		require.Equal(t, int32(released), fsyncCalls.Load(),
+			"expected exactly one serialized fsync arrival per fanout copy")
+		require.Equal(t, int32(maxConcurrentFsyncs), activeFsyncs.Load(),
+			"announced fsync must be the shared WAL writer's only active fsync")
+		require.Equal(t, released-1, visibleCount(),
+			"visibility advanced before fsync release %d", released)
+		require.Zero(t, fired.Load(),
+			"confirm fired before all fanout copies were durable")
+
+		release <- struct{}{}
+		require.Eventually(t, func() bool { return visibleCount() >= released },
+			neverHappenedBound, time.Millisecond,
+			"fanout copy %d never became visible after its announced fsync was released", released)
+		require.Equal(t, released, visibleCount(),
+			"visibility ladder must advance by exactly one copy per fsync release")
 	}
 
-	// Both copies durable ⇒ both queues visible and the confirm fired exactly once.
-	require.Eventually(t, func() bool { return visibleCount() == 2 }, 3*time.Second, 5*time.Millisecond,
-		"both fanout copies must be visible once durable")
-	require.Eventually(t, func() bool { return fired.Load() == 1 }, 3*time.Second, 5*time.Millisecond,
-		"the single confirm must fire exactly once, after BOTH copies are durable")
-	time.Sleep(80 * time.Millisecond)
-	assert.Equal(t, int32(1), fired.Load(), "confirm must fire EXACTLY once for the fanout publish")
+	select {
+	case err := <-confirmResult:
+		require.NoError(t, err, "durable fanout completion unexpectedly failed")
+	case <-time.After(neverHappenedBound):
+		t.Fatal("single fanout confirm never fired after both fsync releases")
+	}
+
+	// Stop the one writer before checking exact-once, so no completion remains
+	// scheduled that could make a later duplicate invisible to this assertion.
+	releaseAll()
+	cleanup()
+	require.Equal(t, int32(expectedCopies), fsyncCalls.Load(),
+		"fixture must observe exactly one fsync call per durable fanout copy")
+	require.Zero(t, activeFsyncs.Load(),
+		"shared WAL writer still had an fsync active after shutdown")
+	select {
+	case call := <-overlapped:
+		t.Fatalf("shared WAL premise violated: fsync call %d overlapped another call", call)
+	default:
+	}
+	require.Equal(t, int32(1), fired.Load(),
+		"confirm must fire EXACTLY once for the fanout publish")
 }
 
 // flakyAsyncStore wraps a real DisruptorStorage and can fail StoreMessageAsync

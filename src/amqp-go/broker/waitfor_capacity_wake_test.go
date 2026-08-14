@@ -1,56 +1,81 @@
 package broker
 
 import (
+	"runtime"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 )
 
-// WaitForCapacity must wake promptly on AckAdvance, not wait for the 10ms
-// safety timer. Today WaitForCapacity does NOT increment parkedCount, so
-// NotifyNewMessage (called from AckAdvance) is a no-op when only the producer
-// is parked — the producer only wakes on the 10ms timer. This test asserts the
-// wake happens within 1ms of the ack.
+// TestWaitForCapacity_ReleasedByAckSignal attributes the wake directly: the
+// safety fallback is moved beyond the test's generous never-happened bound, so
+// only AckAdvance -> NotifyNewMessage can release the registered producer.
+func TestWaitForCapacity_ReleasedByAckSignal(t *testing.T) {
+	const unreachableFallback = 10 * time.Minute
 
-func TestWaitForCapacity_WakesOnAckAdvance_Within1ms(t *testing.T) {
-	runWithTimeout(t, 5*time.Second, func() {
-		qs := NewQueueState(2)
-		defer qs.Close()
-		stop, cancel := makeStop()
-		defer cancel()
+	qs := NewQueueState(2)
+	defer qs.Close()
+	qs.SetCapacityFallback(unreachableFallback)
+	require.Equal(t, unreachableFallback, qs.capacityFallback(),
+		"fixture premise broken: capacity fallback was not moved out of reach")
 
-		qs.FrontierComplete(qs.FrontierReserve(), true)
-		qs.FrontierComplete(qs.FrontierReserve(), true)
-		t0, _, _ := qs.Claim(stop, testTimer(qs))
-		t1, _, _ := qs.Claim(stop, testTimer(qs))
-		qs.ClaimInflight(t0)
-		qs.ClaimInflight(t1)
+	stop, cancel := makeStop()
+	defer cancel()
 
-		blocked := make(chan struct{})
-		go func() {
-			qs.WaitForCapacity(stop)
-			close(blocked)
-		}()
+	qs.FrontierComplete(qs.FrontierReserve(), true)
+	qs.FrontierComplete(qs.FrontierReserve(), true)
+	timer := testTimer(qs)
+	defer timer.Stop()
+	t0, _, ok := qs.Claim(stop, timer)
+	require.True(t, ok, "first capacity-fixture claim failed")
+	t1, _, ok := qs.Claim(stop, timer)
+	require.True(t, ok, "second capacity-fixture claim failed")
+	qs.ClaimInflight(t0)
+	qs.ClaimInflight(t1)
+	require.Equal(t, uint64(2), qs.Depth(),
+		"fixture premise broken: queue depth is not the configured high-water mark")
+	require.True(t, qs.AtHighWaterMark(),
+		"fixture premise broken: producer would not park below the high-water mark")
 
+	released := make(chan bool, 1)
+	go func() { released <- qs.WaitForCapacity(stop) }()
+	requireCapacityWaitParked(t, qs, released)
+
+	qs.AckAdvance(t0)
+	select {
+	case ok := <-released:
+		require.True(t, ok, "WaitForCapacity refused instead of accepting capacity released by ack")
+	case <-time.After(5 * time.Second):
+		t.Fatal("WaitForCapacity never observed the AckAdvance signal; the 10-minute fallback was unreachable")
+	}
+}
+
+// requireCapacityWaitParked observes the registration NotifyNewMessage relies
+// on. Its clock is only a generous outer bound for "registration never
+// happened"; it does not distinguish fast from slow execution.
+func requireCapacityWaitParked(t *testing.T, qs *QueueState, returned <-chan bool) {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for qs.producerParked.Load() == 0 {
 		select {
-		case <-blocked:
-			t.Fatal("WaitForCapacity returned before any ack")
-		case <-time.After(50 * time.Millisecond):
+		case ok := <-returned:
+			t.Fatalf("WaitForCapacity returned (%t) without registering a producer park at the high-water mark", ok)
+		case <-deadline.C:
+			t.Fatal("WaitForCapacity never registered its producer park; an unregistered park cannot be signaled by NotifyNewMessage")
+		default:
+			runtime.Gosched()
 		}
+	}
+}
 
-		ackTime := time.Now()
-		qs.AckAdvance(t0)
+func TestWaitForCapacity_CapacityFallbackDefault(t *testing.T) {
+	qs := NewQueueState(1)
+	defer qs.Close()
 
-		select {
-		case <-blocked:
-			elapsed := time.Since(ackTime)
-			require.Less(t, elapsed, 5*time.Millisecond,
-				"WaitForCapacity must wake within 5ms of AckAdvance (vs 10ms timer fallback), took %v", elapsed)
-		case <-time.After(time.Second):
-			t.Fatal("WaitForCapacity not released within 1s of AckAdvance")
-		}
-	})
+	require.Equal(t, 10*time.Millisecond, qs.capacityFallback(),
+		"WaitForCapacity production fallback must remain 10ms")
 }
 
 func TestNotifyNewMessage_SendsWhenProducerParked(t *testing.T) {

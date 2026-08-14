@@ -62,12 +62,6 @@ func (b *readAheadBuffer) remove(tag uint64) {
 	b.mu.Unlock()
 }
 
-func (b *readAheadBuffer) clear() {
-	b.mu.Lock()
-	b.messages = make(map[uint64]*protocol.Message)
-	b.mu.Unlock()
-}
-
 func (b *readAheadBuffer) len() int {
 	b.mu.Lock()
 	defer b.mu.Unlock()

@@ -6,7 +6,11 @@ import (
 	"time"
 )
 
-const requeueInitialCap = 4096
+const (
+	requeueInitialCap         = 4096
+	defaultCapacityFallback   = 10 * time.Millisecond
+	maxCapacityFallbackMillis = ^uint32(0)
+)
 
 type requeueEntry struct {
 	tag         uint64
@@ -29,23 +33,24 @@ type QueueState struct {
 	// the frontierPending append it must stay coupled to.
 	nextSeq uint64
 
-	tail           atomic.Uint64
-	head           atomic.Uint64
-	minAckCursor   atomic.Uint64
-	waiting        atomic.Int64
-	inflight       atomic.Int64
-	wake           chan struct{}
-	parkedCount    atomic.Int64
-	producerParked atomic.Int64
-	requeueMu      sync.Mutex
-	requeueBuf     []requeueEntry
-	requeueHead    int
-	requeueLen     int
-	requeueCount   atomic.Int64
-	depthHighWM    atomic.Uint64
-	closed         atomic.Bool
-	stopCh         chan struct{}
-	parkTimeout    time.Duration
+	tail                   atomic.Uint64
+	head                   atomic.Uint64
+	minAckCursor           atomic.Uint64
+	waiting                atomic.Int64
+	inflight               atomic.Int64
+	wake                   chan struct{}
+	parkedCount            atomic.Int64
+	producerParked         atomic.Int64
+	requeueMu              sync.Mutex
+	requeueBuf             []requeueEntry
+	requeueHead            int
+	requeueLen             int
+	requeueCount           atomic.Int64
+	depthHighWM            atomic.Uint64
+	closed                 atomic.Bool
+	capacityFallbackMillis uint32 // configured before concurrent use; see SetCapacityFallback
+	stopCh                 chan struct{}
+	parkTimeout            time.Duration
 
 	// readyBytes tracks the total body bytes of ready (not-yet-delivered)
 	// messages for x-max-length-bytes enforcement (SQ-11). It is left at zero
@@ -123,10 +128,11 @@ func (qs *QueueState) SetPolicy(p *QueuePolicy) {
 
 func NewQueueState(depthHighWM uint64) *QueueState {
 	qs := &QueueState{
-		wake:        make(chan struct{}, 128),
-		stopCh:      make(chan struct{}),
-		parkTimeout: 1 * time.Millisecond,
-		requeueBuf:  make([]requeueEntry, requeueInitialCap),
+		wake:                   make(chan struct{}, 128),
+		capacityFallbackMillis: uint32(defaultCapacityFallback / time.Millisecond),
+		stopCh:                 make(chan struct{}),
+		parkTimeout:            1 * time.Millisecond,
+		requeueBuf:             make([]requeueEntry, requeueInitialCap),
 	}
 	qs.depthHighWM.Store(depthHighWM)
 	return qs
@@ -195,6 +201,23 @@ func (qs *QueueState) SetParkTimeout(d time.Duration) {
 	qs.parkTimeout = d
 }
 
+// SetCapacityFallback overrides WaitForCapacity's safety-net wake interval.
+// Set it before the QueueState is used concurrently, like SetParkTimeout.
+// The compact millisecond representation preserves QueueState's dispatch-plane
+// layout while keeping this override per queue. Production leaves the
+// constructor's 10ms default unchanged; tests can move the fallback out of
+// reach to attribute a wake to NotifyNewMessage.
+func (qs *QueueState) SetCapacityFallback(d time.Duration) {
+	if d <= 0 || d%time.Millisecond != 0 || uint64(d/time.Millisecond) > uint64(maxCapacityFallbackMillis) {
+		panic("QueueState.SetCapacityFallback: duration must be a positive whole number of milliseconds fitting uint32")
+	}
+	qs.capacityFallbackMillis = uint32(d / time.Millisecond)
+}
+
+func (qs *QueueState) capacityFallback() time.Duration {
+	return time.Duration(qs.capacityFallbackMillis) * time.Millisecond
+}
+
 func (qs *QueueState) WaitForCapacity(stop <-chan struct{}) bool {
 	// Teardown must be consulted BEFORE the below-HWM fast return. A queue torn
 	// down by DeleteQueue — or the record-less state createQueueStateLocked
@@ -227,7 +250,7 @@ func (qs *QueueState) WaitForCapacity(stop <-chan struct{}) bool {
 	if !qs.AtHighWaterMark() {
 		return true
 	}
-	timer := time.NewTimer(10 * time.Millisecond)
+	timer := time.NewTimer(qs.capacityFallback())
 	defer timer.Stop()
 	qs.producerParked.Add(1)
 	defer qs.producerParked.Add(-1)
@@ -246,7 +269,7 @@ func (qs *QueueState) WaitForCapacity(stop <-chan struct{}) bool {
 			default:
 			}
 		}
-		timer.Reset(10 * time.Millisecond)
+		timer.Reset(qs.capacityFallback())
 		select {
 		case <-qs.wake:
 		case <-stop:

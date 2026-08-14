@@ -1,13 +1,10 @@
 package broker
 
 import (
-	"encoding/binary"
-	"sync"
-	"sync/atomic"
+	"runtime"
 	"testing"
 	"time"
 
-	hdrhistogram "github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
 	"github.com/maxpert/amqp-go/storage"
@@ -46,116 +43,102 @@ func TestDepthHighWMOverride_ZeroFallsBack(t *testing.T) {
 	assert.Equal(t, uint64(52428), broker.computeDepthHighWM())
 }
 
-func TestDepthHighWMOverride_LatencyProportional(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping latency test in short mode")
+// TestDepthHighWMOverride_GatesAtConfiguredDepth proves the override is wired
+// into publisher backpressure, rather than merely computed: HWM-1 is admitted,
+// HWM is gated, and an ack releases the parked producer.
+//
+// Deliberate coverage removal: this no longer compares end-to-end p50 latency
+// for shallow and deep backlogs. It therefore gives up the empirical claim
+// "deeper backlog has higher p50", including that scenario's incidental timing
+// sensitivity to FIFO/drain behavior. That relative-performance assertion was
+// load-dependent and is not retained in the pass/fail suite.
+func TestDepthHighWMOverride_GatesAtConfiguredDepth(t *testing.T) {
+	const (
+		hwm                 = uint64(3)
+		unreachableFallback = 10 * time.Minute
+	)
+
+	ec := interfaces.EngineConfig{
+		RingBufferSize:        65536,
+		SpillThresholdPercent: 80,
+		DepthHighWMOverride:   hwm,
+	}
+	store, err := storage.NewDisruptorStorageWithEngineConfig(t.TempDir(), ec)
+	require.NoError(t, err)
+	defer store.Close()
+
+	broker := NewStorageBroker(store, ec)
+	defer broker.Close()
+	_, err = broker.DeclareQueue("hwm-q", true, false, false, nil)
+	require.NoError(t, err)
+	qs := broker.getOrCreateQueueState("hwm-q")
+
+	require.Equal(t, hwm, qs.DepthHighWM(),
+		"DepthHighWMOverride did not reach the queue's production predicate")
+	qs.SetCapacityFallback(unreachableFallback)
+	require.Equal(t, unreachableFallback, qs.capacityFallback(),
+		"fixture premise broken: capacity fallback was not moved out of reach")
+
+	stop, cancel := makeStop()
+	defer cancel()
+	addInflight := func() uint64 {
+		tag := qs.FrontierReserve()
+		qs.FrontierComplete(tag, true)
+		timer := testTimer(qs)
+		defer timer.Stop()
+		claimed, _, ok := qs.Claim(stop, timer)
+		require.True(t, ok, "fixture failed to claim reserved tag %d", tag)
+		qs.ClaimInflight(claimed)
+		return claimed
 	}
 
-	const timestampedCount = 2000
+	ackTag := addInflight()
+	_ = addInflight()
+	require.Equal(t, hwm-1, qs.Depth(),
+		"fixture premise broken: expected depth HWM-1")
+	require.False(t, qs.AtHighWaterMark(),
+		"AtHighWaterMark must be false one message below the override")
 
-	runScenario := func(hwmOverride uint64) time.Duration {
-		tmpDir := t.TempDir()
-		ec := interfaces.EngineConfig{
-			RingBufferSize:        65536,
-			SpillThresholdPercent: 80,
-			DepthHighWMOverride:   hwmOverride,
-			WALSyncDisabled:       true,
-			WALBatchSize:          1000,
-			WALBatchTimeoutMS:     5,
-		}
-		store, err := storage.NewDisruptorStorageWithEngineConfig(
-			tmpDir, ec)
-		require.NoError(t, err)
-		defer store.Close()
+	_ = addInflight()
+	require.Equal(t, hwm, qs.Depth(),
+		"fixture premise broken: expected depth HWM")
+	require.True(t, qs.AtHighWaterMark(),
+		"AtHighWaterMark must be true at the override")
 
-		broker := NewStorageBroker(store, ec)
-		defer broker.Close()
+	publishDone := make(chan error, 1)
+	go func() {
+		publishDone <- broker.PublishMessage("", "hwm-q", &protocol.Message{
+			Body:         []byte("blocked-at-hwm"),
+			RoutingKey:   "hwm-q",
+			DeliveryMode: 1,
+		})
+	}()
+	requireSynchronousPublishParked(t, qs, publishDone)
 
-		_, err = broker.DeclareQueue("lat-q", true, false, false, nil)
-		require.NoError(t, err)
-		store.RegisterConsumerCursor("lat-q", "lat-cons")
-		qs := broker.getOrCreateQueueState("lat-q")
-
-		// Pre-fill the queue to HWM depth so timestamped messages sit
-		// behind a backlog proportional to HWM. The 1-byte body lets the
-		// consumer distinguish pre-fill from timestamped messages.
-		fillBody := []byte{0}
-		for i := uint64(0); i < hwmOverride; i++ {
-			msg := &protocol.Message{
-				Body:         fillBody,
-				Exchange:     "",
-				RoutingKey:   "lat-q",
-				DeliveryMode: 2,
-			}
-			if err := broker.PublishMessage("", "lat-q", msg); err != nil {
-				t.Fatalf("pre-fill publish %d: %v", i, err)
-			}
-		}
-
-		stop, cancel := makeStop()
-		defer cancel()
-
-		hist := hdrhistogram.New(1, 30_000_000, 3)
-		var processed atomic.Int64
-		totalMsgs := int64(hwmOverride) + int64(timestampedCount)
-
-		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			timer := time.NewTimer(qs.parkTimeout)
-			defer timer.Stop()
-			for processed.Load() < totalMsgs {
-				tag, _, ok := qs.Claim(stop, timer)
-				if !ok {
-					return
-				}
-				msg, err := store.GetMessage("lat-q", tag)
-				if err != nil {
-					qs.GapSkipAdvance(tag)
-					processed.Add(1)
-					continue
-				}
-				if len(msg.Body) >= 8 {
-					publishNano := int64(binary.LittleEndian.Uint64(msg.Body[:8]))
-					latency := time.Since(time.Unix(0, publishNano))
-					if us := latency.Microseconds(); us > 0 {
-						_ = hist.RecordValue(us)
-					}
-				}
-				qs.ClaimInflight(tag)
-				store.DeliverToConsumer("lat-q", "lat-cons", tag)
-				store.DeleteMessage("lat-q", tag)
-				store.AckFromConsumer("lat-q", "lat-cons", tag)
-				qs.SetMinAckCursor(store.GetMinAckCursor("lat-q"))
-				qs.AckAdvance(tag)
-				processed.Add(1)
-			}
-		}()
-
-		for i := 0; i < timestampedCount; i++ {
-			body := make([]byte, 8)
-			binary.LittleEndian.PutUint64(body, uint64(time.Now().UnixNano()))
-			msg := &protocol.Message{
-				Body:         body,
-				Exchange:     "",
-				RoutingKey:   "lat-q",
-				DeliveryMode: 2,
-			}
-			if err := broker.PublishMessage("", "lat-q", msg); err != nil {
-				cancel()
-				t.Fatalf("timestamped publish %d: %v", i, err)
-			}
-		}
-
-		wg.Wait()
-		return time.Duration(hist.ValueAtQuantile(50)) * time.Microsecond
+	qs.AckAdvance(ackTag)
+	select {
+	case err := <-publishDone:
+		require.NoError(t, err, "synchronous publish was refused instead of completing after ack released capacity")
+	case <-time.After(5 * time.Second):
+		t.Fatal("ack never released the synchronous publish parked at DepthHighWMOverride; the 10-minute fallback was unreachable")
 	}
+}
 
-	p50Low := runScenario(1000)
-	p50High := runScenario(50000)
-
-	t.Logf("p50 latency: HWM=1000 -> %v, HWM=50000 -> %v", p50Low, p50High)
-
-	assert.Less(t, p50Low, p50High, "lower HWM should yield lower p50 latency")
+// requireSynchronousPublishParked proves the production PublishMessage path,
+// not a direct QueueState call, reached WaitForCapacity and registered itself.
+// Its clock is only a generous never-happened bound.
+func requireSynchronousPublishParked(t *testing.T, qs *QueueState, completed <-chan error) {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for qs.producerParked.Load() == 0 {
+		select {
+		case err := <-completed:
+			t.Fatalf("synchronous PublishMessage returned (%v) without registering a producer park; production publish must traverse WaitForCapacity", err)
+		case <-deadline.C:
+			t.Fatal("synchronous PublishMessage never registered a producer park at DepthHighWMOverride")
+		default:
+			runtime.Gosched()
+		}
+	}
 }

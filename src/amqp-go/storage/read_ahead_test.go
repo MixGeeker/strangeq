@@ -6,7 +6,6 @@ import (
 	"os"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/maxpert/amqp-go/interfaces"
 	"github.com/maxpert/amqp-go/protocol"
@@ -153,80 +152,85 @@ func TestReadAhead_EvictionOnNonSequential(t *testing.T) {
 		"new buffer should contain the requested tag")
 }
 
-func TestReadAhead_SequentialConsumeRate(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping rate comparison in short mode")
-	}
-	// This test asserts RELATIVE throughput between two read paths (buffered
-	// read-ahead vs. direct WAL pread). Race instrumentation adds per-memory-
-	// access overhead that does not scale equally across the two paths, so the
-	// ratio between them stops being a valid measurement under the detector.
-	// This is a measurement-validity skip, not a correctness test being
-	// disabled — the test still runs, and still enforces the 0.9 threshold,
-	// in any uninstrumented (non -race) run.
-	//
-	// NOTE: CI runs `go test -race` only, so CI no longer exercises this
-	// assertion at all. That is a deliberate, accepted cost of avoiding
-	// -race-induced flakes on a comparison the detector cannot measure
-	// meaningfully.
-	if raceEnabled {
-		t.Skip("relative throughput comparison is not meaningful under -race: instrumentation " +
-			"overhead does not scale equally across the buffered read-ahead path and the direct " +
-			"WAL pread path, so the ratio does not measure the thing it claims to. This is a " +
-			"MEASUREMENT-VALIDITY skip, not a correctness test being disabled — declining to be " +
-			"misled is not losing coverage — and the test still runs uninstrumented. " +
-			"SUCCESSOR: this assertion belongs in cmd/benchgate against a tracked baseline, " +
-			"which is where performance assertions live; see the Loop 2 register. Until it moves " +
-			"there, CI (which runs -race only) does not exercise it at all. Do NOT 'fix' this by " +
-			"relaxing the 0.9 threshold — that was tried once already and is what a threshold in " +
-			"the wrong place looks like.")
-	}
+func TestReadAhead_SequentialConsumeAmortisesBatchReads(t *testing.T) {
 	tmpDir := t.TempDir()
 	storage := newReadAheadTestStorage(t, tmpDir, 64)
 	defer storage.Close()
 
 	require.NoError(t, storage.StoreQueue(&protocol.Queue{Name: "q", Durable: true}))
 
-	numMsgs := 2000
+	const numMsgs = 2000
+	maxRecordBytes := 0
 	for i := 0; i < numMsgs; i++ {
 		msg := &protocol.Message{
 			Body:         []byte(fmt.Sprintf("msg-%d", i)),
 			DeliveryMode: 2,
 			DeliveryTag:  uint64(i),
 		}
+		record, err := appendMessageRecord(nil, "q", msg, uint64(i), false)
+		require.NoError(t, err)
+		maxRecordBytes = max(maxRecordBytes, len(record))
 		require.NoError(t, storage.StoreMessage("q", msg))
 	}
-	clearRingForWALFallback(storage, "q", numMsgs)
-
 	ring := storage.getQueueRing("q")
+	require.NotNil(t, ring.readAhead,
+		"fixture premise broken: the queue has no read-ahead buffer")
+	clearRingForWALFallback(storage, "q", numMsgs)
+	require.Zero(t, ring.ring.Count(),
+		"fixture premise broken: clearing the ring left %d resident messages, so GetMessage can bypass read-ahead",
+		ring.ring.Count())
 
-	start := time.Now()
+	maxEntryBatchBytes := readAheadMaxEntries * maxRecordBytes
+	require.Less(t, maxEntryBatchBytes, readAheadChunkSize,
+		"fixture premise broken: %d entries can occupy %d bytes at the fixture's largest serialized record size (%d), so the %d-byte chunk bound can bind before the entry-count bound",
+		readAheadMaxEntries, maxEntryBatchBytes, maxRecordBytes, readAheadChunkSize)
+
+	wal := storage.wal.sharedWAL
+	wal.offsetIndexMutex.RLock()
+	walFiles := make(map[uint64]struct{})
+	missingOffsets := 0
 	for i := 0; i < numMsgs; i++ {
-		_, err := storage.GetMessage("q", uint64(i))
-		require.NoError(t, err)
+		location, ok := wal.offsetIndex[uint64(i)]
+		if !ok {
+			missingOffsets++
+			continue
+		}
+		walFiles[location.fileNum] = struct{}{}
 	}
-	readAheadDuration := time.Since(start)
+	wal.offsetIndexMutex.RUnlock()
+	require.Zero(t, missingOffsets,
+		"fixture premise broken: %d fixture messages are missing from the WAL index",
+		missingOffsets)
+	require.Len(t, walFiles, 1,
+		"fixture premise broken: %d messages span %d WAL files, so ceil(%d/%d) cannot be the batch count",
+		numMsgs, len(walFiles), numMsgs, readAheadMaxEntries)
 
-	ring.readAhead.clear()
+	wantBatches := (numMsgs + readAheadMaxEntries - 1) / readAheadMaxEntries
+	require.Less(t, wantBatches, numMsgs,
+		"fixture premise broken: readAheadMaxEntries=%d allows no amortisation; the exact count would self-consistently accept one WAL read per message",
+		readAheadMaxEntries)
 
-	start = time.Now()
-	for i := 0; i < numMsgs; i++ {
-		_, err := storage.wal.Read("q", uint64(i))
+	first, err := storage.GetMessage("q", 0)
+	require.NoError(t, err)
+	require.NotNil(t, first)
+	require.Equal(t, []byte("msg-0"), first.Body)
+
+	firstBatchEntries := ring.readAhead.len()
+	require.Equal(t, readAheadMaxEntries, firstBatchEntries,
+		"fixture premise broken: the entry-count bound did not bind before the %d-byte chunk bound; the first batch buffered %d entries, want %d",
+		readAheadChunkSize, firstBatchEntries, readAheadMaxEntries)
+
+	for i := 1; i < numMsgs; i++ {
+		msg, err := storage.GetMessage("q", uint64(i))
 		require.NoError(t, err)
+		require.NotNil(t, msg)
+		require.Equal(t, []byte(fmt.Sprintf("msg-%d", i)), msg.Body)
 	}
-	directDuration := time.Since(start)
 
-	readAheadRate := float64(numMsgs) / readAheadDuration.Seconds()
-	directRate := float64(numMsgs) / directDuration.Seconds()
-
-	t.Logf("read-ahead: %d msgs in %v (%.0f msg/s), direct: %d msgs in %v (%.0f msg/s), %.1fx faster",
-		numMsgs, readAheadDuration, readAheadRate,
-		numMsgs, directDuration, directRate,
-		readAheadRate/directRate)
-
-	assert.GreaterOrEqual(t, readAheadRate, directRate*0.9,
-		"read-ahead (%.0f msg/s) should be at least 90%% as fast as direct WAL reads (%.0f msg/s)",
-		readAheadRate, directRate)
+	gotBatches := ring.readAhead.batchReadCount()
+	require.Equal(t, wantBatches, gotBatches,
+		"read-ahead did not amortise WAL reads: %d sequential GetMessage calls used %d batches; want ceil(%d/%d)=%d",
+		numMsgs, gotBatches, numMsgs, readAheadMaxEntries, wantBatches)
 }
 
 // TestReadAhead_ResolvesSharedBodyRefs exercises the ITER5 shared-body path
