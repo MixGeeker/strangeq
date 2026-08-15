@@ -54,7 +54,9 @@ import (
 // only visible if consumption is measured DURING the publish window rather than
 // after an unbounded drain.
 //
-// These tests are deliberately time-bounded: they fail, they never hang.
+// The P0 sampling phase and fixture-shutdown guards are deliberately bounded.
+// The exact drain has no total deadline: it can run indefinitely while expected
+// identities continue to make progress, and fails only after inactivity.
 // ============================================================================
 
 var bet0PortCounter atomic.Int64
@@ -181,6 +183,7 @@ func bet0Seq(body []byte) uint64 { return binary.BigEndian.Uint64(body[0:8]) }
 type bet0LoadResult struct {
 	published atomic.Int64 // Publish() calls that returned nil
 	consumed  atomic.Int64 // deliveries received and acked
+	observed  *bet0ObservedIdentities
 	// consumedAtWindow / publishedAtWindow are sampled at the SAME instant, at
 	// the end of the publish window, with publishers still running. These are the
 	// LIVENESS numbers: consumption that only happens after publishing stops does
@@ -214,9 +217,10 @@ type bet0LoadResult struct {
 // the banned fix. The predicate file explains why at length. Read it before
 // changing anything here.
 //
-// The second assertion — every published message is eventually delivered, zero
-// loss, within a bounded drain — is the correctness half: the fix must restore
-// liveness without dropping anything.
+// The second assertion — every identity whose Publish call returned nil is
+// eventually observed after a successful Ack — is the correctness half. Exact
+// target inclusion proves safety; reset-on-exact-target-progress inactivity
+// bounds a genuinely stalled mechanism without imposing a total drain deadline.
 //
 // Three shapes, because the transient failure mode is CONDITIONAL. Gap-crawling
 // a foreign tag costs a full cold-read miss only when the WAL actually has
@@ -243,28 +247,38 @@ func TestBet0_ConcurrentMultiQueueDelivery(t *testing.T) {
 	}
 }
 
-// Load shape. The assertion thresholds live in bet0_liveness_predicate_test.go,
-// next to the measurements that justify them.
+// Load shape. The P0 assertion thresholds live in
+// bet0_liveness_predicate_test.go, next to their measurements. The drain
+// inactivity value is a one-sided mechanism liveness guard, not a throughput
+// budget. The same-session selection campaign after exact identity wiring used
+// 3.306079959s as its worst observed healthy inter-expected-progress gap across
+// normal, -race, exact-CI, and constrained-CPU runs. The 60s window has more
+// than 18x headroom over that selection sample. Focused runs keep logging the
+// gap so premise drift remains visible and forces re-derivation rather than a
+// silent threshold change.
 const (
-	bet0Queues            = 2
-	bet0ProducersPerQueue = 3
-	bet0ConsumersPerQueue = 3
-	bet0BodySize          = 128
-	bet0PublishWindow     = 4 * time.Second
-	bet0DrainDeadline     = 25 * time.Second
-	bet0Prefetch          = 100
+	bet0Queues                = 2
+	bet0ProducersPerQueue     = 3
+	bet0ConsumersPerQueue     = 3
+	bet0BodySize              = 128
+	bet0PublishWindow         = 4 * time.Second
+	bet0DrainInactivityWindow = 60 * time.Second
+	bet0PublisherStopGuard    = 60 * time.Second
+	bet0Prefetch              = 100
 )
 
 func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
 	require.Len(t, durable, bet0Queues)
 	_, uri := bet0Server(t, t.TempDir())
 
+	drainChanged := make(chan struct{}, 1)
 	results := make([]*bet0LoadResult, bet0Queues)
 	queueNames := make([]string, bet0Queues)
 	for i := range results {
-		results[i] = &bet0LoadResult{}
+		results[i] = &bet0LoadResult{observed: newBet0ObservedIdentities(drainChanged)}
 		queueNames[i] = fmt.Sprintf("bet0-load-%s-q%d", shape, i+1)
 	}
+	ackErrors := make(chan error, 1)
 
 	// Connections are tracked so the cleanup can force-close them: a producer
 	// blocked in Publish against a wedged broker is only released by closing its
@@ -329,6 +343,7 @@ func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
 			require.NoError(t, err)
 
 			res := results[qi]
+			queueIndex := uint16(qi)
 			conWG.Add(1)
 			go func() {
 				defer conWG.Done()
@@ -340,7 +355,14 @@ func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
 						if !ok {
 							return
 						}
-						_ = d.Ack(false)
+						if err := bet0AckAndObserve(func() error { return d.Ack(false) }, res.observed,
+							queueIndex, bet0ProducersPerQueue, d.Body); err != nil {
+							select {
+							case ackErrors <- fmt.Errorf("queue %s: delivery Ack failed: %w", queueNames[queueIndex], err):
+							default:
+							}
+							return
+						}
 						res.consumed.Add(1)
 					}
 				}
@@ -350,15 +372,16 @@ func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
 	time.Sleep(250 * time.Millisecond) // let consumer registration land
 
 	// --- producers ---
-	pubCtx, pubCancel := context.WithCancel(context.Background())
-	t.Cleanup(pubCancel)
-	body := bet0Body(0, bet0BodySize)
+	successCounts := make([][]*atomic.Uint64, bet0Queues)
+	var pubWG sync.WaitGroup
 	for qi := 0; qi < bet0Queues; qi++ {
+		successCounts[qi] = make([]*atomic.Uint64, bet0ProducersPerQueue)
 		mode := amqp.Transient
 		if durable[qi] {
 			mode = amqp.Persistent
 		}
 		for p := 0; p < bet0ProducersPerQueue; p++ {
+			successCounts[qi][p] = &atomic.Uint64{}
 			conn, err := amqp.Dial(uri)
 			require.NoError(t, err)
 			track(conn)
@@ -367,17 +390,27 @@ func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
 
 			res := results[qi]
 			qName := queueNames[qi]
+			queueIndex, producerIndex := uint16(qi), uint16(p)
+			successCount := successCounts[qi][p]
+			pubWG.Add(1)
 			go func() {
-				pub := amqp.Publishing{DeliveryMode: mode, Body: body}
+				defer pubWG.Done()
+				pub := amqp.Publishing{DeliveryMode: mode, Body: make([]byte, bet0BodySize)}
+				var seq uint64
 				for {
 					select {
 					case <-stopPub:
 						return
 					default:
 					}
-					if err := ch.PublishWithContext(pubCtx, "", qName, false, false, pub); err != nil {
+					bet0EncodeDrainIdentity(pub.Body, bet0DrainIdentity{
+						queue: queueIndex, producer: producerIndex, seq: seq,
+					})
+					if err := ch.PublishWithContext(context.Background(), "", qName, false, false, pub); err != nil {
 						return
 					}
+					seq++
+					successCount.Store(seq)
 					res.published.Add(1)
 				}
 			}()
@@ -396,9 +429,14 @@ func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
 	}
 
 	stopPubOnce.Do(func() { close(stopPub) })
-	pubCancel()
 
 	// --- LIVENESS assertion (this is the one that fails on broken main) ---
+	// Evaluate the already-frozen under-window samples before publisher join. On
+	// the broken tree a producer may be stuck inside PublishWithContext, so a join
+	// guard must not mask this P0 assertion. For the same attribution reason,
+	// queued Ack errors are reported only after this predicate: an Ack-induced
+	// sample failure cannot blunt the starvation regression detector.
+	//
 	// The predicate itself, and the measurements behind every threshold it
 	// applies, are in bet0_liveness_predicate_test.go. Read that file before
 	// touching any number: under -race the consumed/published rate bands of a
@@ -420,40 +458,102 @@ func bet0RunConcurrentMultiQueue(t *testing.T, shape string, durable []bool) {
 	if notice := bet0SignalNotice(samples); notice != "" {
 		t.Log(notice)
 	}
-	require.NoErrorf(t, bet0CheckLiveness(samples, bet0Policy()),
-		"shape=%s window=%s", shape, bet0PublishWindow)
-
-	// --- ZERO-LOSS assertion: drain what is left, bounded ---
-	targets := make([]int64, bet0Queues)
-	for qi, res := range results {
-		targets[qi] = res.published.Load()
-	}
-	drainDeadline := time.After(bet0DrainDeadline)
-	for {
-		allDone := true
-		for qi, res := range results {
-			if res.consumed.Load() < targets[qi] {
-				allDone = false
-				break
+	var publishersDone chan struct{}
+	livenessErr := bet0CheckBeforePublisherJoin(func() error {
+		return bet0CheckLiveness(samples, bet0Policy())
+	}, func() {
+		publishersDone = make(chan struct{})
+		go func() {
+			pubWG.Wait()
+			close(publishersDone)
+		}()
+		select {
+		case <-publishersDone:
+		case <-time.After(bet0PublisherStopGuard):
+			// PublishWithContext in amqp091-go v1.10.0 ignores its context. Force
+			// closing connections is therefore the only reliable way to release a
+			// Publish call wedged during fixture shutdown.
+			closeAll()
+			select {
+			case <-publishersDone:
+			case <-time.After(10 * time.Second):
 			}
-			_ = qi
+			t.Fatalf("publisher goroutines did not stop within %s; targets were not frozen",
+				bet0PublisherStopGuard)
+		}
+	})
+	require.NoErrorf(t, livenessErr, "shape=%s window=%s", shape, bet0PublishWindow)
+	targets := bet0FreezePublisherTargets(func() { <-publishersDone }, bet0Queues,
+		bet0ProducersPerQueue, func(queue, producer int) uint64 {
+			return successCounts[queue][producer].Load()
+		})
+	publishedTotals := make([]int64, bet0Queues)
+	for qi, res := range results {
+		publishedTotals[qi] = res.published.Load()
+	}
+	require.NoError(t, bet0ValidatePublisherTargets(targets, publishedTotals, bet0ProducersPerQueue),
+		"publisher target wiring premise failed after publisher join")
+
+	select {
+	case err := <-ackErrors:
+		t.Fatal(err)
+	default:
+	}
+
+	// --- EXACT ZERO-LOSS assertion: no total drain deadline ---
+	states := make([]*bet0DrainState, bet0Queues)
+	for qi := range states {
+		states[qi] = newBet0DrainState(targets[qi], results[qi].observed, bet0DrainInactivityWindow)
+	}
+	drainStart := time.Now() // explicit inactivity baseline: after publisher join and target freeze
+	finalSnapshots := make([]bet0DrainSnapshot, bet0Queues)
+	for {
+		elapsed := time.Since(drainStart)
+		allDone := true
+		waitFor := bet0DrainInactivityWindow
+		for qi, state := range states {
+			snapshot := state.Observe(elapsed) // fresh snapshot also closes queued-timer/progress races
+			finalSnapshots[qi] = snapshot
+			switch snapshot.verdict {
+			case bet0DrainDone:
+				continue
+			case bet0DrainStalled:
+				t.Fatal(bet0DrainDiagnostic(queueNames[qi], snapshot))
+			default:
+				allDone = false
+				if remaining := state.RemainingInactivity(elapsed); remaining < waitFor {
+					waitFor = remaining
+				}
+			}
 		}
 		if allDone {
 			break
 		}
+
+		timer := time.NewTimer(waitFor)
 		select {
-		case <-drainDeadline:
-			for qi, res := range results {
-				require.GreaterOrEqualf(t, res.consumed.Load(), targets[qi],
-					"queue %s lost messages: %d of %d published were never delivered within %s",
-					queueNames[qi], targets[qi]-res.consumed.Load(), targets[qi], bet0DrainDeadline)
+		case <-drainChanged:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
 			}
-			return
-		case <-time.After(100 * time.Millisecond):
+		case err := <-ackErrors:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			t.Fatal(err)
+		case <-timer.C:
+			// Loop and take a fresh exact missing-set snapshot before deciding.
 		}
 	}
-	for qi, res := range results {
-		t.Logf("queue %s drained: %d/%d", queueNames[qi], res.consumed.Load(), targets[qi])
+	for qi, snapshot := range finalSnapshots {
+		t.Logf("queue %s exact drain: observed=%d target=%d max healthy inter-expected-progress gap=%s",
+			queueNames[qi], snapshot.observed, snapshot.target, snapshot.maxExpectedGap)
 	}
 }
 
