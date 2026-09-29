@@ -19,6 +19,15 @@ def api(repository, path):
     return json.loads(gh("api", f"repos/{repository}/{path}"))
 
 
+def release_by_tag(repository, tag):
+    # releases/tags/{tag} 仅返回已公开版本；列表接口包含写权限可见的草稿。
+    pages = json.loads(gh("api", "--paginate", "--slurp", f"repos/{repository}/releases?per_page=100"))
+    matches = [item for page in pages for item in page if item["tag_name"] == tag]
+    if len(matches) != 1:
+        raise ValueError("expected exactly one visible release for tag: " + tag)
+    return matches[0]
+
+
 def tag_commit(repository, tag):
     obj = api(repository, "git/ref/tags/" + quote(tag, safe=""))["object"]
     for _ in range(8):
@@ -75,7 +84,7 @@ def publish(args):
     directory.mkdir(parents=True, exist_ok=True)
     if any(directory.iterdir()):
         raise ValueError("publish download directory must be empty")
-    current = api(args.repository, "releases/tags/" + quote(args.tag, safe=""))
+    current = release_by_tag(args.repository, args.tag)
     if not current["draft"]:
         raise ValueError("release is already published")
     commit = tag_commit(args.repository, args.tag)
@@ -92,7 +101,7 @@ def publish(args):
             or build["path"].split("@")[0] != ".github/workflows/release.yml" or build["event"] != "push"):
         raise ValueError("release build has not completed successfully for this commit")
     # 读取最新身份，拒绝准备期间有人替换草稿或移动 tag。
-    latest = api(args.repository, "releases/tags/" + quote(args.tag, safe=""))
+    latest = release_by_tag(args.repository, args.tag)
     identity = lambda value: (value["id"], value["draft"], sorted((a["id"], a["name"], a["size"], a["updated_at"]) for a in value["assets"]))
     if identity(current) != identity(latest) or tag_commit(args.repository, args.tag) != commit:
         raise ValueError("release changed during verification")
@@ -100,7 +109,7 @@ def publish(args):
     subprocess.run(["gh", "release", "edit", args.tag, "--repo", args.repository,
                     "--draft=false", "--prerelease=" + str(prerelease).lower(),
                     "--latest=" + str(not prerelease).lower()], check=True)
-    final = api(args.repository, "releases/tags/" + quote(args.tag, safe=""))
+    final = release_by_tag(args.repository, args.tag)
     if final["draft"] or final["id"] != current["id"]:
         raise ValueError("release publication was not confirmed")
     print(final["html_url"])

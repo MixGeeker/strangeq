@@ -116,6 +116,24 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 publish.tag_commit("owner/repo", "v1.2.3")
 
+    def test_release_lookup_finds_exact_draft_across_pages(self):
+        draft = {"id": 17, "tag_name": "v1.2.3-rc.1", "draft": True}
+        pages = [[{"id": 16, "tag_name": "v1.2.3-rc.10", "draft": False}], [draft]]
+        with patch.object(publish, "gh", return_value=json.dumps(pages)) as request:
+            self.assertEqual(publish.release_by_tag("owner/repo", "v1.2.3-rc.1"), draft)
+            self.assertIn("--paginate", request.call_args.args)
+            self.assertIn("--slurp", request.call_args.args)
+        pages[1][0]["draft"] = False
+        with patch.object(publish, "gh", return_value=json.dumps(pages)):
+            self.assertFalse(publish.release_by_tag("owner/repo", "v1.2.3-rc.1")["draft"])
+
+    def test_release_lookup_rejects_missing_or_ambiguous_tags(self):
+        release = {"id": 17, "tag_name": "v1.2.3-rc.1", "draft": True}
+        for pages in ([[]], [[release], [{**release, "id": 18}]]):
+            with self.subTest(pages=pages), patch.object(publish, "gh", return_value=json.dumps(pages)):
+                with self.assertRaisesRegex(ValueError, "exactly one"):
+                    publish.release_by_tag("owner/repo", "v1.2.3-rc.1")
+
     def test_publish_gates_before_publication(self):
         current = {"id": 17, "draft": True, "assets": [{"id": 7, "name": "artifact.zip", "size": 3, "updated_at": "original"}]}
         build = {"conclusion": "success", "status": "completed", "head_sha": "a" * 40,
@@ -143,7 +161,8 @@ class ReleaseTests(unittest.TestCase):
                         raise ValueError("attestation rejected")
 
                 args = SimpleNamespace(directory=temporary, tag="v1.2.3-rc.1", repository="owner/repo")
-                with patch.object(publish, "api", side_effect=[current, run, latest, final]), \
+                with patch.object(publish, "release_by_tag", side_effect=[current, latest, final]), \
+                        patch.object(publish, "api", return_value=run), \
                         patch.object(publish, "tag_commit", side_effect=commits), \
                         patch.object(publish, "verify_directory", return_value=manifest,
                                      side_effect=ValueError("hash mismatch") if scenario == "bad-hash" else None), \
