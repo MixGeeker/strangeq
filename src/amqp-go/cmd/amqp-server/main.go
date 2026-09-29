@@ -3,11 +3,11 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/maxpert/amqp-go/config"
 	"github.com/maxpert/amqp-go/metrics"
@@ -32,11 +32,13 @@ Version: %s
 func main() {
 	// Define command-line flags
 	var (
-		configFile      = flag.String("config", "", "Configuration file path (YAML/JSON)")
-		showVersion     = flag.Bool("version", false, "Show version and exit")
-		generateConfig  = flag.String("generate-config", "", "Generate default config file and exit (e.g., config.yaml)")
-		enableTelemetry = flag.Bool("enable-telemetry", false, "Enable telemetry endpoint (Prometheus + pprof profiling)")
-		telemetryPort   = flag.Int("telemetry-port", 9419, "Telemetry HTTP server port")
+		shutdownOnStdinEOF = flag.Bool("shutdown-on-stdin-eof", false, "Stop gracefully when the supervising stdin pipe closes")
+		hashPasswordStdin  = flag.Bool("hash-password-stdin", false, "Read a password from stdin, print its bcrypt hash and exit")
+		configFile         = flag.String("config", "", "Configuration file path (YAML/JSON)")
+		showVersion        = flag.Bool("version", false, "Show version and exit")
+		generateConfig     = flag.String("generate-config", "", "Generate default config file and exit (e.g., config.yaml)")
+		enableTelemetry    = flag.Bool("enable-telemetry", false, "Enable telemetry endpoint (Prometheus + pprof profiling)")
+		telemetryPort      = flag.Int("telemetry-port", 9419, "Telemetry HTTP server port")
 
 		// TLS flags
 		tlsEnable = flag.Bool("tls", false, "Enable TLS (amqps)")
@@ -55,6 +57,13 @@ func main() {
 	)
 
 	flag.Parse()
+
+	if *hashPasswordStdin {
+		if err := hashPassword(os.Stdin, os.Stdout); err != nil {
+			log.Fatal("PASSWORD_HASH_FAILED")
+		}
+		return
+	}
 
 	// Show version and exit
 	if *showVersion {
@@ -127,6 +136,10 @@ func main() {
 		log.Fatalf("Invalid configuration: %v", err)
 	}
 
+	if *shutdownOnStdinEOF && cfg.Server.Daemonize {
+		log.Fatal("STDIN_SUPERVISION_REQUIRES_FOREGROUND")
+	}
+
 	// Handle daemonization if requested (and not already a daemon)
 	if cfg.Server.Daemonize && !isDaemonChild() {
 		if err := startDaemon(cfg.Server.LogFile); err != nil {
@@ -188,8 +201,14 @@ func main() {
 		}
 	}
 
-	// Setup signal handling for graceful shutdown
-	setupSignalHandling(amqpServer, cfg.Server.PidFile)
+	// Signals and the optional private supervisor pipe share one shutdown path.
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	var supervisor io.Reader
+	if *shutdownOnStdinEOF {
+		supervisor = os.Stdin
+	}
 
 	// Start server - show startup info only if not daemonizing
 	if !cfg.Server.Daemonize || isDaemonChild() {
@@ -231,35 +250,18 @@ func main() {
 		}
 	}
 
-	if err := amqpServer.Start(); err != nil {
+	if err := runServer(amqpServer, signals, supervisor); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
+	if cfg.Server.PidFile != "" {
+		if err := os.Remove(cfg.Server.PidFile); err != nil && !os.IsNotExist(err) {
+			log.Fatal("PID_FILE_CLEANUP_FAILED")
+		}
+	}
+	fmt.Println("Server stopped")
 }
 
 func writePIDFile(pidFile string) error {
 	pid := os.Getpid()
 	return os.WriteFile(pidFile, []byte(fmt.Sprintf("%d\n", pid)), 0644)
-}
-
-func setupSignalHandling(server *server.Server, pidFile string) {
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
-
-	go func() {
-		<-c
-		fmt.Println("\nShutting down server gracefully...")
-
-		// Clean up PID file
-		if pidFile != "" {
-			os.Remove(pidFile)
-		}
-
-		// Stop server gracefully (cancels metrics goroutine, closes listener)
-		server.Stop()
-
-		// Give some time for graceful shutdown
-		time.Sleep(2 * time.Second)
-		fmt.Println("Server stopped")
-		os.Exit(0)
-	}()
 }

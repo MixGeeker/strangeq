@@ -211,6 +211,10 @@ func (s *Server) AlarmState() uint32 {
 
 // Start starts the AMQP server
 func (s *Server) Start() error {
+	return s.start(nil)
+}
+
+func (s *Server) start(quit <-chan struct{}) error {
 	listener, err := s.createListener()
 	if err != nil {
 		return err
@@ -251,6 +255,18 @@ func (s *Server) Start() error {
 			zap.Int("discarded_artifacts", len(s.unsafeRecovery)))
 	}
 
+	if quit != nil {
+		finished := make(chan struct{})
+		defer close(finished)
+		go func() {
+			select {
+			case <-quit:
+				// Stop owns listener, connections, storage and log lifetime.
+				_ = s.Stop()
+			case <-finished:
+			}
+		}()
+	}
 	return s.acceptLoop()
 }
 
@@ -1486,106 +1502,6 @@ func (s *Server) Stop() error {
 
 // StartWithQuitChannel starts the server and returns a quit channel that can be used to stop it
 func (s *Server) StartWithQuitChannel(quit <-chan struct{}) error {
-	listener, err := s.createListener()
-	if err != nil {
-		return fmt.Errorf("failed to start server: %w", err)
-	}
-
-	s.Mutex.Lock()
-	s.Listener = listener
-	s.Mutex.Unlock()
-
-	if s.Config.Security.TLSEnabled {
-		s.Log.Info("AMQP server listening (TLS)", zap.String("addr", s.Addr))
-	} else {
-		s.Log.Info("AMQP server listening", zap.String("addr", s.Addr))
-	}
-
-	// Start system metrics collection in background
-	if s.MetricsCollector != nil {
-		ctx, cancel := context.WithCancel(context.Background())
-		s.Mutex.Lock()
-		s.metricsCancel = cancel
-		s.Mutex.Unlock()
-		go s.startSystemMetricsCollection(ctx)
-		s.Log.Info("Started system metrics collection")
-	}
-
-	// SQ-12: start the resource-alarm monitor (no-op / not spawned when alarms
-	// are disabled — the unset zero-cost contract).
-	if s.startAlarmMonitor() {
-		s.Log.Info("Started resource-alarm monitor",
-			zap.Duration("interval", s.alarm.interval))
-	}
-
-	// A broker that booted with --unsafe-recovery stays loud for its whole
-	// lifetime. Not spawned on a clean boot.
-	if s.startUnsafeRecoveryNag() {
-		s.Log.Error("THIS BROKER IS RUNNING DEGRADED: it started with "+interfaces.UnsafeRecoveryFlag+
-			" after discarding data it could not recover",
-			zap.Int("discarded_artifacts", len(s.unsafeRecovery)))
-	}
-
-	// Accept connections
-	for {
-		// Use a non-blocking approach with select to check for quit signal
-		connChan := make(chan net.Conn, 1)
-		errChan := make(chan error, 1)
-
-		go func() {
-			conn, err := listener.Accept()
-			connChan <- conn
-			errChan <- err
-		}()
-
-		select {
-		case conn := <-connChan:
-			err := <-errChan
-			if err != nil {
-				s.Mutex.RLock()
-				shutdown := s.Shutdown
-				s.Mutex.RUnlock()
-				if shutdown {
-					return nil
-				}
-				s.Log.Error("Error accepting connection", zap.Error(err))
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
-
-			// Handle the connection in a goroutine
-			s.Mutex.Lock()
-			if s.Shutdown {
-				s.Mutex.Unlock()
-				conn.Close()
-				return nil
-			}
-			if s.accepted == nil {
-				s.accepted = make(map[net.Conn]struct{})
-			}
-			s.accepted[conn] = struct{}{}
-			s.connectionWG.Add(1)
-			s.Mutex.Unlock()
-			go func() {
-				defer s.connectionWG.Done()
-				defer func() { s.Mutex.Lock(); delete(s.accepted, conn); s.Mutex.Unlock() }()
-				s.handleConnection(conn)
-			}()
-		case <-quit:
-			s.Log.Info("Server shutdown requested")
-			s.Mutex.Lock()
-			s.Shutdown = true
-			cancel := s.metricsCancel
-			alarmCancel := s.alarmCancel
-			s.Mutex.Unlock()
-			if cancel != nil {
-				cancel()
-			}
-			if alarmCancel != nil {
-				alarmCancel()
-			}
-			listener.Close()
-			return nil
-		}
-	}
+	err := s.start(quit)
+	return errors.Join(err, s.Stop())
 }
