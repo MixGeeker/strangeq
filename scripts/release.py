@@ -6,7 +6,7 @@ import hashlib
 import io
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import re
 import subprocess
 import tarfile
@@ -106,8 +106,10 @@ def archive_files(path):
     roots = set()
     files = {}
     for name, content in zip(names, contents):
-        parts = PurePosixPath(name).parts
-        if len(parts) != 2 or "\\" in name or ":" in name or any(p in (".", "..", "") for p in parts) or name.startswith("/"):
+        parts = name.split("/")
+        if (len(parts) != 2 or re.search(r'[\\:<>"|?*\x00-\x1f]', name)
+                or any(p in (".", "..", "") or p.endswith((".", " "))
+                       or re.fullmatch(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", p, re.IGNORECASE) for p in parts)):
             raise ValueError("unsafe archive name")
         roots.add(parts[0])
         files[parts[1]] = content

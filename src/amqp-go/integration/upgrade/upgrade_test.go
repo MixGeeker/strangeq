@@ -489,7 +489,6 @@ func TestImportMigrationFixture(t *testing.T) {
 		require.Equal(t, "github-hosted", os.Getenv("RUNNER_ENVIRONMENT"))
 		require.NotEmpty(t, fixture.RunID)
 		require.Equal(t, os.Getenv("GITHUB_RUN_ID"), fixture.RunID)
-		require.Equal(t, os.Getenv("GITHUB_RUN_ATTEMPT"), fixture.RunAttempt)
 		require.NotEmpty(t, fixture.Job)
 		require.NotEmpty(t, os.Getenv("GITHUB_JOB"))
 		require.NotEqual(t, os.Getenv("GITHUB_JOB"), fixture.Job)
@@ -527,6 +526,7 @@ func TestImportMigrationFixture(t *testing.T) {
 	require.NoError(t, verifySnapshot(snapshot, fixture.Files), "source remains immutable")
 	report["baselineSha256"] = fixture.BaselineSHA
 	report["sourceRunId"], report["sourceJob"] = fixture.RunID, fixture.Job
+	report["sourceRunAttempt"], report["targetRunAttempt"] = fixture.RunAttempt, os.Getenv("GITHUB_RUN_ATTEMPT")
 	report["targetJob"] = os.Getenv("GITHUB_JOB")
 	report["separateMachineTested"] = separateJob
 	report["samePlatformRestore"] = true

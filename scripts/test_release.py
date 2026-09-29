@@ -70,7 +70,8 @@ class ReleaseTests(unittest.TestCase):
     def test_traversal_and_windows_collisions_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             archive = Path(temporary) / "test.zip"
-            for names in (["../escape"], ["root/a", "root/A"], ["root/a:b"], ["root\\escape"]):
+            for names in (["../escape"], ["root/a", "root/A"], ["root/a:b"], ["root\\escape"],
+                          ["root/a", "root/./a"], ["root/a."], ["root/CON"], ["root/NUL.txt"]):
                 with self.subTest(names=names):
                     with zipfile.ZipFile(archive, "w") as output:
                         for name in names:
