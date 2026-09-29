@@ -36,6 +36,8 @@ Windows 的 race 需要另配 C 编译器；流水线在 Linux 执行 race。构
 
 Windows 原生套件按 Go package 顺序运行，各测试内部的并发场景保持原样，避免几个独立存储压力套件同时争用宿主资源而干扰多队列速率断言。吞吐阈值和消息完整性断言保持原值。
 
+绑定/删除竞态回归通过测试侧存储装饰器固定“绑定已清理、队列元数据尚在”的窗口，并发绑定必须等待删除后被拒绝，最终不能残留绑定。该测试不依赖微秒错峰命中率；移除绑定互斥的变异验证必须使它失败。
+
 `scripts/ci.py upgrade` 要求 `STRANGEQ_BASELINE_BINARY`、`STRANGEQ_CANDIDATE_BINARY`、`STRANGEQ_UPGRADE_REPORT`；设置 `STRANGEQ_MIGRATION_EXPORT` 可导出测试快照。`scripts/ci.py migration` 要求 `STRANGEQ_MIGRATION_SOURCE`、`STRANGEQ_CANDIDATE_BINARY`、`STRANGEQ_MIGRATION_REPORT`。本地同机导入报告的 `separateMachineTested` 为 false，不能代替 CI 换机证据。
 
 ## 仓库配置与故障处理
