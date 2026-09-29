@@ -71,7 +71,8 @@ class ReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             archive = Path(temporary) / "test.zip"
             for names in (["../escape"], ["root/a", "root/A"], ["root/a:b"], ["root\\escape"],
-                          ["root/a", "root/./a"], ["root/a."], ["root/CON"], ["root/NUL.txt"]):
+                          ["root/a", "root/./a"], ["root/a."], ["root/CON"], ["root/NUL.txt"],
+                          ["root/CON .txt"], ["root/COM¹.txt"], ["root/CONIN$"]):
                 with self.subTest(names=names):
                     with zipfile.ZipFile(archive, "w") as output:
                         for name in names:

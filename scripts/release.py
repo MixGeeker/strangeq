@@ -109,7 +109,8 @@ def archive_files(path):
         parts = name.split("/")
         if (len(parts) != 2 or re.search(r'[\\:<>"|?*\x00-\x1f]', name)
                 or any(p in (".", "..", "") or p.endswith((".", " "))
-                       or re.fullmatch(r"(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?", p, re.IGNORECASE) for p in parts)):
+                       or re.fullmatch(r"(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])",
+                                       p.split(".")[0].rstrip(" "), re.IGNORECASE) for p in parts)):
             raise ValueError("unsafe archive name")
         roots.add(parts[0])
         files[parts[1]] = content

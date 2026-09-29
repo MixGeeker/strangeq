@@ -44,6 +44,7 @@ func TestWindowsStorageNamesSurviveRestartWithoutAliases(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, sm.Close()) })
 	for i, name := range names {
+		t.Logf("persist queue and binding %q", name)
 		require.NoError(t, pm.StoreQueue(&protocol.Queue{Name: name, Durable: true, Ordinal: uint64(i + 1)}), name)
 		require.NoError(t, pm.StoreBinding(name, "events", name, nil), name)
 		require.NoError(t, sm.CheckpointBatch(name, segTestMessages(name, []uint64{uint64(i + 1)})), name)

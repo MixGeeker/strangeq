@@ -829,7 +829,9 @@ func legacyBindingFilename(a, b, c string) string {
 // So the tidier-looking order trades a cleanup lag for silent data loss. Do not
 // swap these.
 func removeLegacySlot(dir, current, legacy string, ownsRecord func(data []byte) bool) {
-	if legacy == current {
+	// Windows 的旧拼写可能解析为设备而非文件（如 con .txt_events_key.cbor）。
+	// 必须在读取之前排除，避免在有控制台的宿主中阻塞等待设备输入。
+	if legacy == current || !platformSegmentName(legacy) {
 		return
 	}
 	path := filepath.Join(dir, legacy)

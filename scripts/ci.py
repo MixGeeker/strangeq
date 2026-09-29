@@ -30,7 +30,8 @@ def tests(args):
     directory = Path(args.output).resolve()
     directory.mkdir(parents=True, exist_ok=True)
     options = {
-        "unit": ["-short", "./..."],
+        # 各包仍运行其并发场景；避免存储压力与多队列吞吐断言在同一 runner 争用资源。
+        "unit": ["-p=1", "-short", "./..."],
         "race": ["-race", "-short", "-coverprofile=" + str(directory / "coverage.out"), "-covermode=atomic", "./..."],
         "full": ["./..."],
         "conformance": ["-tags=conformance", "-run=TestConformance", ".", "./server"],
@@ -66,7 +67,7 @@ def tests(args):
             if event.get("Action") in ("skip", "fail"):
                 target = "skipped" if event["Action"] == "skip" else "failed"
                 result[target].append({"test": identity, "output": "".join(messages.get(identity, []))})
-                print(event["Action"] + ": " + identity)
+                print(event["Action"] + ": " + identity, flush=True)
             if event.get("Action") == "pass":
                 if "Test" in event:
                     result["passed"] += 1

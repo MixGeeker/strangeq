@@ -34,6 +34,8 @@ python scripts/release.py --help
 
 Windows 的 race 需要另配 C 编译器；流水线在 Linux 执行 race。构建命令默认拒绝有已跟踪修改的源码；本地临时使用 `--allow-dirty` 的归档明确标记 dirty，发行门禁拒绝该归档。
 
+Windows 原生套件按 Go package 顺序运行，各测试内部的并发场景保持原样，避免几个独立存储压力套件同时争用宿主资源而干扰多队列速率断言。吞吐阈值和消息完整性断言保持原值。
+
 `scripts/ci.py upgrade` 要求 `STRANGEQ_BASELINE_BINARY`、`STRANGEQ_CANDIDATE_BINARY`、`STRANGEQ_UPGRADE_REPORT`；设置 `STRANGEQ_MIGRATION_EXPORT` 可导出测试快照。`scripts/ci.py migration` 要求 `STRANGEQ_MIGRATION_SOURCE`、`STRANGEQ_CANDIDATE_BINARY`、`STRANGEQ_MIGRATION_REPORT`。本地同机导入报告的 `separateMachineTested` 为 false，不能代替 CI 换机证据。
 
 ## 仓库配置与故障处理
