@@ -2,7 +2,7 @@
 
 A high-performance AMQP 0.9.1 message broker written in Go. Compatible with RabbitMQ clients and tools.
 
-[![Build Status](https://github.com/maxpert/strangeq/workflows/Build%20and%20Test/badge.svg)](https://github.com/maxpert/strangeq/actions)
+[![CI](https://github.com/MixGeeker/strangeq/actions/workflows/build.yml/badge.svg)](https://github.com/MixGeeker/strangeq/actions/workflows/build.yml)
 [![Go Report Card](https://goreportcard.com/badge/github.com/maxpert/strangeq)](https://goreportcard.com/report/github.com/maxpert/strangeq)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
@@ -45,31 +45,32 @@ RabbitMQ is the gold standard for AMQP 0.9.1, but it runs on the Erlang VM — a
 
 ## Installation
 
-Windows 原生构建、运行和持久化边界见 [Windows 部署](docs/WINDOWS.md)。
+原生安装见 [运行说明](docs/RUNNING.md) 和 [Windows 部署](docs/WINDOWS.md)。本 fork 的安装、升级、失败回退与同平台迁移验收见 [发行合同](docs/RELEASE.md)；实际验证结果见 [Actions](https://github.com/MixGeeker/strangeq/actions)。
 
 ### Pre-built Binaries
 
-Download the latest release for your platform from the [releases page](https://github.com/maxpert/strangeq/releases).
+从本 fork 的 [发行页](https://github.com/MixGeeker/strangeq/releases) 选择准确版本和平台，核验 SHA-256 与来源证明后解包。程序和持久数据分别存放；归档中的配置样例须按部署环境配置认证、监听地址和存储路径。
 
 ```bash
-# macOS/Linux
-chmod +x amqp-server-*
-sudo mv amqp-server-* /usr/local/bin/amqp-server
-
-# Verify installation
-amqp-server --version
+# macOS/Linux：进入解包后的版本目录
+./amqp-server --version
+./amqp-server --generate-config config.local.yaml
+# 编辑配置后运行
+./amqp-server --config config.local.yaml
 ```
 
 ### From Source
 
 ```bash
-git clone https://github.com/maxpert/strangeq.git
+git clone https://github.com/MixGeeker/strangeq.git
 cd strangeq/src/amqp-go
 go build -o amqp-server ./cmd/amqp-server
 sudo mv amqp-server /usr/local/bin/
 ```
 
 ### Go Install
+
+以下 module 路径保留上游身份；获取本 fork 的准确版本请使用上述发行归档或源码构建。
 
 ```bash
 go install github.com/maxpert/amqp-go/cmd/amqp-server@latest
@@ -80,7 +81,7 @@ go install github.com/maxpert/amqp-go/cmd/amqp-server@latest
 ### Start Server
 
 ```bash
-# Defaults (in-memory, port 5672)
+# 默认使用持久存储，端口 5672；部署前配置认证和监听地址
 amqp-server
 
 # Generate example config

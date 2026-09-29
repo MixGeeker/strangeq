@@ -1,224 +1,50 @@
-name: Release Build
+name: Release candidate
 
 on:
-  release:
-    types: [created, published]
   push:
-    tags:
-      - 'v*'
-  workflow_dispatch:
-    inputs:
-      version:
-        description: 'Version tag (e.g., v1.0.0)'
-        required: true
-        default: 'v0.0.0-dev'
+    tags: ['v*']
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONUTF8: '1'
 
 jobs:
-  build:
-    name: Build ${{ matrix.os }} - ${{ matrix.arch }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      matrix:
-        include:
-          # macOS builds
-          - os: darwin
-            arch: amd64
-            runner: macos-latest
-            goos: darwin
-            goarch: amd64
-          - os: darwin
-            arch: arm64
-            runner: macos-latest
-            goos: darwin
-            goarch: arm64
-          
-          # Linux builds
-          - os: linux
-            arch: amd64
-            runner: ubuntu-latest
-            goos: linux
-            goarch: amd64
-          - os: linux
-            arch: arm64
-            runner: ubuntu-latest
-            goos: linux
-            goarch: arm64
-          - os: linux
-            arch: '386'
-            runner: ubuntu-latest
-            goos: linux
-            goarch: '386'
+  validate:
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ github.ref_name }}
 
+  draft:
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+      attestations: write
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          go-version: '1.25.1'
-
-      - name: Get version
-        id: version
-        run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            echo "version=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event_name }}" = "push" ]; then
-            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-          else
-            echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-          fi
-        shell: bash
-
-      - name: Build binary and create package
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-candidate
+          path: dist/release
+      - name: 制品与报告来源证明
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: dist/release/*
+      - name: 创建草稿，不覆盖已有发行
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 0
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          cd src/amqp-go
-          VERSION="${{ steps.version.outputs.version }}"
-          BINARY_NAME="amqp-server"
-          PACKAGE_NAME="amqp-server-${VERSION}-${{ matrix.os }}-${{ matrix.arch }}"
-
-          # Build with version information
-          go build \
-            -ldflags="-s -w -X main.version=${VERSION}" \
-            -o "${BINARY_NAME}" \
-            ./cmd/amqp-server
-
-          # Create package directory
-          mkdir -p "${PACKAGE_NAME}"
-
-          # Copy files into package
-          cp "${BINARY_NAME}" "${PACKAGE_NAME}/"
-          cp config.sample.yaml "${PACKAGE_NAME}/"
-          cp README.release.txt "${PACKAGE_NAME}/README.txt"
-          cp ../../LICENSE "${PACKAGE_NAME}/"
-
-          # Create tar.gz package
-          tar -czf "${PACKAGE_NAME}.tar.gz" "${PACKAGE_NAME}"
-
-          # Create checksum for the package
-          if command -v sha256sum &> /dev/null; then
-            sha256sum "${PACKAGE_NAME}.tar.gz" > "${PACKAGE_NAME}.tar.gz.sha256"
-          else
-            shasum -a 256 "${PACKAGE_NAME}.tar.gz" > "${PACKAGE_NAME}.tar.gz.sha256"
-          fi
-
-          # List package contents
-          echo "Package contents:"
-          tar -tzf "${PACKAGE_NAME}.tar.gz"
-          ls -lh "${PACKAGE_NAME}.tar.gz"
-        shell: bash
-
-      - name: Upload release package
-        uses: actions/upload-artifact@v4
-        with:
-          name: amqp-server-${{ matrix.os }}-${{ matrix.arch }}
-          path: |
-            src/amqp-go/amqp-server-*.tar.gz*
-          retention-days: 5
-
-  windows:
-    name: Windows x64 ZIP
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.25.1'
-          cache-dependency-path: src/amqp-go/go.sum
-      - name: 构建并打包
-        shell: pwsh
-        env:
-          RELEASE_VERSION: ${{ github.event.release.tag_name || github.event.inputs.version || github.ref_name }}
-          CGO_ENABLED: '0'
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $version = $env:RELEASE_VERSION
-          if ($version -notmatch '^v[0-9]+[.][0-9]+[.][0-9]+(?:[-+][A-Za-z0-9.-]+)?$') { throw 'Invalid release version' }
-          $package = "amqp-server-$version-windows-amd64"
-          New-Item -ItemType Directory -Path "release/$package" -Force | Out-Null
-          Push-Location src/amqp-go
-          go build "-ldflags=-s -w -X main.version=$version" -o "../../release/$package/amqp-server.exe" ./cmd/amqp-server
-          if ($LASTEXITCODE -ne 0) { throw 'Windows build failed' }
-          Pop-Location
-          Copy-Item -LiteralPath src/amqp-go/config.sample.yaml -Destination "release/$package"
-          Copy-Item -LiteralPath LICENSE -Destination "release/$package"
-          Copy-Item -LiteralPath docs/WINDOWS.md -Destination "release/$package/README.md"
-          Copy-Item -LiteralPath docs/AUTHORIZATION.md -Destination "release/$package"
-          Copy-Item -LiteralPath docs/TLS.md -Destination "release/$package"
-          & "./release/$package/amqp-server.exe" --version
-          Compress-Archive -LiteralPath "release/$package" -DestinationPath "release/$package.zip"
-          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "release/$package.zip").Hash.ToLowerInvariant()
-          "$hash  $package.zip" | Set-Content -Encoding utf8 "release/$package.zip.sha256"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: amqp-server-windows-amd64
-          path: release/*.zip*
-          retention-days: 5
-
-  release:
-    name: Create Release Assets
-    needs: [build, windows]
-    runs-on: ubuntu-latest
-    if: github.event_name == 'release' || github.event_name == 'push'
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Get version tag
-        id: version
-        run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            echo "tag=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
-          else
-            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-          fi
-        shell: bash
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-
-      - name: Display structure
-        run: ls -R artifacts
-
-      - name: Create release if needed
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${{ steps.version.outputs.tag }}"
-          # Check if release exists, create if it doesn't
-          if ! gh release view "$TAG" &>/dev/null; then
-            echo "Creating release for tag $TAG"
-            gh release create "$TAG" \
-              --title "Release $TAG" \
-              --notes "Automated release for $TAG" \
-              --draft=false
-          else
-            echo "Release $TAG already exists"
-          fi
-        shell: bash
-
-      - name: Upload release assets
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${{ steps.version.outputs.tag }}"
-          for dir in artifacts/*/; do
-            for file in "${dir}"*; do
-              if [ -f "$file" ]; then
-                echo "Uploading: $file"
-                gh release upload "$TAG" "$file" --clobber
-              fi
-            done
-          done
-        shell: bash
-
+          python scripts/publish.py draft --tag "$RELEASE_TAG" --repository "$GH_REPO" --directory dist/release

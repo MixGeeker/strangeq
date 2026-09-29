@@ -1,69 +1,39 @@
-# Release Process
+# StrangeQ 验证与发行
 
-## Versioning
+发行单位是准确 Git 提交构建出的不可变归档。源码使用 SemVer tag，构建工具链与升级基线由 `ci/contract.json` 固定。Go module 路径保留上游身份；本 fork 的制品和流水线属于 MixGeeker/strangeq。
 
-StrangeQ follows [Semantic Versioning](https://semver.org/).
+## CI
 
-## Creating a Release
+Pull Request、main、develop 和 codex 分支执行相同的基础检查：格式、vet、依赖完整性、Linux race 测试、Windows 原生测试与协议合同。测试输出保留 Go JSON 事件和失败／跳过清单，跳过不是通过对应场景的证明。PR 只使用 GitHub 托管 runner 和只读权限。
 
-1. Create and push a version tag:
-   ```bash
-   git tag -a v0.1.0 -m "Release v0.1.0"
-   git push origin v0.1.0
-   ```
+Windows 与 Linux 在独立托管虚拟机上运行真实 broker 进程。安装验证从最终归档解包，生成配置并在空数据目录启动。升级验证使用合同内固定提交构建旧程序，验证旧程序写入的已确认持久消息、拓扑和属性由候选程序恢复，再验证候选进程崩溃恢复、不支持的数据格式拒绝启动，以及失败后旧程序从升级前冷备份恢复。升级报告绑定两个可执行文件摘要和平台。
 
-2. Create a GitHub release:
-   - Go to https://github.com/maxpert/strangeq/releases/new
-   - Select the tag
-   - Copy release notes from CHANGELOG.md
-   - Publish release
+迁移范围是 StrangeQ 版本、目录及同平台换机。目录迁移保留源目录并校验完整冷备份；换机迁移由后续独立 GitHub job 在另一台同平台托管虚拟机下载测试快照，校验文件集合与摘要，重定位配置中的本机路径，并从同一发行归档恢复原消息、继续收发和重启验证。测试快照仅含随机生成的测试账号与数据，只作为短期 Actions artifact，发行附件不包含快照。
 
-3. GitHub Actions automatically builds binaries for:
-   - macOS (arm64, amd64)
-   - Linux (amd64, arm64, 386)
-   
-   SHA256 checksums are generated and uploaded with the binaries.
+这些测试覆盖进程停止与强制终止。虚拟机整机重启、虚拟磁盘断电及操作系统服务注册需要独立环境验收，不能用进程 kill 或托管 runner 重建代替。性能比较要求同一硬件和相同负载，已有 bench-gate 不在不同硬件的托管 runner 上自动刷新基线。
 
-4. Verify the release:
-   - Check that all binaries are attached
-   - Download and verify checksums
-   - Test at least one binary
+## 构建与制品
 
-## Manual Build
+Windows amd64 使用 ZIP；Linux amd64、arm64、386 和 macOS amd64、arm64 使用 tar.gz。构建固定 Go、CGO、源码提交和版本，使用 `-trimpath` 与只读 module 模式。归档包含程序、配置样例、许可证、第三方许可证、部署说明及构建元数据。元数据记录程序 SHA-256、依赖、源码和工具链；每个归档另有 SHA-256 文件。
 
-```bash
-cd src/amqp-go
-VERSION="v0.1.0"
+发布前检查准确 tag 指向、版本格式、归档集合、摘要和元数据。Windows/Linux amd64 从本次归档解包后执行升级验证；构建过程中的临时程序不代替最终归档验收。交叉构建的平台在报告中保留其实际运行验证范围。
 
-GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w -X main.version=${VERSION}" -o amqp-server-darwin-arm64 ./cmd/amqp-server
-GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w -X main.version=${VERSION}" -o amqp-server-darwin-amd64 ./cmd/amqp-server
-GOOS=linux GOARCH=amd64 go build -ldflags="-s -w -X main.version=${VERSION}" -o amqp-server-linux-amd64 ./cmd/amqp-server
-GOOS=linux GOARCH=arm64 go build -ldflags="-s -w -X main.version=${VERSION}" -o amqp-server-linux-arm64 ./cmd/amqp-server
-GOOS=linux GOARCH=386  go build -ldflags="-s -w -X main.version=${VERSION}" -o amqp-server-linux-386  ./cmd/amqp-server
+## 发版顺序
 
-sha256sum amqp-server-* > checksums.txt
-```
+1. 修改代码和变更说明，通过分支／PR 的 CI。升级来源只能加入已经验证的准确提交，不能使用 latest 或可移动分支作为旧版基线。
+2. 创建准确提交的 `vX.Y.Z` 或 `vX.Y.Z-rc.N` tag 并推送。tag 流水线重新完成检查、构建、归档验证和升级验证。
+3. 流水线为本批归档生成 GitHub 构建来源证明，全部成功后创建草稿 Release，附带制品、摘要和验证报告。同名 Release 或资产不覆盖。
+4. 维护者核对变更、已知限制和验收范围后，通过发布工作流发布该草稿。发布只校验和晋级原有字节，不重新编译；前置构建必须属于同一 tag 与提交并成功。
+5. 使用者选择准确版本及平台，核验归档摘要与来源，按运行说明安装，并在升级前保存程序版本和完整冷备份。
 
-## Hotfix Releases
+首次建立流水线不自动创建版本 tag 或对外发布。仓库的 tag 保护、发布 Environment 审核和 Release 不可变设置由管理员按交付策略配置；工作流的校验不能代替平台权限设置。
 
-1. Create a hotfix branch from the release tag:
-   ```bash
-   git checkout -b hotfix/0.1.1 v0.1.0
-   ```
+## 恢复与限制
 
-2. Make the fix, update CHANGELOG.md, commit.
+升级前停止 broker，保存完整数据和配置冷备份。候选失败后停止候选，保留失败现场，从校验通过的备份恢复到空目录，再启动对应旧程序。旧程序直接打开候选已经修改的数据不属于恢复路径。
 
-3. Tag and push:
-   ```bash
-   git tag -a v0.1.1 -m "Hotfix v0.1.1"
-   git push origin v0.1.1
-   ```
+StrangeQ 自身拥有数据格式及兼容性；AMQP 协议一致不代表磁盘格式兼容。当前 WAL 接受版本 4，并拒绝不支持的版本。流水线证明合同内准确基线到候选的迁移，不能推导为任意历史版本或跨操作系统数据目录兼容。跨格式转换器不在当前实现中；若存储格式变化，须先实现并验证转换路径再更新兼容声明。
 
-4. Create GitHub release.
+已有测试包含明确标记的未覆盖／已知问题；发行报告保留这些结果。恢复夹具读取后 NACK 并重排原消息，验证持久数据完整性，不声明消费者 ACK 后遭遇崩溃绝不重投。冷备份回退恢复的是备份时点；候选运行期间新增数据保留在失败现场，不会自动合并回旧版。安装采用解包后的前台原生进程，服务注册与自动更新器具有独立验收范围。
 
-5. Merge back to main:
-   ```bash
-   git checkout main
-   git merge hotfix/0.1.1
-   git push origin main
-   ```
+本地使用 `python scripts/release.py --help` 查看构建、归档校验和发布检查入口。CI 固定命令见 `.github/workflows/README.md`。

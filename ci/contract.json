@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "goVersion": "1.26.1",
+  "upgradeBaseline": {
+    "commit": "d840fd07c1a43f25b4a1b29ebcf6c81123a78174",
+    "version": "0.9.1+echoo.2"
+  },
+  "targets": ["windows-amd64", "linux-amd64", "linux-arm64", "linux-386", "darwin-amd64", "darwin-arm64"]
+}

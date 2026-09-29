@@ -1,132 +1,368 @@
-name: Build and Test
+name: CI
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [main, develop, 'codex/**']
   pull_request:
-    branches: [ main, develop ]
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  PYTHONUTF8: '1'
+  GOTOOLCHAIN: local
+  GOFLAGS: -mod=readonly
 
 jobs:
-  test:
-    name: Test on Go ${{ matrix.go-version }}
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        go-version: ['1.25.1']
-    
+  identity:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      go: ${{ steps.identity.outputs.go }}
+      version: ${{ steps.identity.outputs.version }}
+      baseline: ${{ steps.identity.outputs.baseline }}
+      targets: ${{ steps.identity.outputs.targets }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          go-version: ${{ matrix.go-version }}
-
-      - name: Cache Go modules
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
-      - name: Download dependencies
+          persist-credentials: false
+      - id: identity
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
-          cd src/amqp-go
-          go mod download
+          python - <<'PY'
+          import json, os, subprocess, sys
+          sys.path.insert(0, 'scripts')
+          import release
+          contract = release.contract()
+          sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          selected = release.version(os.environ.get('REQUESTED_VERSION') or '0.0.0-ci.' + sha[:12])
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('go=' + contract['goVersion'] + '\n')
+              output.write('version=' + selected + '\n')
+              output.write('baseline=' + contract['upgradeBaseline']['commit'] + '\n')
+              output.write('targets=' + json.dumps(contract['targets']) + '\n')
+          PY
 
-      - name: Run tests
-        run: |
-          cd src/amqp-go
-          go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v4
-        with:
-          files: ./src/amqp-go/coverage.out
-          flags: unittests
-          name: codecov-umbrella
-          fail_ci_if_error: false
-
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-
+  quality:
+    needs: identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          go-version: '1.25.1'
-
-      - name: Run go fmt
-        run: |
-          cd src/amqp-go
-          # Exclude examples and testdata directories
-          find . -name '*.go' -not -path './examples/*' -not -path './testdata/*' -exec gofmt -l {} + | tee /tmp/fmt-output
-          if [ -s /tmp/fmt-output ]; then
-            echo "The following files are not formatted:"
-            cat /tmp/fmt-output
-            exit 1
-          fi
-
-      - name: Run go vet
-        run: |
-          cd src/amqp-go
-          # Use go list to get all packages except examples and testdata
-          go list ./... | grep -v '/examples' | grep -v '/testdata' | xargs go vet
-
-  build:
-    name: Build
-    runs-on: ubuntu-latest
-    
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
-          go-version: '1.25.1'
-
-      - name: Build binary
-        run: |
-          cd src/amqp-go
-          go build -v ./cmd/amqp-server
-
-      - name: Verify build
-        run: |
-          cd src/amqp-go
-          ./amqp-server -version
-
-
-  windows:
-    name: Windows 原生协议验收
-    runs-on: windows-latest
-    defaults:
-      run:
-        working-directory: src/amqp-go
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: '1.25.1'
+          go-version: ${{ needs.identity.outputs.go }}
           cache-dependency-path: src/amqp-go/go.sum
-      - name: 构建原生程序
+      - name: 发行工具回归
+        run: python -m unittest discover -s scripts -p 'test_*.py' -v
+      - name: 格式、依赖与 vet
+        run: python scripts/ci.py check
+      - name: 工作流静态检查
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7
+
+  test:
+    needs: identity
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            suite: race
+          - runner: windows-2022
+            suite: unit
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ needs.identity.outputs.go }}
+          cache-dependency-path: src/amqp-go/go.sum
+      - name: 原生测试
+        run: python scripts/ci.py ${{ matrix.suite }}
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: tests-${{ matrix.suite }}
+          path: dist/test-results/
+          if-no-files-found: error
+          retention-days: 14
+
+  conformance:
+    needs: identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ needs.identity.outputs.go }}
+          cache-dependency-path: src/amqp-go/go.sum
+      - run: python scripts/ci.py conformance
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: tests-conformance
+          path: dist/test-results/
+          if-no-files-found: error
+          retention-days: 14
+
+  package:
+    needs: identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(needs.identity.outputs.targets) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ needs.identity.outputs.go }}
+          cache-dependency-path: src/amqp-go/go.sum
+      - name: 冻结构建与归档校验
+        env:
+          VERSION: ${{ needs.identity.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: python scripts/release.py build --version "$VERSION" --target "$TARGET" --output dist/packages
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-${{ matrix.target }}
+          path: |
+            dist/packages/*.zip
+            dist/packages/*.tar.gz
+            dist/packages/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  upgrade:
+    needs: [identity, package]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            target: windows-amd64
+            executable: amqp-server.exe
+            extension: zip
+          - runner: ubuntu-24.04
+            target: linux-amd64
+            executable: amqp-server
+            extension: tar.gz
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ needs.identity.outputs.go }}
+          cache-dependency-path: src/amqp-go/go.sum
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: package-${{ matrix.target }}
+          path: dist/packages
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.identity.outputs.baseline }}
+          path: dist/baseline-source
+          persist-credentials: false
+      - name: 构建准确旧版并验证本次归档
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.identity.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          EXECUTABLE: ${{ matrix.executable }}
+          EXTENSION: ${{ matrix.extension }}
         run: |
-          go build -o amqp-server.exe ./cmd/amqp-server
+          python scripts/release.py baseline --source dist/baseline-source --target $env:TARGET --output "dist/baseline/$env:EXECUTABLE"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./amqp-server.exe --version
-      - name: 平台与协议回归
-        run: |
-          go test ./auth ./config ./interfaces ./protocol ./cmd/amqp-server -count=1 -timeout 90s
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          go test ./server ./storage ./broker -short -count=1 -timeout 300s
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          go test . -run 'TestWindowsNative|TestAuthentication|TestAuthzIntegration|TestTLS|TestDurableRestart_(EveryConfirmed|BelowSpill|NoRestart)' -count=1 -timeout 90s
+          $archive = "dist/packages/strangeq-$env:VERSION-$env:TARGET.$env:EXTENSION"
+          python scripts/release.py verify --archive $archive --version $env:VERSION --commit (git rev-parse HEAD) --extract dist/candidate
           exit $LASTEXITCODE
+      - name: 升级、崩溃与冷备份恢复
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          EXECUTABLE: ${{ matrix.executable }}
+        run: |
+          $env:STRANGEQ_BASELINE_BINARY = (Resolve-Path "dist/baseline/$env:EXECUTABLE").Path
+          $env:STRANGEQ_CANDIDATE_BINARY = (Resolve-Path "dist/candidate/$env:EXECUTABLE").Path
+          $env:STRANGEQ_UPGRADE_REPORT = Join-Path $PWD "dist/evidence/upgrade-$env:TARGET.json"
+          $env:STRANGEQ_MIGRATION_EXPORT = Join-Path $PWD "dist/migration-fixture"
+          python scripts/ci.py upgrade --output dist/upgrade-results
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: migration-source-${{ matrix.target }}
+          path: dist/migration-fixture/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 3
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: upgrade-${{ matrix.target }}
+          path: dist/evidence/
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: tests-upgrade-${{ matrix.target }}
+          path: dist/upgrade-results/
+          if-no-files-found: warn
+          retention-days: 14
+
+  migration:
+    needs: [identity, upgrade]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            target: windows-amd64
+            executable: amqp-server.exe
+            extension: zip
+          - runner: ubuntu-24.04
+            target: linux-amd64
+            executable: amqp-server
+            extension: tar.gz
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: ${{ needs.identity.outputs.go }}
+          cache-dependency-path: src/amqp-go/go.sum
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: package-${{ matrix.target }}
+          path: dist/packages
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: migration-source-${{ matrix.target }}
+          path: dist/migration-fixture
+      - name: 另一台同平台虚拟机安装与恢复
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.identity.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          EXECUTABLE: ${{ matrix.executable }}
+          EXTENSION: ${{ matrix.extension }}
+        run: |
+          $archive = "dist/packages/strangeq-$env:VERSION-$env:TARGET.$env:EXTENSION"
+          python scripts/release.py verify --archive $archive --version $env:VERSION --commit (git rev-parse HEAD) --extract dist/candidate
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:STRANGEQ_CANDIDATE_BINARY = (Resolve-Path "dist/candidate/$env:EXECUTABLE").Path
+          $env:STRANGEQ_MIGRATION_SOURCE = (Resolve-Path "dist/migration-fixture").Path
+          $env:STRANGEQ_MIGRATION_REPORT = Join-Path $PWD "dist/evidence/migration-$env:TARGET.json"
+          python scripts/ci.py migration --output dist/migration-results
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: migration-report-${{ matrix.target }}
+          path: dist/evidence/
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: tests-migration-${{ matrix.target }}
+          path: dist/migration-results/
+          if-no-files-found: warn
+          retention-days: 14
+
+  bundle:
+    needs: [identity, quality, test, conformance, package, upgrade, migration]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: package-*
+          merge-multiple: true
+          path: dist/release
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: upgrade-*
+          merge-multiple: true
+          path: dist/release
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: migration-report-*
+          merge-multiple: true
+          path: dist/release
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: tests-*
+          path: dist/tests
+      - name: 校验候选发行完整集合
+        env:
+          VERSION: ${{ needs.identity.outputs.version }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          BUILD_RUN_ID: ${{ github.run_id }}
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import shutil
+          for path in Path('dist/tests').rglob('*-summary.json'):
+              target = Path('dist/release') / (path.parent.name + '-' + path.name)
+              if target.exists():
+                  raise SystemExit('duplicate report')
+              shutil.copyfile(path, target)
+          PY
+          python scripts/release.py manifest --directory dist/release --version "$VERSION" --commit "$SOURCE_COMMIT" --run-id "$BUILD_RUN_ID"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-candidate
+          path: dist/release/
+          if-no-files-found: error
+          retention-days: 14
+
+  gate:
+    name: CI gate
+    if: always()
+    needs: [quality, test, conformance, package, upgrade, migration, bundle]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python - <<'PY'
+          import json, os
+          results = json.loads(os.environ['RESULTS'])
+          failed = {name: value['result'] for name, value in results.items() if value['result'] != 'success'}
+          if failed:
+              raise SystemExit(str(failed))
+          PY

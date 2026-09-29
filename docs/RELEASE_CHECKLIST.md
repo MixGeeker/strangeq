@@ -1,71 +1,13 @@
-# Release Checklist
+# 发行验收清单
 
-## Pre-Release
+- [ ] tag 对应准确源码提交，版本与归档元数据一致。
+- [ ] 基础 CI、Linux race、Windows 原生与协议测试完成，失败与跳过均可查。
+- [ ] Windows/Linux 最终归档完成空目录安装、固定基线到候选的升级、候选崩溃恢复及失败后的冷备份回退。
+- [ ] 目录迁移及另一台同平台托管虚拟机上的快照恢复通过；源目录保持完整，损坏快照被拒绝。
+- [ ] 原消息身份、内容、属性和拓扑验证通过；新消息收发不能代替旧数据恢复检查。
+- [ ] 制品集合完整，SHA-256、许可证、第三方依赖与构建来源可核验。
+- [ ] 变更说明列出存储兼容范围和已知限制；无证据的升级来源不声明支持。
+- [ ] 声明准确基线与平台范围；整机重启、掉电和服务注册若未验收，明确列为未覆盖。
+- [ ] 发布晋级消费原草稿字节，同名版本没有覆盖、重建或移动 tag。
 
-### Code Quality
-- [ ] All tests pass: `go test -race ./...`
-- [ ] `gofmt -l .` produces no output
-- [ ] `go vet ./...` passes
-- [ ] Benchmarks show no regressions
-- [ ] No critical bugs in issue tracker
-
-### Documentation
-- [ ] Update CHANGELOG.md
-- [ ] Update README.md if features changed
-- [ ] Check all documentation links work
-
-### Testing
-- [ ] Run full test suite with race detector
-- [ ] Test with real AMQP clients (Python, Go, Node.js)
-- [ ] Test authentication and TLS
-- [ ] Test crash recovery scenarios
-
-## Release
-
-1. Update CHANGELOG.md with release date
-2. Commit final changes:
-   ```bash
-   git add CHANGELOG.md
-   git commit -m "chore: prepare for v0.1.0 release"
-   git push origin main
-   ```
-
-3. Create and push tag:
-   ```bash
-   git tag -a v0.1.0 -m "Release v0.1.0"
-   git push origin v0.1.0
-   ```
-
-4. Create GitHub release:
-   - Go to https://github.com/maxpert/strangeq/releases/new
-   - Select the tag
-   - Copy release notes from CHANGELOG.md
-   - Publish release
-
-5. Wait for GitHub Actions to build binaries for all platforms
-
-6. Verify:
-   ```bash
-   wget https://github.com/maxpert/strangeq/releases/download/v0.1.0/amqp-server-linux-amd64
-   wget https://github.com/maxpert/strangeq/releases/download/v0.1.0/amqp-server-linux-amd64.sha256
-   sha256sum -c amqp-server-linux-amd64.sha256
-   ```
-
-## Post-Release
-
-- [ ] Monitor issue tracker for release-related bugs
-- [ ] Create new CHANGELOG section for next version
-
-## Hotfix
-
-```bash
-git checkout -b hotfix/0.1.1 v0.1.0
-# make fix
-git commit -m "fix: critical bug description"
-git tag -a v0.1.1 -m "Hotfix v0.1.1"
-git push origin v0.1.1
-# create GitHub release, then merge back to main
-git checkout main
-git merge hotfix/0.1.1
-git push origin main
-```
+流程与职责以 [发行合同](RELEASE.md) 为准；单次结果保存在 Actions 和 Release。

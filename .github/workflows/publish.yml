@@ -1,0 +1,37 @@
+name: Publish verified release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '已经通过验证的草稿 tag，例如 v0.9.2-rc.1'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release
+    permissions:
+      contents: write
+      actions: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: 核验原制品与来源后发布
+        env:
+          PYTHONUTF8: '1'
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          GH_REPO: ${{ github.repository }}
+        run: python scripts/publish.py publish --tag "$RELEASE_TAG" --repository "$GH_REPO" --directory dist/promote

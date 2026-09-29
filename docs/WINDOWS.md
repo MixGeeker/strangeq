@@ -1,6 +1,6 @@
 # Windows 原生部署
 
-StrangeQ 在 Windows 10 1809 / Windows Server 2019 或更高版本的 x64 系统上以独立 `amqp-server.exe` 运行，客户端使用 AMQP 0-9-1。构建需要 Go 1.25.1 或以上版本；数据保存在本机 NTFS 卷，不需要 Erlang 或 Docker。
+StrangeQ 在 Windows 10 1809 / Windows Server 2019 或更高版本的 x64 系统上以独立 `amqp-server.exe` 运行，客户端使用 AMQP 0-9-1。发行构建固定使用 `ci/contract.json` 指定的 Go 版本；数据保存在本机 NTFS 卷，不需要 Erlang 或 Docker。
 
 使用 Windows 发行 ZIP 时，解压后在程序目录执行 `./amqp-server.exe --generate-config config.local.yaml`，编辑配置后执行 `./amqp-server.exe --config config.local.yaml`。从源码构建使用以下命令：
 
@@ -31,7 +31,7 @@ Windows 构建和协议测试由构建流水线执行，发行流水线提供 Wi
 
 `basic.cancel` 停止后续投递，已发送到客户端的未确认消息仍属于原 channel，可继续 ACK、NACK 或 Reject。尚在内部缓冲的消息回到 ready 队列；关闭 channel 或连接时再重投剩余未确认消息。这使客户端能先取消消费，再排空正在处理的业务操作。
 
-## 本轮验证记录
+## 历史本地验证记录
 
 2026-09-29，本机 Windows x64 / NTFS，Go 1.26.1：
 
@@ -41,4 +41,4 @@ Windows 构建和协议测试由构建流水线执行，发行流水线提供 Wi
 - `go vet ./server ./storage ./broker ./cmd/amqp-server` 通过；Linux amd64、macOS amd64 交叉构建通过。
 - Echoo 的 AMQP Profile 19 项测试及支付模块 24 项测试在原生 broker 上通过。
 
-构建流水线使用 Go 1.25.1。远端 CI、Linux/macOS 运行测试、Windows 服务安装、真实断电与长期压力测试未在本轮执行。
+以上是该次本地验证范围。当前流水线工具链由 `ci/contract.json` 固定，Windows/Linux 安装、升级、回退和同平台迁移的结果见 [Actions](https://github.com/MixGeeker/strangeq/actions)；发版门禁与未覆盖范围见 [发行合同](RELEASE.md)。
