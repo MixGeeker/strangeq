@@ -30,13 +30,20 @@ type consumerInfo struct {
 // Flow control: before forwarding, a single atomic load of channel.FlowActive
 // gates the send. When flow is inactive the goroutine parks on FlowWake until
 // flow resumes or stop closes (zero overhead in the common active case).
-func forwardConsumerMessages(channel *protocol.Channel, msgChan chan *protocol.Delivery, fanIn chan<- *protocol.Delivery, stop <-chan struct{}) {
+func forwardConsumerMessages(channel *protocol.Channel, msgChan chan *protocol.Delivery, fanIn chan<- *protocol.Delivery, stop <-chan struct{}, requeue ...func(*protocol.Delivery)) {
+	var pending *protocol.Delivery
+	defer func() {
+		if pending != nil && len(requeue) > 0 {
+			requeue[0](pending)
+		}
+	}()
 	for {
 		select {
 		case delivery, ok := <-msgChan:
 			if !ok {
 				return
 			}
+			pending = delivery
 			for !channel.FlowActive.Load() {
 				select {
 				case <-channel.FlowWake:
@@ -46,6 +53,7 @@ func forwardConsumerMessages(channel *protocol.Channel, msgChan chan *protocol.D
 			}
 			select {
 			case fanIn <- delivery:
+				pending = nil
 			case <-stop:
 				return
 			}
@@ -85,7 +93,7 @@ func (s *Server) discoverConsumers(
 				consumerInfos[consumer.ID] = &consumerInfo{channel: channel, tag: consumer.Tag}
 				stop := make(chan struct{})
 				forwarders[consumer.ID] = stop
-				go forwardConsumerMessages(channel, consumer.Messages, fanIn, stop)
+				go forwardConsumerMessages(channel, consumer.Messages, fanIn, stop, s.requeueSingleDelivery)
 				s.Log.Debug("Started forwarder for consumer",
 					zap.String("consumer_tag", consumer.Tag),
 					zap.String("consumer_id", consumer.ID),
@@ -161,6 +169,15 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection, done chan struc
 		}
 
 		if len(consumerInfos) == 0 {
+		drainCancelled:
+			for {
+				select {
+				case delivery := <-fanIn:
+					s.requeueSingleDelivery(delivery)
+				default:
+					break drainCancelled
+				}
+			}
 			time.Sleep(10 * time.Millisecond)
 			continue
 		}
@@ -187,6 +204,7 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection, done chan struc
 			info, exists := consumerInfos[delivery.ConsumerID]
 			if !exists {
 				// Consumer was removed after forwarding — drop the delivery
+				s.requeueSingleDelivery(delivery)
 				continue
 			}
 
@@ -230,6 +248,7 @@ func (s *Server) consumerDeliveryLoop(conn *protocol.Connection, done chan struc
 			for i, extra := range extras {
 				extraInfo, exists := consumerInfos[extra.ConsumerID]
 				if !exists {
+					s.requeueSingleDelivery(extra)
 					continue
 				}
 				err := s.sendBatchedDeliveries(conn, extraInfo.channel.ID, extraInfo.tag, []*protocol.Delivery{extra})

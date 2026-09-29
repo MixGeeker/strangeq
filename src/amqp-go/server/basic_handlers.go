@@ -809,12 +809,19 @@ func (s *Server) handleBasicCancel(conn *protocol.Connection, channelID uint16, 
 		// Consumer doesn't exist, but this might be OK depending on the spec
 		s.Log.Warn("Attempted to cancel non-existent consumer",
 			zap.String("consumer_tag", cancelMethod.ConsumerTag))
+		if !cancelMethod.NoWait {
+			return s.sendBasicCancelOK(conn, channelID, cancelMethod.ConsumerTag)
+		}
 		return nil
 	}
 
 	// Close the consumer's message channel and signal cancellation
 	close(consumer.Cancel)
 	delete(channel.Consumers, cancelMethod.ConsumerTag)
+	if channel.CancelledConsumers == nil {
+		channel.CancelledConsumers = make(map[string]struct{})
+	}
+	channel.CancelledConsumers[consumer.ID] = struct{}{}
 	channel.Mutex.Unlock()
 	conn.ConsumersDirty.Store(true)
 
@@ -823,7 +830,7 @@ func (s *Server) handleBasicCancel(conn *protocol.Connection, channelID uint16, 
 	// last, anywhere on the broker — one connection's basic.cancel tearing down
 	// another connection's consumer. The tag resolves to a consumer only within
 	// this channel, which is the resolution the lookup above just performed.
-	err = s.Broker.UnregisterConsumer(consumer.ID)
+	err = s.Broker.CancelConsumer(consumer.ID)
 	if err != nil {
 		s.Log.Error("Failed to unregister consumer with broker",
 			zap.Error(err),

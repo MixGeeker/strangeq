@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -133,6 +134,11 @@ func TestRecovery_UnsafeRecoveryBootsAndNamesEveryDiscardedArtifact(t *testing.T
 	if srv == nil {
 		t.Fatalf("Build() returned (nil, nil) with --unsafe-recovery set")
 	}
+	t.Cleanup(func() {
+		if err := srv.Stop(); err != nil {
+			t.Error(err)
+		}
+	})
 
 	// The in-process form of the pinned metric: every discarded artifact is
 	// enumerable for the lifetime of the process, not just at boot.
@@ -167,7 +173,8 @@ func TestRecovery_UnsafeRecoveryBootsAndNamesEveryDiscardedArtifact(t *testing.T
 		walPath,           // every discarded artifact, BY PATH
 		"unsafe-recovery", // and why it was discarded rather than recovered
 	} {
-		if !strings.Contains(logged, want) {
+		encoded, _ := json.Marshal(want)
+		if !strings.Contains(logged, want) && !strings.Contains(logged, string(encoded)) {
 			t.Errorf("boot log does not contain %q; a degraded boot must name what it dropped.\nlog:\n%s", want, logged)
 		}
 	}
@@ -327,6 +334,11 @@ func TestRecovery_DeletedQueueLeftoversStillBoot(t *testing.T) {
 	if srv == nil {
 		t.Fatalf("Build() returned (nil, nil)")
 	}
+	t.Cleanup(func() {
+		if err := srv.Stop(); err != nil {
+			t.Error(err)
+		}
+	})
 }
 
 // TestRecovery_LegacyOrdinalZeroRecordStillRefuses is a REGRESSION GUARD, not a
@@ -555,6 +567,11 @@ func TestRecovery_UnsafeRecoveryConfinesLossToTheNamedFile(t *testing.T) {
 	if srv == nil {
 		t.Fatalf("Build() returned (nil, nil)")
 	}
+	t.Cleanup(func() {
+		if err := srv.Stop(); err != nil {
+			t.Error(err)
+		}
+	})
 	raw, rerr := os.ReadFile(logPath)
 	if rerr != nil {
 		t.Fatalf("read boot log: %v", rerr)
@@ -635,6 +652,11 @@ func TestRecovery_DurableBindingsSurviveRestartWithoutBindingRecovery(t *testing
 	if srv == nil {
 		t.Fatalf("Build() returned (nil, nil)")
 	}
+	t.Cleanup(func() {
+		if err := srv.Stop(); err != nil {
+			t.Error(err)
+		}
+	})
 	if err := srv.Broker.PublishMessage("bex", "bk", &protocol.Message{
 		Body: []byte("after-restart"), DeliveryMode: 2, Exchange: "bex", RoutingKey: "bk",
 	}); err != nil {

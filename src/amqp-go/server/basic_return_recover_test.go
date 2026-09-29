@@ -34,7 +34,12 @@ func createTestStorageBroker(t testing.TB) (*broker.StorageBroker, func()) {
 		ConsumerMaxBatchSize:    100,
 	}
 	br := broker.NewStorageBroker(store, engineConfig)
-	return br, func() {}
+	return br, func() {
+		br.Close()
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	}
 }
 
 // parseMethodFrame extracts classID, methodID, and method payload from a

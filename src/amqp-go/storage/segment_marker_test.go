@@ -3,6 +3,7 @@ package storage
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -536,6 +537,9 @@ func TestSegmentMarker_MarkerlessGeneratedDirIsNotAMetricLabel(t *testing.T) {
 // mkdir'd either, so segmentDirFor exhausts every candidate and faults, and the
 // fixture would be measuring a refusal rather than the silent strand.
 func TestSegmentDir_UnlistableSegmentsRootIsReported(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("该故障注入依赖 POSIX 目录权限位")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("running as root: permission bits do not restrict access, so the injection cannot work")
 	}

@@ -3,6 +3,7 @@ package storage
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -158,6 +159,9 @@ func TestMetadataPath_OrdinaryNamesKeepTheirExistingFile(t *testing.T) {
 		strings.Repeat("q", 246),
 	}
 	for _, name := range ordinary {
+		if runtime.GOOS == "windows" && !platformLiteralName(name) {
+			continue // Windows 编码名称由专门的重启与身份回归覆盖。
+		}
 		require.NoError(t, pm.StoreQueue(&protocol.Queue{Name: name, Durable: true, Ordinal: 3}))
 		want := filepath.Join(dataDir, MetadataDir, QueuesDir, name+FileExtension)
 		_, serr := os.Stat(want)

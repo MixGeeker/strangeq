@@ -59,6 +59,12 @@ func newB4Server(t *testing.T, authEnabled bool, users []auth.UserEntry) *Server
 	}
 	storageBroker := broker.NewStorageBroker(storageImpl, cfg.GetEngine())
 	unifiedBroker := NewStorageBrokerAdapter(storageBroker)
+	t.Cleanup(func() {
+		storageBroker.Close()
+		if err := storageImpl.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 
 	dir := t.TempDir()
 	authPath := dir + "/auth.json"

@@ -654,7 +654,7 @@ func WALRecordCountsForTest(dataDir string) (WALRecordCounts, error) {
 // WALRecordCountsForTest).
 func scanWALFileRecordCounts(filePath string) (WALRecordCounts, error) {
 	var c WALRecordCounts
-	f, err := os.Open(filePath)
+	f, err := openStorageFile(filePath, os.O_RDONLY, 0)
 	if err != nil {
 		return c, err
 	}
@@ -1125,7 +1125,7 @@ func walNothingIntelligibleFollows(f *os.File, from int64) bool {
 // It returns the messages it did parse ALONGSIDE any fault, so a degraded or
 // benign outcome keeps its partial data; only a fatal outcome discards it.
 func (qw *QueueWAL) scanWALFile(filePath string) ([]*RecoveryMessage, error) {
-	file, err := os.Open(filePath)
+	file, err := openStorageFile(filePath, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -2299,7 +2299,7 @@ func (qw *QueueWAL) openNextFile() error {
 	fileNum := qw.fileNum.Add(1)
 	filename := filepath.Join(qw.dataDir, fmt.Sprintf("%020d%s", fileNum, WALFileExtension))
 
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	file, err := openStorageFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to open WAL file: %w", err)
 	}
@@ -2350,7 +2350,7 @@ func (qw *QueueWAL) openNextFile() error {
 				filename, ErrUnsupportedWALVersion, size, WALHeaderSize)
 		}
 		// currentFile is O_WRONLY and cannot ReadAt; probe with its own handle.
-		probe, perr := os.Open(filename)
+		probe, perr := openStorageFile(filename, os.O_RDONLY, 0)
 		if perr != nil {
 			_ = file.Close()
 			return fmt.Errorf("failed to open WAL file %s for header validation: %w", filename, perr)
@@ -2364,7 +2364,7 @@ func (qw *QueueWAL) openNextFile() error {
 	}
 
 	// Open a read-only handle for ReadAt (currentFile is O_WRONLY, can't ReadAt)
-	readFile, err := os.Open(filename)
+	readFile, err := openStorageFile(filename, os.O_RDONLY, 0)
 	if err != nil {
 		file.Close()
 		return fmt.Errorf("failed to open WAL read handle: %w", err)
@@ -2639,7 +2639,7 @@ func (qw *QueueWAL) getOldFileHandle(fileNum uint64) (*os.File, error) {
 	}
 
 	// Open file outside any locks
-	file, err := os.Open(filePath)
+	file, err := openStorageFile(filePath, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -2920,7 +2920,7 @@ func (qw *QueueWAL) readMessageSequential(queueName string, offset uint64) (*pro
 
 // readMessageFromFile reads a message from a specific WAL file (sequential scan for shared WAL format)
 func (qw *QueueWAL) readMessageFromFile(queueName string, filePath string, offset uint64) (*protocol.Message, error) {
-	file, err := os.Open(filePath)
+	file, err := openStorageFile(filePath, os.O_RDONLY, 0)
 	if err != nil {
 		return nil, err
 	}

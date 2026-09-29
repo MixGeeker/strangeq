@@ -44,6 +44,7 @@ func newIsolatedTestServer(t *testing.T, cfg *config.AMQPConfig) *server.Server 
 	if err != nil {
 		t.Fatalf("building test server at %s: %v", cfg.Network.Address, err)
 	}
+	t.Cleanup(func() { require.NoError(t, srv.Stop()) })
 	return srv
 }
 

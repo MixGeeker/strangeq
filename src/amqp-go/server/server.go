@@ -120,6 +120,12 @@ type Server struct {
 	// checked. Per-server scoping removes the premise rather than documenting
 	// it. Appended at the end of the struct so no pre-existing field moves.
 	generateConsumerTag func() string
+	stopOnce            sync.Once
+	stopErr             error
+	connectionWG        sync.WaitGroup
+	accepted            map[net.Conn]struct{}
+	closeStorage        func() error
+	closeLogger         func() error
 }
 
 // markUnsafeRecovery records that this process booted with --unsafe-recovery
@@ -284,7 +290,23 @@ func (s *Server) acceptLoop() error {
 			continue
 		}
 
-		go s.handleConnection(conn)
+		s.Mutex.Lock()
+		if s.Shutdown {
+			s.Mutex.Unlock()
+			conn.Close()
+			return nil
+		}
+		if s.accepted == nil {
+			s.accepted = make(map[net.Conn]struct{})
+		}
+		s.accepted[conn] = struct{}{}
+		s.connectionWG.Add(1)
+		s.Mutex.Unlock()
+		go func() {
+			defer s.connectionWG.Done()
+			defer func() { s.Mutex.Lock(); delete(s.accepted, conn); s.Mutex.Unlock() }()
+			s.handleConnection(conn)
+		}()
 	}
 }
 
@@ -407,6 +429,10 @@ func (s *Server) cleanupConnection(connection *protocol.Connection) {
 			consumerIDs = append(consumerIDs, consumer.ID)
 		}
 		channel.Consumers = make(map[string]*protocol.Consumer)
+		for consumerID := range channel.CancelledConsumers {
+			consumerIDs = append(consumerIDs, consumerID)
+		}
+		channel.CancelledConsumers = nil
 		channel.Closed = true
 		channel.Mutex.Unlock()
 
@@ -423,7 +449,7 @@ func (s *Server) cleanupConnection(connection *protocol.Connection) {
 		if s.Broker != nil {
 			for _, consumerID := range consumerIDs {
 				err := s.Broker.UnregisterConsumer(consumerID)
-				if err != nil {
+				if err != nil && !errors.Is(err, interfaces.ErrConsumerNotFound) {
 					s.Log.Warn("Failed to unregister consumer on connection close",
 						zap.String("consumer_id", consumerID),
 						zap.String("connection_id", connection.ID),
@@ -1420,28 +1446,42 @@ func (s *Server) processChannelMethod(conn *protocol.Connection, frame *protocol
 
 // Stop stops the server gracefully
 func (s *Server) Stop() error {
-	s.Mutex.Lock()
-	s.Shutdown = true
-	ln := s.Listener
-	cancel := s.metricsCancel
-	alarmCancel := s.alarmCancel
-	nagCancel := s.unsafeRecoveryCancel
-	s.Mutex.Unlock()
-
-	if cancel != nil {
-		cancel()
-	}
-	if alarmCancel != nil {
-		alarmCancel()
-	}
-	if nagCancel != nil {
-		nagCancel()
-	}
-
-	if ln != nil {
-		return ln.Close()
-	}
-	return nil
+	s.stopOnce.Do(func() {
+		s.Mutex.Lock()
+		s.Shutdown = true
+		ln := s.Listener
+		cancel, alarmCancel, nagCancel := s.metricsCancel, s.alarmCancel, s.unsafeRecoveryCancel
+		connections := make([]net.Conn, 0, len(s.accepted))
+		for conn := range s.accepted {
+			connections = append(connections, conn)
+		}
+		s.Mutex.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		if alarmCancel != nil {
+			alarmCancel()
+		}
+		if nagCancel != nil {
+			nagCancel()
+		}
+		if ln != nil {
+			if err := ln.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+				s.stopErr = err
+			}
+		}
+		for _, conn := range connections {
+			_ = conn.Close()
+		}
+		s.connectionWG.Wait()
+		if s.closeStorage != nil {
+			s.stopErr = errors.Join(s.stopErr, s.closeStorage())
+		}
+		if s.closeLogger != nil {
+			s.stopErr = errors.Join(s.stopErr, s.closeLogger())
+		}
+	})
+	return s.stopErr
 }
 
 // StartWithQuitChannel starts the server and returns a quit channel that can be used to stop it
@@ -1514,7 +1554,23 @@ func (s *Server) StartWithQuitChannel(quit <-chan struct{}) error {
 			}
 
 			// Handle the connection in a goroutine
-			go s.handleConnection(conn)
+			s.Mutex.Lock()
+			if s.Shutdown {
+				s.Mutex.Unlock()
+				conn.Close()
+				return nil
+			}
+			if s.accepted == nil {
+				s.accepted = make(map[net.Conn]struct{})
+			}
+			s.accepted[conn] = struct{}{}
+			s.connectionWG.Add(1)
+			s.Mutex.Unlock()
+			go func() {
+				defer s.connectionWG.Done()
+				defer func() { s.Mutex.Lock(); delete(s.accepted, conn); s.Mutex.Unlock() }()
+				s.handleConnection(conn)
+			}()
 		case <-quit:
 			s.Log.Info("Server shutdown requested")
 			s.Mutex.Lock()

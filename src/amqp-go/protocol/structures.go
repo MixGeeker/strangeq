@@ -309,16 +309,17 @@ type Channel struct {
 	// map is the authority on tag uniqueness: a duplicate key here is the
 	// 530 not-allowed case, while the same key on another channel is legal.
 	// Guarded by Mutex.
-	Consumers       map[string]*Consumer
-	DeliveryTag     uint64        // Used for delivery tags in acknowledgements
-	PrefetchCount   uint16        // Channel-level prefetch count
-	PrefetchSize    uint32        // Channel-level prefetch size (0 = unlimited)
-	GlobalPrefetch  bool          // Apply prefetch settings globally
-	CurrentQueue    string        // Last declared queue name (for empty-name resolution per AMQP spec)
-	FlowActive      atomic.Bool   // channel.flow state: true = content frames may be sent
-	FlowWake        chan struct{} // signaled to wake parked forwarders when flow resumes/closes
-	ConfirmMode     atomic.Bool   // confirm.select state: true = server sends basic.ack for each publish
-	ConfirmSequence atomic.Uint64 // channel-scoped delivery tag sequence for publisher confirms
+	Consumers          map[string]*Consumer
+	CancelledConsumers map[string]struct{} // 已取消消费但仍可在本 channel 确认的身份；Mutex 保护。
+	DeliveryTag        uint64              // Used for delivery tags in acknowledgements
+	PrefetchCount      uint16              // Channel-level prefetch count
+	PrefetchSize       uint32              // Channel-level prefetch size (0 = unlimited)
+	GlobalPrefetch     bool                // Apply prefetch settings globally
+	CurrentQueue       string              // Last declared queue name (for empty-name resolution per AMQP spec)
+	FlowActive         atomic.Bool         // channel.flow state: true = content frames may be sent
+	FlowWake           chan struct{}       // signaled to wake parked forwarders when flow resumes/closes
+	ConfirmMode        atomic.Bool         // confirm.select state: true = server sends basic.ack for each publish
+	ConfirmSequence    atomic.Uint64       // channel-scoped delivery tag sequence for publisher confirms
 
 	// SQ-5: publisher-confirm batching state. The per-publish hot path touches
 	// ONLY confirmDurable (a lock-free CAS-max watermark). confirmFlushMu is a

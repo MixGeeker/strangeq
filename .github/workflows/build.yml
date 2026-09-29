@@ -104,3 +104,29 @@ jobs:
           cd src/amqp-go
           ./amqp-server -version
 
+
+  windows:
+    name: Windows 原生协议验收
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: src/amqp-go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.1'
+          cache-dependency-path: src/amqp-go/go.sum
+      - name: 构建原生程序
+        run: |
+          go build -o amqp-server.exe ./cmd/amqp-server
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./amqp-server.exe --version
+      - name: 平台与协议回归
+        run: |
+          go test ./auth ./config ./interfaces ./protocol ./cmd/amqp-server -count=1 -timeout 90s
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go test ./server ./storage ./broker -short -count=1 -timeout 300s
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          go test . -run 'TestWindowsNative|TestAuthentication|TestAuthzIntegration|TestTLS|TestDurableRestart_(EveryConfirmed|BelowSpill|NoRestart)' -count=1 -timeout 90s
+          exit $LASTEXITCODE

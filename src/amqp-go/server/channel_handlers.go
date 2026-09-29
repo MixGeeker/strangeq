@@ -1,7 +1,9 @@
 package server
 
 import (
+	"errors"
 	"fmt"
+	"github.com/maxpert/amqp-go/interfaces"
 
 	"github.com/maxpert/amqp-go/protocol"
 	"go.uber.org/zap"
@@ -183,6 +185,10 @@ func (s *Server) teardownChannel(conn *protocol.Connection, channelID uint16) {
 		consumerIDs = append(consumerIDs, consumer.ID)
 	}
 	channel.Consumers = make(map[string]*protocol.Consumer) // Clear all consumers
+	for consumerID := range channel.CancelledConsumers {
+		consumerIDs = append(consumerIDs, consumerID)
+	}
+	channel.CancelledConsumers = nil
 	channel.Closed = true
 	channel.Mutex.Unlock()
 	conn.ConsumersDirty.Store(true)
@@ -190,7 +196,7 @@ func (s *Server) teardownChannel(conn *protocol.Connection, channelID uint16) {
 	// Unregister consumers from broker (stops poll goroutines)
 	for _, consumerID := range consumerIDs {
 		err := s.Broker.UnregisterConsumer(consumerID)
-		if err != nil {
+		if err != nil && !errors.Is(err, interfaces.ErrConsumerNotFound) {
 			s.Log.Warn("Failed to unregister consumer on channel close",
 				zap.String("consumer_id", consumerID),
 				zap.Uint16("channel_id", channelID),

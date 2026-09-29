@@ -427,6 +427,7 @@ const (
 // inverts. A name that PASSES here but that the FILESYSTEM rejects (invalid
 // UTF-8 on APFS, for instance) is handled by segmentDirFor's create-fallthrough,
 // not here: this is a question about the name, not about the volume.
+// Windows 使用安全的文件名子集，原名称由目录标记保留。
 func segmentDirNameIsLiteral(name string) bool {
 	if name == "" || name == "." || name == ".." {
 		return false
@@ -434,7 +435,7 @@ func segmentDirNameIsLiteral(name string) bool {
 	if len(name) > 255 {
 		return false
 	}
-	return !strings.ContainsRune(name, filepath.Separator) && !strings.ContainsRune(name, 0)
+	return !strings.ContainsRune(name, filepath.Separator) && !strings.ContainsRune(name, 0) && platformSegmentName(name)
 }
 
 // segmentDirEncoded generates a directory name for a queue whose name cannot be
@@ -1451,7 +1452,7 @@ func (qs *QueueSegments) sealSegment() error {
 
 	// Reopen the file read-only for sealed-segment reads BEFORE taking the
 	// segment lock, so no file I/O happens inside it.
-	readFile, err := os.Open(qs.currentSegment.path)
+	readFile, err := openStorageFile(qs.currentSegment.path, os.O_RDONLY, 0)
 
 	// The index copy and the handle swap happen under ONE hold of
 	// segment.mutex, which is the lock readMessage and collectAllMessages take
@@ -1522,7 +1523,7 @@ func (qs *QueueSegments) openNextSegmentLocked() error {
 	segmentNum := uint64(time.Now().UnixNano())
 	filename := filepath.Join(qs.dataDir, fmt.Sprintf("%020d%s", segmentNum, SegmentFileExtension))
 
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	file, err := openStorageFile(filename, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to open segment file: %w", err)
 	}
@@ -1693,7 +1694,7 @@ func (qs *QueueSegments) compactSegment(segment *SegmentFile) error {
 
 	// Create new temporary segment
 	tempPath := segment.path + segmentCompactSuffix
-	tempFile, err := os.OpenFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	tempFile, err := openStorageFile(tempPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return fmt.Errorf("segment compaction: cannot create %s: %w", tempPath, err)
 	}
@@ -1751,7 +1752,7 @@ func (qs *QueueSegments) compactSegment(segment *SegmentFile) error {
 	}
 
 	// Atomically replace old segment with compacted one.
-	if rerr := os.Rename(tempPath, segment.path); rerr != nil {
+	if rerr := replaceStorageFile(tempPath, segment.path); rerr != nil {
 		_ = os.Remove(tempPath)
 		return fmt.Errorf("segment compaction aborted: cannot install %s over %s; the old file and its index are left untouched: %w",
 			tempPath, segment.path, rerr)
@@ -1767,7 +1768,7 @@ func (qs *QueueSegments) compactSegment(segment *SegmentFile) error {
 	// unlinked) old inode, which the OLD index describes correctly — so
 	// leaving both in place is the consistent outcome, and the next boot reads
 	// the compacted file with a freshly scanned index.
-	newFile, err := os.Open(segment.path)
+	newFile, err := openStorageFile(segment.path, os.O_RDONLY, 0)
 	if err != nil {
 		return fmt.Errorf("segment compaction: %s was replaced but could not be reopened; the previous handle and index are still consistent: %w", segment.path, err)
 	}
@@ -1909,7 +1910,7 @@ func (qs *QueueSegments) loadExistingSegments() []error {
 // can pair its bytes with an index, and the caller keeps scanning the rest of
 // the directory.
 func (qs *QueueSegments) loadSegmentFile(segmentNum uint64, segPath string) error {
-	file, err := os.Open(segPath)
+	file, err := openStorageFile(segPath, os.O_RDONLY, 0)
 	if err != nil {
 		return interfaces.DegradedFault("segment-open", segPath,
 			"this segment file could not be opened and is quarantined for this boot",

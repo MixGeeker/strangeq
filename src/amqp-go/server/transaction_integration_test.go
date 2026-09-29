@@ -31,6 +31,12 @@ func newTransactionTestServer(t *testing.T) *Server {
 	}
 	storageBroker := broker.NewStorageBroker(storageImpl, cfg.GetEngine())
 	unifiedBroker := NewStorageBrokerAdapter(storageBroker)
+	t.Cleanup(func() {
+		storageBroker.Close()
+		if err := storageImpl.Close(); err != nil {
+			t.Errorf("close storage: %v", err)
+		}
+	})
 
 	tm := transaction.NewTransactionManager()
 	executor := transaction.NewUnifiedBrokerExecutor(unifiedBroker)

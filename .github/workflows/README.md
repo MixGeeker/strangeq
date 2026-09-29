@@ -32,3 +32,7 @@ go build ./cmd/amqp-server
 ### Build failures
 1. Check Go version (requires 1.25.1+)
 2. Run locally: `go test ./... && go build ./cmd/amqp-server`
+
+## Windows 验收与发行
+
+`build.yml` 在 Windows x64 运行资源采样、取消后的在途确认、认证、TLS、持久恢复及原生 exe 强制终止恢复测试。Unix 文件大小限制故障注入保留在 Unix 专属测试文件中。`release.yml` 打包 Windows x64 ZIP 和 SHA-256，包含原生程序、样例配置、许可证及 Windows 部署说明。

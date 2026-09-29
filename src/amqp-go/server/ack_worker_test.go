@@ -131,6 +131,7 @@ func (b *ackTestBroker) RegisterConsumer(queueName, consumerTag string, consumer
 	return nil
 }
 func (b *ackTestBroker) UnregisterConsumer(consumerTag string) error { return nil }
+func (b *ackTestBroker) CancelConsumer(consumerTag string) error     { return nil }
 
 func (b *ackTestBroker) AcknowledgeMessage(consumerTag string, deliveryTag uint64, multiple bool) error {
 	b.mu.Lock()

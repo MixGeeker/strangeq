@@ -41,6 +41,17 @@ func (s *Server) sendBatchedDeliveries(conn *protocol.Connection, channelID uint
 	var channel *protocol.Channel
 	if v, ok := conn.Channels.Load(channelID); ok {
 		channel = v.(*protocol.Channel)
+		channel.Mutex.RLock()
+		defer channel.Mutex.RUnlock()
+		// 与 basic.cancel 串行，确保 cancel-ok 之后不会继续发送旧消费者的数据。
+		if channel.Closed {
+			s.requeueFailedDeliveries(deliveries, nil)
+			return nil
+		}
+		if _, cancelled := channel.CancelledConsumers[deliveries[0].ConsumerID]; cancelled {
+			s.requeueFailedDeliveries(deliveries, nil)
+			return nil
+		}
 	}
 
 	// Large-body deliveries take the zero-copy vectored (writev) path: each body

@@ -102,21 +102,23 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 		return s.authzChannelError(conn, channelID, err, 50, 10)
 	}
 
-	// Call the broker to declare the queue
-	queue, err := s.Broker.DeclareQueue(
-		queueName,
-		declareMethod.Durable,
-		declareMethod.AutoDelete,
-		declareMethod.Exclusive,
-		declareMethod.Arguments,
-	)
+	var queue *protocol.Queue
+	if declareMethod.Passive {
+		queue = s.Broker.GetQueues()[declareMethod.Queue]
+		if queue == nil {
+			s.sendChannelClose(conn, channelID, amqperrors.NotFound, "NOT_FOUND - queue does not exist", 50, 10)
+			return nil
+		}
+	} else {
+		queue, err = s.Broker.DeclareQueue(queueName, declareMethod.Durable, declareMethod.AutoDelete, declareMethod.Exclusive, declareMethod.Arguments)
+	}
 
 	if err != nil {
 		// Malformed known x-arguments (SQ-7 policy validation) are a
 		// channel-level soft error: 406 PreconditionFailed, keep the
 		// connection alive. Mirrors the ErrExchangeTypeMismatch handling in
 		// handleExchangeDeclare.
-		if errors.Is(err, broker.ErrInvalidQueueArgument) {
+		if errors.Is(err, broker.ErrInvalidQueueArgument) || errors.Is(err, broker.ErrQueuePropertiesMismatch) {
 			s.sendChannelClose(conn, channelID, amqperrors.PreconditionFailed, err.Error(), 50, 10)
 			return nil
 		}
@@ -126,7 +128,7 @@ func (s *Server) handleQueueDeclare(conn *protocol.Connection, channelID uint16,
 		return err
 	}
 
-	if declareMethod.Exclusive {
+	if queue.Exclusive {
 		if sb, ok := s.Broker.(*StorageBrokerAdapter); ok {
 			if !sb.broker.SetQueueOwnerIfFree(queue.Name, conn.ID) {
 				replyText := fmt.Sprintf("QUEUE_LOCKED - queue '%s' is exclusive to another connection", queue.Name)

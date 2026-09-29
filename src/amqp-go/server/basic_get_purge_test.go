@@ -31,6 +31,12 @@ func newGetPurgeTestServer(t *testing.T) *Server {
 	}
 	storageBroker := broker.NewStorageBroker(storageImpl, cfg.GetEngine())
 	unifiedBroker := NewStorageBrokerAdapter(storageBroker)
+	t.Cleanup(func() {
+		storageBroker.Close()
+		if err := storageImpl.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 
 	return &Server{
 		Addr:             ":0",

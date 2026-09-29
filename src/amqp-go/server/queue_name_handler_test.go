@@ -43,6 +43,12 @@ func newTestServer(t *testing.T) *Server {
 	}
 	storageBroker := broker.NewStorageBroker(storageImpl, cfg.GetEngine())
 	unifiedBroker := NewStorageBrokerAdapter(storageBroker)
+	t.Cleanup(func() {
+		storageBroker.Close()
+		if err := storageImpl.Close(); err != nil {
+			t.Errorf("close storage: %v", err)
+		}
+	})
 
 	return &Server{
 		Addr:             ":0",
@@ -62,6 +68,7 @@ func newTestServer(t *testing.T) *Server {
 func newPipeConn(t *testing.T) *protocol.Connection {
 	t.Helper()
 	clientConn, serverConn := net.Pipe()
+	t.Cleanup(func() { clientConn.Close(); serverConn.Close() })
 	go io.Copy(io.Discard, clientConn) // drain response frames
 	return protocol.NewConnection(serverConn)
 }

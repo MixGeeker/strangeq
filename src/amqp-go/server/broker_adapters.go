@@ -75,6 +75,10 @@ func (a *StorageBrokerAdapter) UnregisterConsumer(consumerID string) error {
 	return a.broker.UnregisterConsumer(consumerID)
 }
 
+func (a *StorageBrokerAdapter) CancelConsumer(consumerID string) error {
+	return a.broker.CancelConsumer(consumerID)
+}
+
 func (a *StorageBrokerAdapter) AcknowledgeMessage(consumerID string, deliveryTag uint64, multiple bool) error {
 	return a.broker.AcknowledgeMessage(consumerID, deliveryTag, multiple)
 }

@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"syscall"
 	"time"
 
 	"github.com/maxpert/amqp-go/storage"
@@ -95,14 +94,14 @@ func (s *Server) updateDiskMetrics() {
 	}
 
 	// Get disk usage stats
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(dataDir, &stat); err != nil {
+	available, ok := readDiskFreeBytes(dataDir)
+	if !ok {
 		// Silently fail - disk metrics are optional
 		return
 	}
 
 	// Available space
-	freeBytes := float64(stat.Bavail * uint64(stat.Bsize))
+	freeBytes := float64(available)
 	s.MetricsCollector.UpdateDiskMetrics(freeBytes, 0) // We'll calculate used bytes separately
 
 	// Calculate total disk used by server data

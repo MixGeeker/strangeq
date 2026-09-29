@@ -79,6 +79,7 @@ const metadataSlotMaxNameLen = 255 - len(FileExtension) - len(TempFileExtension)
 // from its preferred spelling: on POSIX the old build really did write
 // "a\\b.cbor", and moving that file would be the review-4 B-1 defect one tier
 // over.
+// Windows 还通过 platformLiteralName 排除保留字符、设备名和大小写别名。
 func metadataNameIsLiteral(name string, maxLen int) bool {
 	if name == "" || name == "." || name == ".." {
 		return false
@@ -86,7 +87,7 @@ func metadataNameIsLiteral(name string, maxLen int) bool {
 	if len(name) > maxLen {
 		return false
 	}
-	return !strings.ContainsRune(name, filepath.Separator) && !strings.ContainsRune(name, 0)
+	return !strings.ContainsRune(name, filepath.Separator) && !strings.ContainsRune(name, 0) && platformLiteralName(name)
 }
 
 // metadataEscapedName generates a single path element for a name that cannot be

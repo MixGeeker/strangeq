@@ -31,7 +31,8 @@ var ErrQueueClosed = errors.New("queue closed during publish")
 // ErrExchangeTypeMismatch is returned when a re-declare of an existing
 // exchange specifies a different type. Callers should handle this as a
 // channel-level 406 PreconditionFailed per AMQP 0.9.1 spec.
-var ErrExchangeTypeMismatch = errors.New("exchange type mismatch")
+var ErrExchangeTypeMismatch = errors.New("exchange properties mismatch")
+var ErrQueuePropertiesMismatch = errors.New("queue properties mismatch")
 
 // defaultUnlimitedPrefetchCap is the fallback finite gate cap for a prefetch-0
 // manual-ack consumer when EngineConfig.UnlimitedPrefetchCap is unset (0). It
@@ -148,6 +149,7 @@ type ConsumerState struct {
 	bypassGate atomic.Bool
 	stopCh     chan struct{}
 	stopOnce   sync.Once
+	cancelled  atomic.Bool
 	done       chan struct{}
 }
 
@@ -158,6 +160,7 @@ type MetricsCollector interface {
 }
 
 type StorageBroker struct {
+	closeOnce         sync.Once
 	storage           interfaces.Storage
 	engineConfig      interfaces.EngineConfig
 	queueStates       sync.Map
@@ -535,7 +538,13 @@ func (b *StorageBroker) SetTTLClock(now func() int64) { b.ttlNow = now }
 // caller owns that. Production servers should call this on shutdown for a clean
 // stop; tests call it before closing storage so a reaper never touches a closed
 // store (the synchronous wait is what makes that guarantee hold under -race).
-func (b *StorageBroker) Close() {
+func (b *StorageBroker) Close() { b.closeOnce.Do(b.close) }
+
+func (b *StorageBroker) close() {
+	b.activeConsumers.Range(func(key, _ interface{}) bool {
+		_ = b.UnregisterConsumer(key.(string))
+		return true
+	})
 	b.queueStates.Range(func(_, v interface{}) bool {
 		v.(*QueueState).Close()
 		return true
@@ -1426,7 +1435,7 @@ func (b *StorageBroker) DeclareExchange(name, exchangeType string, durable, auto
 
 	// If exists, validate properties match
 	if existing != nil {
-		if existing.Kind != exchangeType {
+		if existing.Kind != exchangeType || existing.Durable != durable || existing.AutoDelete != autoDelete || existing.Internal != internal {
 			return fmt.Errorf("%w: exchange '%s' expected %s, got %s", ErrExchangeTypeMismatch, name, existing.Kind, exchangeType)
 		}
 		// Exchange already exists with matching properties
@@ -1531,7 +1540,7 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 		mu.Lock()
 		fresh, ferr := b.storage.GetQueue(name)
 		if ferr == nil && fresh != nil {
-			q, derr := b.declareExistingQueueLocked(fresh, durable, autoDelete, exclusive)
+			q, derr := b.declareExistingQueueLocked(fresh, durable, autoDelete, exclusive, arguments)
 			mu.Unlock()
 			return q, derr
 		}
@@ -1588,7 +1597,7 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 	// inside declareExistingQueueLocked, which is the exact race this whole
 	// change eliminates.
 	if existing, gerr := b.storage.GetQueue(name); gerr == nil && existing != nil {
-		q, derr := b.declareExistingQueueLocked(existing, durable, autoDelete, exclusive)
+		q, derr := b.declareExistingQueueLocked(existing, durable, autoDelete, exclusive, arguments)
 		mu.Unlock()
 		return q, derr
 	}
@@ -1657,16 +1666,23 @@ func (b *StorageBroker) DeclareQueue(name string, durable, autoDelete, exclusive
 // is why this function calls createQueueStateLocked (which assumes the lock
 // is held) rather than getOrCreateQueueState (which would try to take it
 // again and self-deadlock).
-func (b *StorageBroker) declareExistingQueueLocked(existing *protocol.Queue, durable, autoDelete, exclusive bool) (*protocol.Queue, error) {
+func (b *StorageBroker) declareExistingQueueLocked(existing *protocol.Queue, durable, autoDelete, exclusive bool, arguments map[string]interface{}) (*protocol.Queue, error) {
 	if existing.Durable != durable || existing.AutoDelete != autoDelete || existing.Exclusive != exclusive {
-		return nil, fmt.Errorf("queue '%s' properties mismatch", existing.Name)
+		return nil, fmt.Errorf("%w: %s", ErrQueuePropertiesMismatch, existing.Name)
+	}
+
+	for _, key := range []string{"x-dead-letter-exchange", "x-dead-letter-routing-key"} {
+		if !reflect.DeepEqual(existing.Arguments[key], arguments[key]) {
+			return nil, fmt.Errorf("%w: %s %s", ErrQueuePropertiesMismatch, existing.Name, key)
+		}
 	}
 
 	// Add to active cache (lock-free)
 	b.activeQueues.Store(existing.Name, existing)
 
 	// Ensure queue state exists and carries the resolved policy. The
-	// stored (original) arguments win: redeclare arguments are not
+	// 已检查 Profile 的死信参数；其余策略继续使用最初持久化的参数。
+	// stored (original) arguments win: other redeclare arguments are not
 	// compared today (known gap — AMQP 0.9.1 says differing args should
 	// be a 406), so they must not overwrite the policy either. This
 	// branch also covers recovery when the storage backend already holds
@@ -2169,11 +2185,30 @@ func (b *StorageBroker) RegisterConsumer(queueName, consumerID string, consumer 
 // by its client-visible tag: the tag is channel-scoped, so cancelling by tag
 // would tear down whichever same-tagged consumer happened to be registered last
 // — one connection's basic.cancel killing another connection's consumer.
+// CancelConsumer 停止分发并归还内部缓冲，已发送消息保持可确认。
+func (b *StorageBroker) CancelConsumer(consumerID string) error {
+	return b.removeConsumer(consumerID, true)
+}
+
 func (b *StorageBroker) UnregisterConsumer(consumerID string) error {
+	return b.removeConsumer(consumerID, false)
+}
+
+func (b *StorageBroker) releaseCancelledConsumer(state *ConsumerState) {
+	if !state.cancelled.Load() {
+		return
+	}
+	tags, err := b.storage.GetUnackedTags(state.queueName, state.consumer.ID)
+	if err == nil && len(tags) == 0 && b.activeConsumers.CompareAndDelete(state.consumer.ID, state) {
+		b.storage.UnregisterConsumerCursor(state.queueName, state.consumer.ID)
+	}
+}
+
+func (b *StorageBroker) removeConsumer(consumerID string, retainDelivered bool) error {
 	// Load consumer state (lock-free)
 	val, ok := b.activeConsumers.Load(consumerID)
 	if !ok {
-		return errors.New("consumer not found")
+		return interfaces.ErrConsumerNotFound
 	}
 	state := val.(*ConsumerState)
 
@@ -2202,7 +2237,9 @@ func (b *StorageBroker) UnregisterConsumer(consumerID string) error {
 	//    LoadAndDelete for the same reason). Only one side wins the
 	//    LoadAndDelete; the other sees !loaded and skips — no double
 	//    decrement of the inflight counter, no double requeue.
-	b.activeConsumers.Delete(consumerID)
+	if !retainDelivered {
+		b.activeConsumers.Delete(consumerID)
+	}
 
 	// 6. Drain consumer.Messages — these are deliveries that were buffered
 	//    in the channel but not yet pulled by the server's forwarder
@@ -2244,23 +2281,25 @@ drainComplete:
 	//
 	//    The scan is O(total in-flight deliveries broker-wide) — acceptable
 	//    because consumer cancellation is a rare event.
-	var orphanedTags []uint64
-	b.deliveryIndex.Range(func(key, value interface{}) bool {
-		if value.(string) == consumerID {
-			orphanedTags = append(orphanedTags, key.(uint64))
+	if !retainDelivered {
+		var orphanedTags []uint64
+		b.deliveryIndex.Range(func(key, value interface{}) bool {
+			if value.(string) == consumerID {
+				orphanedTags = append(orphanedTags, key.(uint64))
+			}
+			return true
+		})
+		for _, deliveryTag := range orphanedTags {
+			b.requeueInflightDelivery(queueState, state.queueName, deliveryTag)
 		}
-		return true
-	})
-	for _, deliveryTag := range orphanedTags {
-		b.requeueInflightDelivery(queueState, state.queueName, deliveryTag)
-	}
 
-	// 8. Unregister from AckCursor — safe now: all in-flight messages have
-	//    been requeued, so minAckCursor recomputation won't skip them. If
-	//    this were done before the requeue, minAckCursor would jump forward
-	//    past the consumer's unacked tags, making the queue appear emptier
-	//    than it actually is and potentially failing to apply backpressure.
-	b.storage.UnregisterConsumerCursor(state.queueName, consumerID)
+		// 8. Unregister from AckCursor — safe now: all in-flight messages have
+		//    been requeued, so minAckCursor recomputation won't skip them. If
+		//    this were done before the requeue, minAckCursor would jump forward
+		//    past the consumer's unacked tags, making the queue appear emptier
+		//    than it actually is and potentially failing to apply backpressure.
+		b.storage.UnregisterConsumerCursor(state.queueName, consumerID)
+	}
 
 	mu := b.getQueueConsumersMutex(state.queueName)
 	mu.Lock()
@@ -2314,6 +2353,10 @@ drainComplete:
 		return err
 	}
 
+	if retainDelivered {
+		state.cancelled.Store(true)
+		b.releaseCancelledConsumer(state)
+	}
 	return nil
 }
 
@@ -2324,7 +2367,8 @@ drainComplete:
 // no-op — preventing double-decrement of the inflight counter and
 // double-requeue of the message.
 func (b *StorageBroker) requeueInflightDelivery(qs *QueueState, queueName string, deliveryTag uint64) {
-	if _, loaded := b.deliveryIndex.LoadAndDelete(deliveryTag); !loaded {
+	owner, loaded := b.deliveryIndex.LoadAndDelete(deliveryTag)
+	if !loaded {
 		return
 	}
 	// SQ-11: consumer-cancel drain re-enters the message into the ready set —
@@ -2332,6 +2376,7 @@ func (b *StorageBroker) requeueInflightDelivery(qs *QueueState, queueName string
 	b.restoreReadyBytesOnRequeue(qs, queueName, deliveryTag)
 	qs.Requeue(deliveryTag)
 	b.storage.DeletePendingAck(queueName, deliveryTag)
+	b.storage.NackFromConsumer(queueName, owner.(string), deliveryTag)
 }
 
 // PublishMessage publishes a message to an exchange.
@@ -3536,6 +3581,11 @@ func (b *StorageBroker) GetConsumers() map[string]*protocol.Consumer {
 	b.activeConsumers.Range(func(key, value interface{}) bool {
 		consumerID := key.(string)
 		state := value.(*ConsumerState)
+		select {
+		case <-state.stopCh:
+			return true
+		default:
+		}
 		result[consumerID] = state.consumer
 		return true
 	})
@@ -3653,6 +3703,7 @@ func (b *StorageBroker) AcknowledgeMessage(consumerID string, deliveryTag uint64
 		return nil
 	}
 	state := val.(*ConsumerState)
+	defer b.releaseCancelledConsumer(state)
 
 	// Get queue state
 	queueState := b.getOrCreateQueueState(state.queueName)
@@ -3706,6 +3757,7 @@ func (b *StorageBroker) RejectMessage(consumerID string, deliveryTag uint64, req
 		return nil
 	}
 	state := val.(*ConsumerState)
+	defer b.releaseCancelledConsumer(state)
 
 	// Get queue state
 	queueState := b.getOrCreateQueueState(state.queueName)
@@ -3728,6 +3780,7 @@ func (b *StorageBroker) NacknowledgeMessage(consumerID string, deliveryTag uint6
 		return nil
 	}
 	state := val.(*ConsumerState)
+	defer b.releaseCancelledConsumer(state)
 
 	// Get queue state
 	queueState := b.getOrCreateQueueState(state.queueName)

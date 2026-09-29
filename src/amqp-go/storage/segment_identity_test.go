@@ -114,6 +114,9 @@ func TestSegmentPath_LegacyDirectoryRecoversUnderItsOwnQueueName(t *testing.T) {
 	}
 
 	for _, name := range legacy {
+		if runtime.GOOS == "windows" && strings.Contains(name, `\`) {
+			continue // 该历史目录只可能由 POSIX 文件系统创建。
+		}
 		t.Run(fmt.Sprintf("%q", name), func(t *testing.T) {
 			dataDir := t.TempDir()
 			legacySegmentDir(t, dataDir, name, []uint64{1, 2, 3})

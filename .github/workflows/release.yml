@@ -123,9 +123,48 @@ jobs:
             src/amqp-go/amqp-server-*.tar.gz*
           retention-days: 5
 
+  windows:
+    name: Windows x64 ZIP
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.1'
+          cache-dependency-path: src/amqp-go/go.sum
+      - name: 构建并打包
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ github.event.release.tag_name || github.event.inputs.version || github.ref_name }}
+          CGO_ENABLED: '0'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = $env:RELEASE_VERSION
+          if ($version -notmatch '^v[0-9]+[.][0-9]+[.][0-9]+(?:[-+][A-Za-z0-9.-]+)?$') { throw 'Invalid release version' }
+          $package = "amqp-server-$version-windows-amd64"
+          New-Item -ItemType Directory -Path "release/$package" -Force | Out-Null
+          Push-Location src/amqp-go
+          go build "-ldflags=-s -w -X main.version=$version" -o "../../release/$package/amqp-server.exe" ./cmd/amqp-server
+          if ($LASTEXITCODE -ne 0) { throw 'Windows build failed' }
+          Pop-Location
+          Copy-Item -LiteralPath src/amqp-go/config.sample.yaml -Destination "release/$package"
+          Copy-Item -LiteralPath LICENSE -Destination "release/$package"
+          Copy-Item -LiteralPath docs/WINDOWS.md -Destination "release/$package/README.md"
+          Copy-Item -LiteralPath docs/AUTHORIZATION.md -Destination "release/$package"
+          Copy-Item -LiteralPath docs/TLS.md -Destination "release/$package"
+          & "./release/$package/amqp-server.exe" --version
+          Compress-Archive -LiteralPath "release/$package" -DestinationPath "release/$package.zip"
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath "release/$package.zip").Hash.ToLowerInvariant()
+          "$hash  $package.zip" | Set-Content -Encoding utf8 "release/$package.zip.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: amqp-server-windows-amd64
+          path: release/*.zip*
+          retention-days: 5
+
   release:
     name: Create Release Assets
-    needs: build
+    needs: [build, windows]
     runs-on: ubuntu-latest
     if: github.event_name == 'release' || github.event_name == 'push'
 

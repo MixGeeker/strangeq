@@ -47,6 +47,7 @@ type UnifiedBroker interface {
 	// another's.
 	RegisterConsumer(queueName, consumerID string, consumer *protocol.Consumer) error
 	UnregisterConsumer(consumerID string) error
+	CancelConsumer(consumerID string) error
 
 	// Acknowledgment operations
 	AcknowledgeMessage(consumerID string, deliveryTag uint64, multiple bool) error

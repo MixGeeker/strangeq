@@ -45,6 +45,8 @@ RabbitMQ is the gold standard for AMQP 0.9.1, but it runs on the Erlang VM — a
 
 ## Installation
 
+Windows 原生构建、运行和持久化边界见 [Windows 部署](docs/WINDOWS.md)。
+
 ### Pre-built Binaries
 
 Download the latest release for your platform from the [releases page](https://github.com/maxpert/strangeq/releases).

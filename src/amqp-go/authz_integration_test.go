@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -101,7 +102,7 @@ func writeAuthzAuthFile(t *testing.T, path string) {
 
 func startAuthzTestServer(t *testing.T, port string) *server.Server {
 	t.Helper()
-	authFile := fmt.Sprintf("/tmp/test_authz_%d.json", time.Now().UnixNano())
+	authFile := filepath.Join(t.TempDir(), fmt.Sprintf("test_authz_%d.json", time.Now().UnixNano()))
 	t.Cleanup(func() { os.Remove(authFile) })
 	writeAuthzAuthFile(t, authFile)
 

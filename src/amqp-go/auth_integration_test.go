@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -52,7 +53,7 @@ func writeRootTestAuthFile(t *testing.T, path string) {
 
 // TestAuthenticationPLAIN tests PLAIN mechanism authentication
 func TestAuthenticationPLAIN(t *testing.T) {
-	authFile := "/tmp/test_auth_plain.json"
+	authFile := filepath.Join(t.TempDir(), "test_auth_plain.json")
 	defer os.Remove(authFile)
 	writeRootTestAuthFile(t, authFile)
 
@@ -127,7 +128,7 @@ func TestAuthenticationPLAIN(t *testing.T) {
 
 // TestAuthenticationANONYMOUS tests ANONYMOUS mechanism authentication
 func TestAuthenticationANONYMOUS(t *testing.T) {
-	authFile := "/tmp/test_auth_anon.json"
+	authFile := filepath.Join(t.TempDir(), "test_auth_anon.json")
 	defer os.Remove(authFile)
 	writeRootTestAuthFile(t, authFile)
 
@@ -232,7 +233,7 @@ func TestAuthenticationDisabled(t *testing.T) {
 
 // TestAuthenticationWithMessaging tests that authenticated connections can publish/consume
 func TestAuthenticationWithMessaging(t *testing.T) {
-	authFile := "/tmp/test_auth_messaging.json"
+	authFile := filepath.Join(t.TempDir(), "test_auth_messaging.json")
 	defer os.Remove(authFile)
 	writeRootTestAuthFile(t, authFile)
 

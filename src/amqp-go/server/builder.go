@@ -185,13 +185,23 @@ func (b *ServerBuilder) Build() (*Server, error) {
 	// TODO: Implement memory limits at disruptor/queue level
 
 	// Create logger if not provided
+	built := false
+	var closeLogger func() error
+	defer func() {
+		if !built && closeLogger != nil {
+			if err := closeLogger(); err != nil {
+				fmt.Fprintf(os.Stderr, "close broker log: %v\n", err)
+			}
+		}
+	}()
 	logger := b.logger
 	if logger == nil {
-		zapLogger, err := createZapLogger(b.config.Server.LogLevel, b.config.Server.LogFile)
+		zapLogger, closeLog, err := createZapLogger(b.config.Server.LogLevel, b.config.Server.LogFile)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create logger: %w", err)
 		}
 		logger = &ZapLoggerAdapter{logger: zapLogger}
+		closeLogger = closeLog
 	}
 
 	// Phase 1: Use disruptor-based in-memory storage
@@ -210,6 +220,24 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		}
 		logger.Info("Using disruptor-based storage")
 	}
+
+	var ownedBroker *broker.StorageBroker
+	closeOwned := func() error {
+		if ownedBroker != nil {
+			ownedBroker.Close()
+		}
+		if b.storage == nil {
+			return storageImpl.(interface{ Close() error }).Close()
+		}
+		return nil
+	}
+	defer func() {
+		if !built {
+			if err := closeOwned(); err != nil {
+				logger.Error("关闭未启动的存储失败", interfaces.LogField{Key: "error", Value: err})
+			}
+		}
+	}()
 
 	// The storage tiers have cold-path durability failures the call stack cannot
 	// return: a checkpoint that cannot run leaves a WAL file unreclaimed
@@ -239,6 +267,7 @@ func (b *ServerBuilder) Build() (*Server, error) {
 		// Create storage-backed broker using the storage we just created
 		// Phase 6G: Pass engine config for tunable parameters
 		storageBroker := broker.NewStorageBroker(storageImpl, b.config.GetEngine())
+		ownedBroker = storageBroker
 		storageBroker.SetLogger(logger)
 		// initOrdinalAllocator establishes the delivery-tag ordinal high-water
 		// mark. It cannot report through the constructor's signature, and a
@@ -403,6 +432,9 @@ func (b *ServerBuilder) Build() (*Server, error) {
 			interfaces.LogField{Key: "faults", Value: len(faults)})
 	}
 
+	server.closeStorage = closeOwned
+	server.closeLogger = closeLogger
+	built = true
 	return server, nil
 }
 
@@ -552,7 +584,7 @@ func parseZapLevel(level string) zap.AtomicLevel {
 	}
 }
 
-func createZapLogger(level, logFile string) (*zap.Logger, error) {
+func createZapLogger(level, logFile string) (*zap.Logger, func() error, error) {
 	// "silent" bypasses zap.Config entirely rather than mapping to a level
 	// above Fatal: a real core still pays for encoding + a sink write on
 	// every log-site guard check, and every "info"-level connection
@@ -563,7 +595,7 @@ func createZapLogger(level, logFile string) (*zap.Logger, error) {
 	// benchmarks that spin up an embedded server (see versusURI in
 	// versus_bench_test.go) where any log write is noise, not signal.
 	if level == "silent" {
-		return zap.NewNop(), nil
+		return zap.NewNop(), nil, nil
 	}
 
 	var zapConfig zap.Config
@@ -575,9 +607,21 @@ func createZapLogger(level, logFile string) (*zap.Logger, error) {
 		zapConfig.Level = parseZapLevel(level)
 	}
 
-	if logFile != "" {
-		zapConfig.OutputPaths = []string{logFile}
+	logger, err := zapConfig.Build()
+	if err != nil || logFile == "" {
+		return logger, nil, err
 	}
-
-	return zapConfig.Build()
+	file, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, nil, err
+	}
+	var encoder zapcore.Encoder
+	if zapConfig.Encoding == "console" {
+		encoder = zapcore.NewConsoleEncoder(zapConfig.EncoderConfig)
+	} else {
+		encoder = zapcore.NewJSONEncoder(zapConfig.EncoderConfig)
+	}
+	core := zapcore.NewCore(encoder, zapcore.Lock(zapcore.AddSync(file)), zapConfig.Level)
+	logger = logger.WithOptions(zap.WrapCore(func(zapcore.Core) zapcore.Core { return core }))
+	return logger, func() error { return errors.Join(file.Sync(), file.Close()) }, nil
 }

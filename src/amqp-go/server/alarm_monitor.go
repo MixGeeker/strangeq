@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"syscall"
 	"time"
 
 	"github.com/maxpert/amqp-go/config"
@@ -385,15 +384,4 @@ func (s *Server) parkReaderWhileAlarmed(conn *protocol.Connection) (probing bool
 		}
 	}
 	return false
-}
-
-// readDiskFreeBytes returns the free bytes available to an unprivileged process
-// on the filesystem backing path. syscall.Statfs is available on both Linux and
-// darwin, so this reader is platform-independent.
-func readDiskFreeBytes(path string) (uint64, bool) {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(path, &stat); err != nil {
-		return 0, false
-	}
-	return stat.Bavail * uint64(stat.Bsize), true
 }

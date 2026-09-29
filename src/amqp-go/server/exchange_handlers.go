@@ -86,6 +86,17 @@ func (s *Server) handleExchangeDeclare(conn *protocol.Connection, channelID uint
 		return fmt.Errorf("unsupported exchange type: %s", declareMethod.Type)
 	}
 
+	if declareMethod.Passive {
+		if s.Broker.GetExchanges()[declareMethod.Exchange] == nil {
+			s.sendChannelClose(conn, channelID, amqperrors.NotFound, "NOT_FOUND - exchange does not exist", 40, 10)
+			return nil
+		}
+		if declareMethod.NoWait {
+			return nil
+		}
+		return s.sendExchangeDeclareOK(conn, channelID)
+	}
+
 	err = s.Broker.DeclareExchange(
 		declareMethod.Exchange,
 		declareMethod.Type,
